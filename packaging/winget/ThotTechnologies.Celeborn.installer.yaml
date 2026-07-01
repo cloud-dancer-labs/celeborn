@@ -1,0 +1,17 @@
+# winget installer manifest — portable single-exe (no MSI). The release workflow prints the asset
+# sha256 (the *.sha256 sidecar); paste it into InstallerSha256 on each release.
+PackageIdentifier: ThotTechnologies.Celeborn
+PackageVersion: 0.1.0
+InstallerType: portable
+Commands:
+  - celeborn
+  - cel
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/cloud-dancer-labs/celeborn/releases/download/v0.1.0/celeborn-windows-x86_64.exe
+    InstallerSha256: REPLACE_WITH_WINDOWS_X86_64_SHA256
+    NestedInstallerFiles:
+      - RelativeFilePath: celeborn-windows-x86_64.exe
+        PortableCommandAlias: celeborn
+ManifestType: installer
+ManifestVersion: 1.6.0

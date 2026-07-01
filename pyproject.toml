@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "celeborn"
+version = "0.1.0"
+description = "A long-term context substrate for coding agents."
+readme = "README.md"
+license = { text = "LicenseRef-Proprietary" }
+requires-python = ">=3.9"
+authors = [{ name = "Cloud Dancer" }]
+maintainers = [{ name = "Thot Technologies LLC" }]
+keywords = ["llm", "agents", "memory", "context", "claude", "coding-agents"]
+classifiers = [
+    # NOTE: "Private :: Do Not Upload" was removed deliberately — that classifier makes PyPI REJECT
+    # the upload. The package is intentionally published to PyPI (proprietary LICENSE still governs
+    # use). See references/pypi-publishing.md for the source-exposure decision.
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = []  # stdlib only (argparse, sqlite3, json, pathlib) — "boring technology"
+
+[project.urls]
+Homepage = "https://github.com/cloud-dancer-labs/celeborn"
+Repository = "https://github.com/cloud-dancer-labs/celeborn"
+Issues = "https://github.com/cloud-dancer-labs/celeborn/issues"
+
+[project.scripts]
+celeborn = "celeborn:main"
+cel = "celeborn:main"
+
+[tool.setuptools]
+# The CLI stays two flat modules under scripts/ (single-file ethos preserved). Runtime data
+# (schema.sql + init templates) lives in references/ and ships as the data-only `celeborn_refs`
+# package so wheels/uv-tool installs carry it; celeborn.py resolves it via importlib.resources.
+package-dir = { "" = "scripts", "celeborn_refs" = "references" }
+py-modules = ["celeborn", "celeborn_sync"]
+packages = ["celeborn_refs"]
+
+[tool.setuptools.package-data]
+celeborn_refs = ["*.sql", "*.md", "*.json", "templates/*", "templates/**/*"]

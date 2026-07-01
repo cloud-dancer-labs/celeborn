@@ -1,0 +1,22 @@
+{
+  "version": "0.1.0",
+  "description": "Long-term context substrate for coding agents (CLI).",
+  "homepage": "https://github.com/cloud-dancer-labs/celeborn",
+  "license": "Proprietary",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/cloud-dancer-labs/celeborn/releases/download/v0.1.0/celeborn-windows-x86_64.exe#/celeborn.exe",
+      "hash": "REPLACE_WITH_WINDOWS_X86_64_SHA256"
+    }
+  },
+  "bin": [["celeborn.exe", "celeborn"], ["celeborn.exe", "cel"]],
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/cloud-dancer-labs/celeborn/releases/download/v$version/celeborn-windows-x86_64.exe#/celeborn.exe"
+      }
+    }
+  },
+  "_comment": "Lives in a Scoop bucket repo (e.g. cloud-dancer-labs/scoop-celeborn) as bucket/celeborn.json. Install: scoop bucket add celeborn https://github.com/cloud-dancer-labs/scoop-celeborn; scoop install celeborn. The hash is the release asset's sha256 (printed by the release workflow)."
+}

@@ -1,0 +1,32 @@
+{
+  "$comment": "Celeborn GitHub App manifest. Feed this to GitHub's 'Create a GitHub App from a manifest' flow (https://docs.github.com/apps/sharing-github-apps/registering-a-github-app-from-a-manifest). LEAST PRIVILEGE: the only WRITE scope is `checks` — there is NO contents/issues/pull_requests write, which makes pushing memory back out to a PR/issue structurally impossible (the no-Memory-on-PR guarantee). Replace every <your-project> placeholder with your Supabase project ref before submitting. See references/github-app-listing.md for the Marketplace copy and the publisher-verification note.",
+  "name": "Celeborn Memory",
+  "url": "https://github.com/cloud-dancer-labs/celeborn",
+  "description": "Celeborn watches your repo's committed memory (.context/) for drift and captures PR/issue threads for your team's local context. It NEVER writes to your code, PRs, or issues — its only write is a neutral CI check.",
+  "public": true,
+  "hook_attributes": {
+    "url": "https://<your-project>.supabase.co/functions/v1/gh-webhook",
+    "active": true
+  },
+  "redirect_url": "https://github.com/cloud-dancer-labs/celeborn",
+  "setup_url": "https://github.com/cloud-dancer-labs/celeborn#github-app",
+  "setup_on_update": false,
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "read",
+    "issues": "read",
+    "pull_requests": "read",
+    "checks": "write"
+  },
+  "default_events": [
+    "pull_request",
+    "check_run",
+    "check_suite",
+    "issue_comment",
+    "pull_request_review",
+    "pull_request_review_comment",
+    "marketplace_purchase",
+    "installation",
+    "installation_repositories"
+  ]
+}
