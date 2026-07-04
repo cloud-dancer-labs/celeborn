@@ -16,7 +16,7 @@ class Celeborn < Formula
   desc "Long-term context substrate for coding agents (CLI)"
   homepage "https://github.com/cloud-dancer-labs/celeborn"
   version "0.1.0"
-  license :cannot_represent # proprietary — © Thot Technologies LLC
+  license "BUSL-1.1" # source-available; converts to Apache-2.0 four years after release — © Cloud Dancer
 
   on_macos do
     on_arm do

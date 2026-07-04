@@ -1,22 +1,25 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]  # >=77 for PEP 639 SPDX license expression (license = "BUSL-1.1")
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "celeborn"
-version = "0.1.0"
+version = "0.1.1"
 description = "A long-term context substrate for coding agents."
 readme = "README.md"
-license = { text = "LicenseRef-Proprietary" }
+# Source-available under the Business Source License 1.1 (SPDX: BUSL-1.1). Converts to Apache-2.0
+# four years after each version's release. Full terms + Additional Use Grant in the LICENSE file.
+license = "BUSL-1.1"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
 authors = [{ name = "Cloud Dancer" }]
 maintainers = [{ name = "Thot Technologies LLC" }]
 keywords = ["llm", "agents", "memory", "context", "claude", "coding-agents"]
 classifiers = [
-    # NOTE: "Private :: Do Not Upload" was removed deliberately — that classifier makes PyPI REJECT
-    # the upload. The package is intentionally published to PyPI (proprietary LICENSE still governs
-    # use). See references/pypi-publishing.md for the source-exposure decision.
-    "License :: Other/Proprietary License",
+    # NOTE: No "License ::" trove classifier here — PEP 639 forbids pairing a License-Expression
+    # (the `license = "BUSL-1.1"` above) with a License classifier. PyPI renders BUSL-1.1 from the
+    # SPDX expression. ("Private :: Do Not Upload" is also intentionally absent — it makes PyPI
+    # REJECT the upload.) See references/pypi-publishing.md.
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Environment :: Console",

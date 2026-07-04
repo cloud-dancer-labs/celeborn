@@ -1,7 +1,7 @@
 # Celeborn
 
 > Celeborn husbands your context, creating a silver tree of `.md` files in a turbocharged SQLite
-> index. Elegant. Fast. Proprietary (© Cloud Dancer, all rights reserved; distributed by Thot Technologies LLC). Saves time, money, and tokens — and
+> index. Elegant. Fast. Source-available under the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE) (© Cloud Dancer; distributed by Thot Technologies LLC). Saves time, money, and tokens — and
 > mitigates session restarts.
 
 **A long-term context substrate for coding agents.** Celeborn gives any repository a small,
@@ -549,9 +549,11 @@ this README any other way than by saying thank you.
 
 ## Support
 
-Celeborn is **proprietary software — © Cloud Dancer, all rights reserved; distributed by Thot Technologies LLC** (see
-[LICENSE](LICENSE)). It is not open source; no rights to use, copy, modify, or distribute are granted
-without prior written consent.
+Celeborn is **source-available under the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE)** (© Cloud Dancer; distributed by Thot Technologies LLC).
+You may read, copy, and modify the source; production use of the unmodified, checksum-valid client is
+granted at no charge, and the **only** restriction is that you may not operate a competing hosted service
+built on it. Each version converts to **Apache-2.0** on its Change Date (four years after release). See
+the [LICENSE](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE) for the full terms.
 
 It earns its keep in tokens and time. If you want to know how much, run `celeborn metrics`.
 
@@ -569,5 +571,6 @@ free, and it genuinely helps.
 
 ## Status
 
-Early. See [`plan/PLAN.md`](plan/PLAN.md) for the full design and build phases. Proprietary —
-© Cloud Dancer, all rights reserved; distributed by Thot Technologies LLC (see [LICENSE](LICENSE)).
+Early. See [`plan/PLAN.md`](plan/PLAN.md) for the full design and build phases. Source-available under
+the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE) —
+© Cloud Dancer; distributed by Thot Technologies LLC (converts to Apache-2.0 four years after release).

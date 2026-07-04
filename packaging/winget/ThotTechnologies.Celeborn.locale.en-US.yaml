@@ -5,7 +5,8 @@ Publisher: Thot Technologies LLC
 PublisherUrl: https://github.com/cloud-dancer-labs
 PackageName: Celeborn
 PackageUrl: https://github.com/cloud-dancer-labs/celeborn
-License: Proprietary
+License: BUSL-1.1
+LicenseUrl: https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE
 Copyright: Copyright (c) 2026 Cloud Dancer (distributed by Thot Technologies LLC)
 ShortDescription: Long-term context substrate for coding agents (CLI).
 Description: >-

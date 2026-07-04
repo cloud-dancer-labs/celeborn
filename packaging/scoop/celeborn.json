@@ -2,7 +2,7 @@
   "version": "0.1.0",
   "description": "Long-term context substrate for coding agents (CLI).",
   "homepage": "https://github.com/cloud-dancer-labs/celeborn",
-  "license": "Proprietary",
+  "license": "BUSL-1.1",
   "architecture": {
     "64bit": {
       "url": "https://github.com/cloud-dancer-labs/celeborn/releases/download/v0.1.0/celeborn-windows-x86_64.exe#/celeborn.exe",
