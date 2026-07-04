@@ -42,8 +42,15 @@ SYNCABLE_SUFFIXES = (".md", ".json")
 # the raw-file channel also carried them, the two would fight: a file-pull of a stale tasks.md would
 # clobber a table-level reconcile (web edit), so every sync would thrash. Keep the table authoritative.
 TASK_TABLE_FILES = {cb.TASKS_FILE, cb.TASKS_JSON}
-# never sync these as raw files even though they're .json/.md: derived, local, rc, or table-owned
-SYNC_SKIP_NAMES = {cb.INDEX_NAME, cb.RC_NAME} | TASK_TABLE_FILES
+# The architecture diagram (CELE-t187) syncs through the structured `project_architecture` TABLE
+# channel (build_architecture_row/_push_architecture), with its `credentials` block STRIPPED. It must
+# NEVER go through the raw-file channel — that would upload the file verbatim, credentials and all.
+INFRA_LOCAL_NAME = "infra-local.json"
+# never sync these as raw files even though they're .json/.md: derived, local, rc, table-owned, or
+# credential-bearing (.alerts.json is transient blocked-progress state that rides the tasks
+# projection, CELE-t169; infra-local.json is credential-bearing and table-owned, CELE-t187)
+SYNC_SKIP_NAMES = {cb.INDEX_NAME, cb.RC_NAME, cb.ALERTS_NAME, INFRA_LOCAL_NAME,
+                   cb.ARCH_TRACE_STATE_NAME} | TASK_TABLE_FILES
 
 
 # --------------------------------------------------------------------------- config + credentials
@@ -232,6 +239,11 @@ def build_task_rows(ctx: Path, project_id: str, patterns: list[str]) -> list[dic
             "display_id": t.get("display_id") or t["id"],
             "owner_family": t.get("owner_family") or "",
             "owner_model": t.get("owner_model") or "",
+            # Live blocked-progress alert (CELE-t169) — the hosted board renders the same badge. Message
+            # is redacted like every other free-text field. Null columns when the card isn't blocked.
+            "alert_kind": (t.get("alert") or {}).get("kind") or None,
+            "alert_message": _clean((t.get("alert") or {}).get("message", "")) or None,
+            "alert_at": (t.get("alert") or {}).get("at") or None,
             "created": t.get("created") or None,
             "updated": t.get("updated") or None,
         })
@@ -806,6 +818,83 @@ def _push_tasks(ctx: Path, cfg: dict, jwt: str, project_id: str, patterns: list[
     return len(rows)
 
 
+# --------------------------------------------------------------------------- architecture diagram (CELE-t187)
+
+def _strip_credentials(doc: dict) -> dict:
+    """Return a copy of the architecture doc with the ENTIRE `credentials` block removed. Credentials
+    never sync (references/sync-design.md §9) — only schema/updated/nodes/flows survive. This is the
+    single chokepoint the diagram push goes through, so a credential value can never reach the cloud."""
+    return {k: v for k, v in doc.items() if k != "credentials"}
+
+
+def build_architecture_row(ctx: Path, project_id: str, patterns: list[str]) -> dict | None:
+    """Build the single `project_architecture` upsert row from `.context/infra-local.json`, with the
+    `credentials` block stripped AND a defense-in-depth secret-redaction pass over the remaining doc.
+    Pure + testable. Returns None when there's no (valid) infra-local.json — sync then no-ops."""
+    p = ctx / INFRA_LOCAL_NAME
+    if not p.is_file():
+        return None
+    raw = p.read_text(errors="ignore")
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError:
+        cb.warn(f"skipping architecture push: {INFRA_LOCAL_NAME} is not valid JSON")
+        return None
+    if not isinstance(doc, dict):
+        cb.warn(f"skipping architecture push: {INFRA_LOCAL_NAME} is not a JSON object")
+        return None
+    clean = _strip_credentials(doc)
+    # Belt-and-suspenders: run the same secret patterns over the (credential-free) doc in case a token
+    # was pasted into a node's notes/endpoint. redact() works on text, so round-trip through JSON.
+    redacted, _hits = redact(json.dumps(clean), patterns)
+    try:
+        clean = json.loads(redacted)
+    except json.JSONDecodeError:
+        pass  # redaction never breaks JSON structure, but never fail the sync if it somehow did
+    return {
+        "project_id": project_id,
+        "doc": clean,
+        "version": int(p.stat().st_mtime_ns),
+        "updated": cb.now_iso(),
+    }
+
+
+def _push_architecture(ctx: Path, cfg: dict, jwt: str, project_id: str, patterns: list[str]) -> int:
+    """Push the per-project architecture diagram to the hosted `project_architecture` table (0013) so it
+    renders on celeborn.thot.ai (CELE-t187). One row per project (upsert on project_id). No
+    infra-local.json → no-op. RLS gates this Pro, exactly like the file/task pushes."""
+    row = build_architecture_row(ctx, project_id, patterns)
+    if not row:
+        return 0
+    s, d = _http("POST", f"{cfg['url']}/rest/v1/project_architecture",
+                 headers=_rest_headers(cfg, jwt, {"Prefer": "resolution=merge-duplicates,return=minimal"}),
+                 body=[row])
+    if s == 403:
+        _upgrade_hint(d)
+        cb.die("the hosted architecture diagram requires a Celeborn Pro subscription.", code=2)
+    if s not in (200, 201, 204):
+        cb.die(f"architecture push failed ({s}): {d}")
+    return 1
+
+
+def cmd_architecture_sync(args):
+    """`celeborn architecture sync` — push the (credential-stripped) architecture topology to the
+    hosted board. Mirrors cmd_sync's session/project bootstrap, then pushes only the diagram."""
+    ctx = cb.require_context(args)
+    cfg = sync_config(ctx)
+    if cfg["url"].startswith("https://REPLACE"):
+        cb.die("hosted sync not configured. Set CELEBORN_SUPABASE_URL / _ANON_KEY or .celebornrc "
+               "sync.{url,anon_key} (see references/supabase-setup.md).")
+    patterns = cb.load_config(ctx).get("secret_patterns", [])
+    jwt = _ensure_session(cfg)
+    project_id = _ensure_project(ctx, cfg, jwt)
+    n = _push_architecture(ctx, cfg, jwt, project_id, patterns)
+    if n:
+        cb.ok("architecture diagram pushed to the hosted board (credentials stripped).")
+    else:
+        print(f"no {INFRA_LOCAL_NAME} to push — run `celeborn architecture init` first.")
+
+
 # --------------------------------------------------------------------------- active agents (live windows)
 
 def build_agent_rows(ctx: Path, project_id: str) -> list[dict]:
@@ -975,6 +1064,37 @@ def schedule_agents_push(ctx: Path, min_interval_s: int = 90) -> None:
         )
     except Exception:
         pass  # liveness is best-effort — a failed spawn never breaks the turn
+
+
+def schedule_architecture_push(ctx: Path) -> None:
+    """Best-effort detached remap (CELE-t201): after the auto-trace additively merges a new stack piece
+    into infra-local.json, push the (credential-stripped) topology to the hosted Stack WITHOUT blocking
+    the turn. Cheap gates first — nothing spawns unless hosted sync is configured and the user is signed
+    in; a failed spawn (or an unentitled/offline machine) is a silent no-op, exactly like the local
+    capture that already landed. No throttle: the trace itself only fires when something actually changed."""
+    try:
+        cfg = sync_config(ctx)
+        if cfg["url"].startswith("https://REPLACE"):
+            return  # hosted sync not configured → nowhere to push
+        creds = load_creds()
+        if not creds.get("refresh_token") and not creds.get("access_token"):
+            return  # not signed in
+    except Exception:
+        return
+    import sys, subprocess
+    try:
+        cli = os.path.join(os.path.dirname(os.path.abspath(__file__)), "celeborn.py")
+        repo_root = ctx.parent if ctx.name == ".context" else ctx
+        subprocess.Popen(
+            [sys.executable, cli, "architecture", "sync"],
+            cwd=str(repo_root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # outlive the parent CLI invocation
+        )
+    except Exception:
+        pass  # the remap is best-effort — a failed spawn never breaks the turn
 
 
 def cmd_hosted_push_agents(args) -> None:
@@ -1402,12 +1522,15 @@ def cmd_sync(args):
         # web edit isn't clobbered by a stale local push and a web-created card survives the prune.
         task_changes, conflicts = _pull_tasks(ctx, cfg, jwt, project_id)
         pushed_tasks = _push_tasks(ctx, cfg, jwt, project_id, patterns)
+        pushed_arch = _push_architecture(ctx, cfg, jwt, project_id, patterns)  # CELE-t187 (creds stripped)
         pulled = _pull(ctx, cfg, jwt, project_id)
         note = f"  ↑ pushed {pushed} file(s)"
         if redactions:
             note += f" ({redactions} secret(s) redacted out)"
         if pushed_tasks:
             note += f"  ⤴ {pushed_tasks} task(s) → hosted board"
+        if pushed_arch:
+            note += "  🗺 architecture → hosted board"
         if task_changes:
             note += f"  ⚠ {task_changes} task(s) changed on the hosted board → merged into tasks.md"
         note += f"  ↓ pulled {pulled} change(s)"

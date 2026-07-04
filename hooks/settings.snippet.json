@@ -41,6 +41,13 @@
         ]
       }
     ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command", "command": "celeborn hook notification" }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",

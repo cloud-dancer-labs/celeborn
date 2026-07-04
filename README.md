@@ -185,7 +185,7 @@ The Homebrew/winget/Scoop installs are **standalone native binaries** (no Python
 **2 — Wire the hooks into Claude Code** (once). The easy way — run it from your clone:
 
 ```bash
-celeborn wire --global      # merges statusLine + the 5 hook groups into ~/.claude/settings.json
+celeborn wire --global      # merges statusLine + the 6 hook groups into ~/.claude/settings.json
                             # (omit --global to wire just the current project's .claude/settings.json)
 ```
 
@@ -224,7 +224,7 @@ you'd rather:
 
 ```jsonc
 { "statusLine": { "type": "command", "command": "celeborn hook statusline" },
-  "hooks": { /* SessionStart · UserPromptSubmit · PreCompact · SessionEnd · Stop — copy from the snippet */ } }
+  "hooks": { /* SessionStart · UserPromptSubmit · PreCompact · SessionEnd · Stop · Notification — copy from the snippet */ } }
 ```
 
 This is what makes capture, the per-turn note, the statusLine, and context reminders fire automatically. The hooks
@@ -330,6 +330,39 @@ freely between versions. If you want different behavior, change it through a PR 
 
 (Prefer the short `celeborn` / `cel` command? That's the one-time [Install](#install) above.)
 
+### Product federation (multi-repo) — optional
+
+A product often spans several repos — a public client, a private server, vendored or forked
+dependencies — each with its own rules. `celeborn product` names those **facets** in a small registry
+so every agent knows, on orient, what facets exist and which are present on this machine:
+
+```bash
+celeborn product init                                             # scaffold .context/product.md
+celeborn product add client --role client:public --repo github.com/you/app
+celeborn product add server --role server:private --repo github.com/you/app-cloud
+celeborn product bind  client /path/to/checkout                   # per-machine, gitignored
+celeborn product                                                  # the facet table
+```
+
+Product **facts** (facet keys, roles, publish policy, repo URLs) live in the committed `product.md`;
+this machine's **checkout paths** live in a gitignored `product-local.json`, so a facet you haven't
+checked out here simply shows as *not present* rather than following a dead path. When a `product.md`
+exists, orient leads with a one-line banner of the facets and their bound/unbound state.
+
+Once facets are bound, git/PR ops route to the right repo and attribute themselves automatically:
+
+```bash
+celeborn commit --facet client -m "fix parser" parser.py   # commit in the client checkout + trailers
+celeborn push   --facet client                             # git push, routed to that checkout
+celeborn pr     --facet client --base main                 # DRAFT a PR (prints a gh command; never sends)
+```
+
+`commit` appends `Celeborn-Task`/`-Agent`/`-Model` trailers and registers a cross-repo touch, so one
+board coordinates work across every repo. A **publish guard** hard-DENYs a release (`twine`/`npm publish`,
+`gh release create`, a tag push, …) targeting a `server:private` or `oss:*` facet — the former never
+publishes, the latter is contributed back via fork → PR. See
+[`references/product-federation.md`](references/product-federation.md).
+
 ### Sync across devices (optional)
 
 Once `.context/` is private (gitignored), git no longer carries it between machines — so Celeborn can.
@@ -375,10 +408,11 @@ block, never duplicates it) and preserves the rest of the file; opt out with `in
 For the live, per-turn behaviour, run `celeborn wire` (or merge
 [`hooks/settings.snippet.json`](hooks/settings.snippet.json) into your `.claude/settings.json`). Each
 hook is a single in-process `celeborn hook <event>` command — no bash wrapper, no inline `python3`, no
-`$CELEBORN_HOME`; just have `celeborn` on PATH. The five hooks: `SessionStart` pre-hydrates the Hot
+`$CELEBORN_HOME`; just have `celeborn` on PATH. The six hooks: `SessionStart` pre-hydrates the Hot
 tier, `Stop` auto-captures each turn, `UserPromptSubmit` surfaces the context reminder and the capture
-heartbeat, `PreCompact` forces a checkpoint, and `SessionEnd` records the close. The four
-authored-tier hooks **no-op in repos without a `.context/`**, so they're safe to enable globally; the
+heartbeat, `PreCompact` forces a checkpoint, `SessionEnd` records the close, and `Notification` raises
+a blocked-progress alert on the DOING card when a session needs the user (a permission prompt or an
+idle stall — see `celeborn alert`). The authored-tier hooks **no-op in repos without a `.context/`**, so they're safe to enable globally; the
 `Stop`/capture hook instead falls back to the global `~/.context/` (above), so every session is
 recorded. On tools without hooks (Codex, Claude.ai), the skill still works — the agent runs the Orient
 read manually.

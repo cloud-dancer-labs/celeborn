@@ -347,17 +347,25 @@ def _derive_board_port(project_dir: Path) -> int:
     return BOARD_PORT_BASE + int(hashlib.sha1(key).hexdigest(), 16) % BOARD_PORT_SPAN
 
 
+# CELE-t170: one shared server serves every project's board on a single port — `/` is the fleet home,
+# `/board/<slug>` is a project's board. The per-repo hashed port (`_derive_board_port`) is retired from
+# the default path; it stays defined above for the stable-port unit test and any legacy explicit override.
+SHARED_BOARD_PORT = BOARD_PORT_BASE  # 3141
+
+
 def board_port(ctx: Path) -> int:
-    """Resolve this project's kanban port: an explicit, valid `board_port` in .celebornrc wins;
-    otherwise derive a stable per-project port from the project path (so repos never collide)."""
+    """The board's port. Defaults to the shared 3141 — one server for the whole fleet (CELE-t170).
+    An explicit, valid `board_port` in .celebornrc still wins as an advanced/legacy override."""
     p = load_config(ctx).get("board_port")
     if isinstance(p, int) and 1 <= p <= 65535:
         return p
-    return _derive_board_port(ctx.parent)
+    return SHARED_BOARD_PORT
 
 
 def board_url(ctx: Path) -> str:
-    return f"http://localhost:{board_port(ctx)}"
+    """This project's board on the shared server: http://localhost:<port>/board/<slug>. `/` is the
+    fleet home; each project lives under its slug so one server serves them all without data bleed."""
+    return f"http://localhost:{board_port(ctx)}/board/{project_slug(ctx)}"
 
 
 def _board_live(port: int, timeout: float = 0.15) -> bool:
@@ -403,17 +411,29 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _read_board_pidfile(ctx: Path) -> dict:
+# CELE-t170: the pidfile + log are MACHINE-GLOBAL (under ~/.config/celeborn), not per-`.context`,
+# because there is now exactly ONE shared board server for the whole machine. This is what makes the
+# supervisor a singleton: concurrent orients across repos all consult the same pidfile.
+def _board_pidfile_path() -> Path:
+    return _config_dir() / BOARD_PIDFILE
+
+
+def _board_log_path() -> Path:
+    return _config_dir() / BOARD_LOG
+
+
+def _read_board_pidfile() -> dict:
     try:
-        d = json.loads((ctx / BOARD_PIDFILE).read_text())
+        d = json.loads(_board_pidfile_path().read_text())
         return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def _board_booting(ctx: Path, port: int) -> bool:
-    """True if a board WE launched for this port is still alive (presumably mid-boot, not yet bound)."""
-    d = _read_board_pidfile(ctx)
+def _board_booting(port: int) -> bool:
+    """True if the shared board WE launched for this port is still alive (presumably mid-boot, not yet
+    bound). Machine-global — any repo's orient sees the same in-flight launch and won't double-spawn."""
+    d = _read_board_pidfile()
     pid = d.get("pid")
     return isinstance(pid, int) and d.get("port") == port and _pid_alive(pid)
 
@@ -467,18 +487,20 @@ def _install_supervisor_signals() -> None:
         pass
 
 
-def _board_supervise(runner: list[str], port: int, tasks_json: Path, board_dir: Path, *,
+def _board_supervise(runner: list[str], port: int, board_dir: Path, *,
                      spawn=None, sleeper=None, clock=None,
                      max_rapid: int = 5, rapid_window_s: float = 10.0,
                      backoff_cap_s: float = 30.0) -> int:
     """The self-healing core: run the viewer (`next dev`) as a child and relaunch it whenever it
-    exits, with bounded exponential backoff. This is the process detached and recorded in
-    `.board.pid`, so any crash of the dev server self-heals within seconds while the tab lives.
-    Gives up (returns) only after `max_rapid` restarts that each died inside `rapid_window_s` — a
-    genuinely broken build we shouldn't hot-loop. `spawn`/`sleeper`/`clock` are injectable so tests
-    drive the loop without real processes or real sleeps. Returns the number of child exits seen."""
+    exits, with bounded exponential backoff. This is the process detached and recorded in the
+    machine-global `.board.pid`, so any crash of the dev server self-heals within seconds while the
+    tab lives. One shared server on `port` serves every project (CELE-t170) — no per-repo tasks path;
+    the route resolves the project from the URL. Gives up (returns) only after `max_rapid` restarts
+    that each died inside `rapid_window_s` — a genuinely broken build we shouldn't hot-loop.
+    `spawn`/`sleeper`/`clock` are injectable so tests drive the loop without real processes or real
+    sleeps. Returns the number of child exits seen."""
     import os, time
-    env = {**os.environ, "PORT": str(port), "CELEBORN_TASKS_JSON": str(tasks_json)}
+    env = {**os.environ, "PORT": str(port)}
     if spawn is None:
         import subprocess
 
@@ -525,19 +547,21 @@ def _run_board_supervisor(args) -> None:
     if runner is None:
         print("🏹 board supervisor: viewer unavailable (no app / deps / npm) — exiting", flush=True)
         return
-    _board_supervise(runner, int(args.supervise_port), Path(args.supervise_tasks), board_dir)
+    _board_supervise(runner, int(args.supervise_port), board_dir)
 
 
-def _spawn_board(board_dir: Path, runner: list[str], port: int, tasks_json: Path, ctx: Path) -> int:
-    """Start the SUPERVISOR detached and return its PID (the PID we record in `.board.pid`). Own
-    session (setsid) so it outlives the hook and the spawning session; stdio to `.context/.board.log`.
-    The supervisor runs `runner` (`next dev`) as a child and relaunches it on crash, so the board
-    stays live for the whole session. Separated out so tests can stub the actual process launch."""
+def _spawn_board(board_dir: Path, runner: list[str], port: int) -> int:
+    """Start the SUPERVISOR detached and return its PID (the PID we record in the machine-global
+    `.board.pid`). Own session (setsid) so it outlives the hook and the spawning session; stdio to the
+    machine-global `.board.log`. The supervisor runs `next dev` (one shared server on `port`, CELE-t170)
+    as a child and relaunches it on crash. No per-repo tasks path — the route resolves the project from
+    the URL. Separated out so tests can stub the actual process launch."""
     import os, subprocess, sys
-    env = {**os.environ, "PORT": str(port), "CELEBORN_TASKS_JSON": str(tasks_json)}
-    log = open(ctx / BOARD_LOG, "ab", buffering=0)
+    env = {**os.environ, "PORT": str(port)}
+    _config_dir().mkdir(parents=True, exist_ok=True)
+    log = open(_board_log_path(), "ab", buffering=0)
     supervisor = [sys.executable, str(Path(__file__).resolve()), "board",
-                  "--supervise", "--supervise-port", str(port), "--supervise-tasks", str(tasks_json)]
+                  "--supervise", "--supervise-port", str(port)]
     try:
         proc = subprocess.Popen(
             supervisor, cwd=str(board_dir), env=env,
@@ -550,19 +574,21 @@ def _spawn_board(board_dir: Path, runner: list[str], port: int, tasks_json: Path
 
 
 def ensure_board(ctx: Path, *, launch: bool = True) -> dict:
-    """Probe this project's resolved kanban port; if it's down, start the viewer (detached) so it's
-    effectively always running on localhost. The seam the SessionStart hook calls on every orient.
+    """Probe the shared board port; if it's down, start the ONE viewer (detached) so it's effectively
+    always running on localhost:3141 for the whole fleet (CELE-t170). The seam the SessionStart hook
+    calls on every orient — from any repo. Idempotent: once live, every other repo's orient is a no-op.
 
     Returns a status dict {port, url, live, action, reason?} where `action` is one of:
       live        already listening — nothing to do
-      booting     a board we launched is still coming up (don't double-launch)
+      booting     the shared board we launched is still coming up (don't double-launch)
       started     just launched it (pid in the dict)
       off         autostart disabled in .celebornrc (board_autostart=false)
       no-tasks    this project doesn't use the kanban (no tasks.md) — stay quiet
       unavailable can't launch (no board app / deps not installed / no npm)
     Never raises — a hook must never break the user's turn."""
+    import os
     port = board_port(ctx)
-    url = f"http://localhost:{port}"
+    url = board_url(ctx)
     base = {"port": port, "url": url}
     if _board_live(port):
         return {**base, "live": True, "action": "live"}
@@ -570,7 +596,7 @@ def ensure_board(ctx: Path, *, launch: bool = True) -> dict:
         return {**base, "live": False, "action": "off", "reason": "board_autostart=false"}
     if not (ctx / "tasks.md").is_file():
         return {**base, "live": False, "action": "no-tasks", "reason": "no tasks.md — kanban unused"}
-    if _board_booting(ctx, port):
+    if _board_booting(port):
         return {**base, "live": False, "action": "booting"}
     board_dir = _board_dir()
     runner = _board_runner(board_dir)
@@ -579,9 +605,29 @@ def ensure_board(ctx: Path, *, launch: bool = True) -> dict:
                 "reason": "no board app, deps not installed, or npm missing"}
     if not launch:
         return {**base, "live": False, "action": "down"}
+    # Machine-global singleton claim: only ONE concurrent orient (across any repo/thread) may spawn the
+    # shared server. O_EXCL makes the check-and-claim atomic; a stale claim (dead pid) is stolen. The
+    # fixed port is the ultimate backstop — a losing supervisor can't bind 3141 and backs off.
     try:
-        pid = _spawn_board(board_dir, runner, port, _tasks_json_path(ctx), ctx)
-        (ctx / BOARD_PIDFILE).write_text(json.dumps({"pid": pid, "port": port, "at": now_iso()}) + "\n")
+        _config_dir().mkdir(parents=True, exist_ok=True)
+        pidfile = _board_pidfile_path()
+        try:
+            fd = os.open(str(pidfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            rec = _read_board_pidfile()
+            rp = rec.get("pid")
+            if isinstance(rp, int) and _pid_alive(rp):
+                return {**base, "live": False, "action": "booting"}
+            try:
+                os.unlink(str(pidfile))
+            except OSError:
+                pass
+            fd = os.open(str(pidfile), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            pid = _spawn_board(board_dir, runner, port)
+            os.write(fd, (json.dumps({"pid": pid, "port": port, "at": now_iso()}) + "\n").encode())
+        finally:
+            os.close(fd)
         return {**base, "live": False, "action": "started", "pid": pid}
     except Exception as e:                      # noqa: BLE001 — never let a launch failure break orient
         return {**base, "live": False, "action": "unavailable", "reason": str(e)}
@@ -1429,6 +1475,10 @@ def _ensure_gitignore(root: Path, private: bool = False):
         gi, ".context/.agents.json",
         "\n# Celeborn agent identity registry (handle -> family/model) — local cache.\n"
         ".context/.agents.json\n")
+    _append_gitignore_block(
+        gi, ".context/.alerts.json",
+        "\n# Celeborn live blocked-progress alerts (CELE-t169) — transient local state.\n"
+        ".context/.alerts.json\n")
     if private:
         if _append_gitignore_block(
                 gi, "/.context/",
@@ -1459,9 +1509,18 @@ def _ensure_gitignore(root: Path, private: bool = False):
         gi, ".context/.jira-autopush.json",
         "\n# Celeborn Jira auto-push queue (local debounce state)\n.context/.jira-autopush.json\n")
     _append_gitignore_block(
+        gi, ".context/.arch-trace.json",
+        "\n# Celeborn auto-architecture-trace bookkeeping (CELE-t201) — transient local state.\n"
+        ".context/.arch-trace.json\n")
+    _append_gitignore_block(
         gi, ".context/progress.json",
         "\n# Celeborn progress-engine bookkeeping (floor/signals/nudge state) — local-only.\n"
         ".context/progress.json\n")
+    _append_gitignore_block(
+        gi, ".context/product-local.json",
+        "\n# Celeborn product federation (CELE-t190): per-machine facet→checkout path bindings.\n"
+        "# product.md (the product facts) IS committed; only these local paths stay out of git.\n"
+        ".context/product-local.json\n")
 
 
 # Managed block that announces Celeborn through the file Claude Code auto-loads (CLAUDE.md). This is
@@ -2591,6 +2650,144 @@ def _save_agents(ctx: Path, data: dict):
     _agents_path(ctx).write_text(json.dumps(data, indent=2) + "\n")
 
 
+# --------------------------------------------------------------------------- alerts (CELE-t169)
+# Transient per-card "coding progress is blocked, the user's input is needed" state — a permission
+# prompt, a ~60s idle stall, or a stopped turn awaiting direction. Like the /clear-nudge token band
+# it is LIVE state that rides the DOING card, never a durable tasks.md field: it lives in a local,
+# gitignored `.context/.alerts.json` and is stamped onto the board projection (`_tasks_doc`) + the
+# fleet snapshot (`_doing_row`) + the hosted `tasks` push. `celeborn alert` is the reusable service
+# (the Notification/Stop hooks are its first callers; any other system can call it too), and it
+# clears the moment the user re-engages (a new prompt). No focus-stealing OS dialog (rejected
+# t47/t50/t62) — the alert surfaces on the card, locally and on celeborn.thot.ai.
+ALERTS_NAME = ".alerts.json"
+ALERTS_SCHEMA = "celeborn-alerts/1"
+ALERT_KINDS = ("permission", "idle", "stopped")
+
+
+def _alerts_path(ctx: Path) -> Path:
+    return ctx / ALERTS_NAME
+
+
+def _load_alerts(ctx: Path) -> dict:
+    p = _alerts_path(ctx)
+    if not p.is_file():
+        return {"schema": ALERTS_SCHEMA, "alerts": {}}
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"schema": ALERTS_SCHEMA, "alerts": {}}
+    data.setdefault("schema", ALERTS_SCHEMA)
+    if not isinstance(data.get("alerts"), dict):
+        data["alerts"] = {}
+    return data
+
+
+def _save_alerts(ctx: Path, data: dict):
+    import os
+    data["schema"] = ALERTS_SCHEMA
+    p = _alerts_path(ctx)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, p)
+
+
+def _alert_for(ctx: Path, task_id: str) -> dict | None:
+    """The live alert on a card (bare local id), or None. Read by the projection/snapshot stamps."""
+    bare = _split_qualified_tid((task_id or "").strip())[1]
+    return (_load_alerts(ctx).get("alerts") or {}).get(bare) if bare else None
+
+
+def _set_alert(ctx: Path, task_id: str, kind: str, message: str = "", session: str = "") -> dict:
+    """Raise (or refresh) the blocked-alert on a card. Idempotent per card — one alert at a time; a
+    newer signal overwrites. Returns the stored record."""
+    bare = _split_qualified_tid((task_id or "").strip())[1]
+    if not bare:
+        return {}
+    kind = kind if kind in ALERT_KINDS else "idle"
+    rec = {"kind": kind, "message": (message or "").strip()[:280], "at": now_iso(),
+           "session": (session or "").strip()[:12]}
+    data = _load_alerts(ctx)
+    data.setdefault("alerts", {})[bare] = rec
+    _save_alerts(ctx, data)
+    return rec
+
+
+def _clear_alert(ctx: Path, task_id: str) -> bool:
+    """Drop a card's alert (progress resumed / card claimed elsewhere). True if one was present."""
+    bare = _split_qualified_tid((task_id or "").strip())[1]
+    if not bare:
+        return False
+    data = _load_alerts(ctx)
+    alerts = data.setdefault("alerts", {})
+    if bare in alerts:
+        del alerts[bare]
+        _save_alerts(ctx, data)
+        return True
+    return False
+
+
+def _live_alerts(ctx: Path) -> dict:
+    """The alerts map with DEAD-session alerts filtered out (CELE-t195). A blocked-alert means "this
+    session is awaiting the user" — once that session has ended (`/clear`, logout, exit → tombstoned
+    in `ended_sessions`), it is awaiting nothing, so its badge must not keep blinking on the board.
+    This is the deterministic catch-all for the stale badge: it holds even when the SessionEnd hook
+    never fired to clear the record (the common cause — a window killed without a clean exit). An
+    alert with no recorded session is kept (can't prove it's dead). Read by the board projections."""
+    alerts = dict(_load_alerts(ctx).get("alerts") or {})
+    if not alerts:
+        return alerts
+    ended = _load_metrics(ctx).get("ended_sessions") or {}
+    if not ended:
+        return alerts
+    live = {}
+    for tid, rec in alerts.items():
+        sess = ((rec or {}).get("session") or "").strip()   # stored as sid[:12]
+        if sess and any(k.startswith(sess) for k in ended):
+            continue                                          # owning window is gone — drop the badge
+        live[tid] = rec
+    return live
+
+
+def _clear_alert_on_activity(project_dir: str, session: str) -> None:
+    """Drop this session's card alert the instant it makes a tool call (CELE-t195). PreToolUse fires
+    on every Bash/Edit/Write/NotebookEdit, so a tool call is the earliest observable "work resumed"
+    signal — clearing HERE (not only on the next user prompt) is what drops the board's "awaiting you"
+    badge within seconds of the user removing the block, including the cases the user-prompt-submit
+    clear misses entirely: a permission GRANT or an AskUserQuestion ANSWER both resume the SAME turn
+    and never fire a new prompt, so the old code left the badge stale for the rest of the turn.
+
+    Fast-guarded so the ~99% no-alert tool call pays almost nothing: no .context/ → return; no alerts
+    file → one stat and return; empty alerts map → one small read and return. Best-effort; a bug here
+    must never break a tool call, so everything is wrapped and swallowed."""
+    if not session:
+        return
+    try:
+        ctxdir = find_context_root(Path(project_dir))
+        if ctxdir is None or not _alerts_path(ctxdir).is_file():
+            return
+        if not (_load_alerts(ctxdir).get("alerts") or {}):
+            return                                    # resting state — nothing to clear
+        tid = _session_task_id(ctxdir, session)
+        if tid and _clear_alert(ctxdir, tid):
+            _refresh_alerted_card(ctxdir, tid)
+            __import__("celeborn_sync").schedule_agents_push(ctxdir, min_interval_s=0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _refresh_alerted_card(ctx: Path, task_id: str) -> None:
+    """After an alert set/clear, regenerate the derived tasks.json (so the local board's next poll
+    carries the badge) and live-push the one card to the hosted board. Best-effort — an alert must
+    never break a turn or a caller."""
+    bare = _split_qualified_tid((task_id or "").strip())[1]
+    if not bare:
+        return
+    try:
+        _save_tasks(ctx, _load_tasks(ctx), autopush_ids=[bare])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _register_agent(ctx: Path, handle: str, family: str = "", model: str = "") -> dict:
     """Upsert a handle's family/model — only non-empty fields overwrite. Returns the merged entry."""
     handle = (handle or "").strip()
@@ -2924,7 +3121,7 @@ def cmd_board(args):
         _run_board_supervisor(args); return
     ctx = require_context(args)
     port = board_port(ctx)
-    url = f"http://localhost:{port}"
+    url = board_url(ctx)
     if getattr(args, "port_only", False):
         print(port); return
     if getattr(args, "url_only", False):
@@ -3690,8 +3887,14 @@ def _minutes_since_iso(at: str) -> int | None:
     return max(0, int((_dt.datetime.now() - ts).total_seconds() // 60))
 
 
-def _fleet_agent_status(ctx: Path, owner: str, doing: list[dict], touches: list[dict]) -> str:
-    """working | stuck | idle — per-agent liveness from touches + DOING cards."""
+def _fleet_agent_status(ctx: Path, owner: str, doing: list[dict], touches: list[dict], *, live: bool = False) -> str:
+    """working | stuck | idle — per-agent liveness from touches + DOING cards.
+
+    `live` (CELE-t172): the owning project shows real recent activity — a live transcript window, a
+    fresh mechanical capture, or a session heartbeat. File touches are an optional, releasable
+    protocol, so a session that released its touches (or merely let them age) while still DOING must
+    not read as "stuck" if it's demonstrably alive. When `live`, a touch-derived "stuck" is
+    downgraded back to "working"."""
     who = (owner or "").strip() or "_unassigned"
     mine = [t for t in touches if (t.get("by") or "").strip() == who]
     cards = [t for t in doing if ((t.get("owner") or "").strip() or "_unassigned") == who]
@@ -3699,17 +3902,20 @@ def _fleet_agent_status(ctx: Path, owner: str, doing: list[dict], touches: list[
         ages = [_minutes_since_iso(t.get("at", "")) for t in mine]
         ages = [a for a in ages if a is not None]
         if ages and min(ages) <= _FLEET_WORKING_MINUTES:
-            return "working"
-        if ages and min(ages) > _FLEET_STUCK_MINUTES and cards:
-            return "stuck"
-        if cards and not _task_has_active_touches(ctx, cards[0]["id"]):
-            return "stuck"
-        return "working" if ages and min(ages) <= _FLEET_STUCK_MINUTES else "idle"
-    if cards:
-        if any(_is_stale_doing(ctx, t) for t in cards):
-            return "stuck"
-        return "idle"
-    return "idle"
+            status = "working"
+        elif ages and min(ages) > _FLEET_STUCK_MINUTES and cards:
+            status = "stuck"
+        elif cards and not _task_has_active_touches(ctx, cards[0]["id"]):
+            status = "stuck"
+        else:
+            status = "working" if ages and min(ages) <= _FLEET_STUCK_MINUTES else "idle"
+    elif cards:
+        status = "stuck" if any(_is_stale_doing(ctx, t) for t in cards) else "idle"
+    else:
+        status = "idle"
+    if status == "stuck" and live and cards:
+        return "working"
+    return status
 
 
 def _fleet_project_snapshot(project_dir: Path) -> dict | None:
@@ -3723,6 +3929,35 @@ def _fleet_project_snapshot(project_dir: Path) -> dict | None:
     session = _load_session(ctx)
     activity = _parse_activity_meta(ctx)
     doing = [t for t in tasks if t["state"] == "doing"]
+
+    # Real session liveness (CELE-t172), shared by the stale gate below and the context band. A live
+    # transcript window, a fresh mechanical capture, or a recent session heartbeat all mean "someone
+    # is actively here" — regardless of whether file touches are present.
+    #
+    # CELE-t178: context tracking follows the SESSION, not the card — a shipped card must not clear the
+    # fleet widget's context band while the owning session is still alive. So we scan transcripts when
+    # the project has DOING cards OR shows fresh mechanical activity (capture/session within the stale
+    # window). The transcript scan (and its token estimate) stays skipped for genuinely idle projects,
+    # preserving the CELE-t170 per-poll perf win — a completed-but-live session keeps a fresh
+    # activity.md capture every turn, so it still qualifies.
+    last_mins = _minutes_since_iso(activity.get("last_capture", ""))
+    sess_mins = _minutes_since_iso(session.get("updated_at", ""))
+    _cheap_live = (
+        (last_mins is not None and last_mins <= _FLEET_STUCK_MINUTES)
+        or (sess_mins is not None and sess_mins <= _FLEET_STUCK_MINUTES)
+    )
+    agent_rows = _active_agents(ctx, AGENT_ACTIVE_WINDOW_MIN, False) if (doing or _cheap_live) else []
+    tokens_by_task: dict[str, int] = {}
+    session_by_task: dict[str, str] = {}
+    for r in agent_rows:  # sorted fullest-window first, so the loudest session wins per card
+        tid = r.get("task_id")
+        if tid:
+            tokens_by_task[tid] = max(tokens_by_task.get(tid, 0), int(r.get("tokens") or 0))
+            sid = (r.get("session") or "")[:6]
+            if sid and tid not in session_by_task:
+                session_by_task[tid] = sid
+    project_live = bool(agent_rows) or _cheap_live
+
     owners: set[str] = set()
     for t in doing:
         owners.add((t.get("owner") or "").strip() or "_unassigned")
@@ -3730,7 +3965,7 @@ def _fleet_project_snapshot(project_dir: Path) -> dict | None:
         owners.add((t.get("by") or "").strip() or "unknown")
     agents = []
     for who in sorted(owners):
-        cards = [{"id": t["id"], "title": t["title"], "stale": _is_stale_doing(ctx, t)}
+        cards = [{"id": t["id"], "title": t["title"], "stale": _is_stale_doing(ctx, t) and not project_live}
                  for t in doing
                  if ((t.get("owner") or "").strip() or "_unassigned") == who]
         touch_rows = [{"path": t["path"], "task": t.get("task") or "", "age": t.get("age") or ""}
@@ -3739,7 +3974,7 @@ def _fleet_project_snapshot(project_dir: Path) -> dict | None:
             continue
         agents.append({
             "id": who,
-            "status": _fleet_agent_status(ctx, who, doing, touches),
+            "status": _fleet_agent_status(ctx, who, doing, touches, live=project_live),
             "doing": cards,
             "touches": touch_rows,
         })
@@ -3751,10 +3986,67 @@ def _fleet_project_snapshot(project_dir: Path) -> dict | None:
         proj_status = "stuck"
     else:
         proj_status = "idle"
-    last_mins = _minutes_since_iso(activity.get("last_capture", ""))
+    # Enrichment for the fleet home cards (CELE-t170): the board's owner→model join, a project-
+    # qualified display id, and each DOING card's sand-fill progress; plus the top TODO the project
+    # should pick up next. The per-card context-window band (`k`) rides `tokens_by_task` above
+    # (CELE-t172) — the same live-window value `celeborn agents --json` returns — so the fleet cards
+    # carry the /clear-nudge band, matching the tasks board.
+    slug = project_slug(ctx)
+    reg = _load_agents(ctx).get("agents") or {}
+    alerts = _live_alerts(ctx)   # CELE-t195: drop alerts from ended sessions so a dead window can't blink
+
+    def _doing_row(t: dict) -> dict:
+        owner = (t.get("owner") or "").strip()
+        model = (reg.get(owner) or {}).get("model") or ""
+        tokens = tokens_by_task.get(t["id"])
+        return {
+            "id": t["id"],
+            "display_id": _display_tid(ctx, t["id"], slug=slug),
+            "title": t["title"],
+            # Session / human handle only — a model-derived owner falls back to the live session id
+            # (when known) or is suppressed, never rendered as the owner (CELE-t172).
+            "owner": _display_owner(owner, model, session_by_task.get(t["id"], "")),
+            "owner_model": model,
+            "progress": t.get("progress") or 0,
+            # Live session (recent transcript/capture/heartbeat) is never stale — touches are an
+            # optional, releasable protocol, so a lapsed/released touch alone must not read stale.
+            "stale": _is_stale_doing(ctx, t) and not project_live,
+            # Live context window in k-tokens for the /clear-nudge band pill; None when no live
+            # transcript attributes to this card (the pill degrades gracefully) (CELE-t172).
+            "k": (tokens // 1000) if tokens else None,
+            # Live blocked-alert (CELE-t169): permission / idle / stopped — None when unblocked.
+            "alert": alerts.get(t["id"]),
+        }
+
+    # CELE-t178: when a live session has NO doing card (it just shipped one, or hasn't claimed yet)
+    # the in-flight block above won't render — so surface the session's live context band separately,
+    # keyed on the session id. "session id active = tracked context": a completed card never clears
+    # this; the band shows until the session claims another card (then the in-flight block takes the
+    # slot) or the session goes idle / clears (agent_rows drops it). agent_rows is fullest-window
+    # first, so the loudest session wins the card's row.
+    active_session = None
+    if agent_rows and not doing:
+        top = agent_rows[0]
+        toks = int(top.get("tokens") or 0)
+        sid = (top.get("session") or "")[:6]
+        # _active_agents sets `agent` to a real handle (@claim / CELEBORN_AGENT) or, absent one, the
+        # session short id itself — so a real owner is one that isn't just that session-id fallback.
+        agent_h = (top.get("agent") or "").strip()
+        active_session = {
+            "session": sid,
+            "owner": agent_h if (agent_h and agent_h != sid) else "",
+            "k": (toks // 1000) if toks else None,
+        }
+
+    todo_top = next((t for t in tasks if t["state"] == "todo"), None)
+    suggested_todo = (
+        {"id": todo_top["id"], "display_id": _display_tid(ctx, todo_top["id"], slug=slug),
+         "title": todo_top["title"]}
+        if todo_top else None
+    )
     return {
         "path": str(project_dir),
-        "slug": project_slug(ctx),
+        "slug": slug,
         "name": _project_name(ctx),
         "status": proj_status,
         "session": {
@@ -3765,8 +4057,10 @@ def _fleet_project_snapshot(project_dir: Path) -> dict | None:
             "updated_at": session.get("updated_at") or "",
         },
         "counts": {s: sum(1 for t in tasks if t["state"] == s) for s in TASK_STATES},
-        "doing": [{"id": t["id"], "title": t["title"], "owner": t.get("owner") or "",
-                   "stale": _is_stale_doing(ctx, t)} for t in doing],
+        "doing": [_doing_row(t) for t in doing],
+        # Live context of the owning session when there is no in-flight card to carry the band (t178).
+        "active_session": active_session,
+        "suggested_todo": suggested_todo,
         "agents": agents,
         "activity": {**activity, "minutes_since_capture": last_mins},
         "board": {"port": port, "url": board_url(ctx), "live": live},
@@ -3981,6 +4275,43 @@ _SESSION_ID_RE = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I
 
 def _looks_like_session_id(s: str) -> bool:
     return bool(_SESSION_ID_RE.fullmatch((s or "").strip()))
+
+
+# Tokens that occur only in model names — never in a hex session short-id (hex letters are a–f, so
+# 'opus'/'sonnet'/'gemini'/… can't appear) nor in a bare family/human handle ('grok', 'scotch').
+# Used to keep model strings out of the owner chip: a card is owned by its session, not its model
+# (CELE-t131/t172).
+_MODEL_TOKEN_RE = re.compile(r"opus|sonnet|haiku|fable|gpt[0-9]|gemini[0-9]|claude[0-9]")
+
+# Bare model-family words that _MODEL_TOKEN_RE (which needs a digit for gpt/gemini/claude) misses —
+# used only to sharpen the "record your model with `identify`" nudge when a superseded --by was a
+# generic family name (e.g. `--by claude`). NOT used to change ownership: outside a Claude window a
+# human may legitimately attribute `--by claude`, so this never rejects, it only advises.
+_GENERIC_MODEL_FAMILIES = {"claude", "gpt", "chatgpt", "gemini", "opus", "sonnet", "haiku", "fable",
+                           "llama", "mistral", "anthropic", "openai"}
+
+
+def _looks_like_model_handle(owner: str, model: str = "") -> bool:
+    """True when a claim handle embeds a model name rather than an identity — e.g. 'claude-opus48',
+    'Claude/Opus 4.8', 'Opus 4.8'. A session short-id, a bare family, or a human handle is not.
+    `model` (the handle's registered model, when known) catches custom names the token list misses."""
+    norm = re.sub(r"[^a-z0-9]", "", (owner or "").lower())
+    if not norm:
+        return False
+    m = re.sub(r"[^a-z0-9]", "", (model or "").lower())
+    if len(m) >= 4 and m in norm:
+        return True
+    return bool(_MODEL_TOKEN_RE.search(norm))
+
+
+def _display_owner(owner: str, model: str = "", session_id: str = "") -> str:
+    """The owner chip shows a session / human handle, never a model (CELE-t172). When a card's
+    recorded owner is model-derived, prefer the live session short-id if known, else show nothing
+    rather than leak model text onto the board."""
+    owner = (owner or "").strip()
+    if owner and _looks_like_model_handle(owner, model):
+        return (session_id or "").strip()
+    return owner
 
 
 def _cc_project_dir(repo: Path) -> Path:
@@ -4802,7 +5133,7 @@ def _hook_run(fn, **ns) -> str:
 
 
 def _compose_user_prompt_envelope(heartbeat: str, nudge: str, handoff: str = "", claim: str = "",
-                                  directive: str = "", progress_nudge: str = "") -> str:
+                                  directive: str = "", progress_nudge: str = "", arch_notice: str = "") -> str:
     """Build the UserPromptSubmit JSON envelope (was the python3 tail of hooks/context-watch.sh).
 
     `additionalContext` is delivered to the MODEL only — never painted for the user on any surface
@@ -4835,6 +5166,11 @@ def _compose_user_prompt_envelope(heartbeat: str, nudge: str, handoff: str = "",
             "[Celeborn progress nudge — SURFACE THIS TO THE USER. Your doing card's bar hasn't moved; "
             "relay the line below verbatim (on its own line) and run the copy-pasteable command it "
             "names if the milestone is genuinely done:]\n" + progress_nudge)
+    if arch_notice:
+        parts.append(
+            "[Celeborn architecture trace — SURFACE THIS TO THE USER. The auto-trace (CELE-t201) found a "
+            "new piece in the stack and remapped the hosted Stack; relay the line(s) below verbatim, on "
+            "their own line(s):]\n" + arch_notice)
     if nudge:
         parts.append(
             "[Celeborn context-health notice — FRESHEN THE HOT TIER FIRST, THEN SURFACE THIS TO THE USER] "
@@ -4946,6 +5282,89 @@ def _pre_tool_use_decision(payload: dict) -> str:
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,
         "permissionDecisionReason": reason,
+    }})
+
+
+# --------------------------------------------------------------------------- PreToolUse publish guard (t191)
+#
+# Layer B of the product federation (CELE-t188 §6). A publish/release action — twine/flit/poetry/hatch/
+# maturin publish, npm/pnpm/yarn/bun publish, cargo publish, `gh release create`, or a tag push — that
+# targets a facet whose role is `server:private` or any `oss:*` is a policy violation: server:private
+# never publishes (full rights reserved), and oss:* is stewarded code we contribute back via fork→PR, never
+# publish as ours. Only `client:public` publishes (still honoring the CELE-t168 BUSL gate elsewhere).
+# Same rail + hard-DENY vocabulary as the redirect guard above, and the same accepted-risk escape hatch:
+# a trailing `# celeborn:allow-publish: <why>` marker auto-ALLOWS the command (mirrors allow-redirect).
+# Silent for single-repo projects (no product.md) and for any command that isn't a publish action — the
+# cheap regex runs first, so only publish-shaped Bash commands ever pay the registry lookup.
+PUBLISH_BYPASS_MARKER = "celeborn:allow-publish"
+_PUBLISH_ACTION_RE = re.compile(
+    r"\btwine\s+upload\b"
+    r"|\bpython\d?\s+-m\s+twine\b"
+    r"|\b(?:flit|poetry|hatch|maturin)\s+publish\b"
+    r"|\b(?:npm|pnpm|yarn|bun)\s+publish\b"
+    r"|\bcargo\s+publish\b"
+    r"|\bgh\s+release\s+create\b"
+    r"|\bgit\s+push\b[^\n|;&]*--(?:tags|follow-tags)\b",
+    re.I,
+)
+
+
+def _is_publish_action(cmd: str) -> bool:
+    """True if `cmd` is a package-registry publish or a release/tag push — the actions the publish guard
+    (and cmd_push's in-command check) enforce role policy on. A plain branch `git push` is NOT one."""
+    return bool(cmd) and bool(_PUBLISH_ACTION_RE.search(cmd))
+
+
+def _role_forbids_publish(role: str) -> bool:
+    """Publish policy from the role vocabulary (t188 §3): server:private never publishes; every oss:*
+    contributes via fork→PR, never publish-as-ours. Only client:public may publish."""
+    role = (role or "").strip()
+    return role == "server:private" or role.startswith("oss:")
+
+
+def _publish_policy_reason(key: str, role: str, action: str = "this publish/release action") -> str:
+    """The hard-DENY / refusal message for a publish targeting a forbidden facet — shared by the
+    PreToolUse guard and cmd_push's in-command check so the wording is identical wherever it fires."""
+    if (role or "").startswith("oss:"):
+        why = f"role {role} — stewarded OSS; contribute via fork → PR, never publish as ours"
+    else:
+        why = f"role {role} — private, full rights reserved; it never publishes"
+    return (f"🏹 Celeborn publish guard: {action} targeting facet '{key}' is refused ({why}). If this is "
+            f"genuinely intended, the operator can override the raw command with a trailing "
+            f"`# {PUBLISH_BYPASS_MARKER}: <why>` comment (accepted-risk, exactly like `# celeborn:allow-redirect`).")
+
+
+def _publish_guard_decision(payload: dict, project_dir: str) -> str:
+    """PreToolUse publish guard (t191). Hard-DENY a Bash publish/release action that targets a
+    server:private/oss:* facet — resolved from the product registry either by a bound checkout path
+    appearing in the command or by the project the command runs in. AUTO-ALLOW on an explicit
+    `# celeborn:allow-publish` marker. Emits nothing for anything else (no product.md, not a publish
+    action, or targeting a client:public facet), so every other Bash call flows through untouched."""
+    if (payload.get("tool_name") or "") != "Bash":
+        return ""
+    cmd = (payload.get("tool_input") or {}).get("command") or ""
+    if not _is_publish_action(cmd):
+        return ""                                      # not a publish action — flow through (cheap fast path)
+    ctxdir = find_context_root(Path(project_dir))
+    if ctxdir is None:
+        return ""                                      # not a Celeborn project — never guard
+    targets = _publish_guard_targets(ctxdir, cmd, project_dir)
+    if not targets:
+        return ""                                      # no forbidden facet in scope (e.g. client:public) — allow
+    key, role = targets[0]
+    if PUBLISH_BYPASS_MARKER in cmd:
+        return json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": (
+                f"🏹 Celeborn auto-allowed a publish action on facet '{key}' ({role}) via an explicit "
+                f"`# {PUBLISH_BYPASS_MARKER}` marker — the operator accepted the policy risk. The default "
+                f"posture hard-DENYs publishing a server:private/oss:* facet."),
+        }})
+    return json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": _publish_policy_reason(key, role),
     }})
 
 
@@ -5090,6 +5509,17 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         redirect = _pre_tool_use_decision(payload)
         if redirect:
             return redirect
+        # Publish guard (CELE-t191): after the redirect guard has no opinion, refuse a publish/release
+        # action targeting a server:private/oss:* facet (§6). Its own cheap publish-action regex gates the
+        # registry lookup, so a non-publish Bash call returns in microseconds, same as the redirect guard.
+        publish = _publish_guard_decision(payload, project_dir)
+        if publish:
+            return publish
+        # Work resumed (CELE-t195): a tool call means this session is actively working again, so any
+        # "awaiting you" alert on its card (permission / idle / stopped) is stale. Clear it here — the
+        # earliest resume signal — so the badge drops within seconds even when the user unblocks
+        # WITHOUT a new prompt (permission grant, AskUserQuestion answer). Fast-guarded; best-effort.
+        _clear_alert_on_activity(project_dir, payload.get("session_id") or "")
         return _card_gate_pre_tool_use(payload, project_dir)
     sid = payload.get("session_id") or ""
     tp = payload.get("transcript_path") or ""
@@ -5130,7 +5560,7 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         # Lead the Orient load with at most two one-line self-diagnosing notices: the install-integrity
         # check, then the skill advisor (t70) — friction/quality recommendations the agent can act on,
         # throttled to one per session. Both are best-effort and silent when there's nothing to say.
-        notices = [_integrity_notice(), _advisor_notice(ctxdir, sid), SHELL_HYGIENE_RULE]
+        notices = [_integrity_notice(), _advisor_notice(ctxdir, sid), _product_banner(ctxdir), SHELL_HYGIENE_RULE]
         head = "\n\n".join(n for n in notices if n)
         head = (head + "\n\n") if head else ""
         return head + "## Celeborn memory (Orient load)\n\n" + _hook_run(cmd_status, path=proj, full=False)
@@ -5170,6 +5600,12 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
             # a closed terminal can't bleed its card onto someone else's later /clear.
             if (payload.get("reason") or "") in ("", "clear"):
                 _stash_clear_carryover(ctxdir, sid)
+            # A stopped/idle/permission alert dies with its session (CELE-t195): the window is gone,
+            # so it awaits nothing. Clear the record now so .alerts.json doesn't accumulate the stale
+            # badges that _live_alerts otherwise has to filter (belt-and-suspenders with that guard).
+            _tid = _session_task_id(ctxdir, sid)
+            if _tid:
+                _clear_alert(ctxdir, _tid)
             if _mark_session_ended(ctxdir, sid):
                 __import__("celeborn_sync").schedule_agents_push(ctxdir, min_interval_s=0)
         except Exception:
@@ -5181,8 +5617,42 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         # session goes unrecorded. Needs a transcript to read; without one there's nothing to capture.
         if not tp:
             return ""
+        # Idle-Stop alert (CELE-t169): the turn ended and the session's DOING card is unfinished, so
+        # coding progress has paused awaiting the user's next direction. Raise a low-severity "stopped"
+        # alert on the card — it clears the instant the user replies (user-prompt-submit below). A card
+        # that was just shipped is no longer doing, so `_session_task_id` returns "" and no alert fires.
+        if ctxdir is not None:
+            try:
+                tid = _session_task_id(ctxdir, sid)
+                if tid:
+                    _set_alert(ctxdir, tid, "stopped", "Turn ended — awaiting your direction.", sid)
+                    _refresh_alerted_card(ctxdir, tid)
+                    __import__("celeborn_sync").schedule_agents_push(ctxdir, min_interval_s=0)
+            except Exception:  # noqa: BLE001
+                pass
         return _hook_run(cmd_capture, path=proj, transcript=tp, session=sid,
                          quiet=True, note=True, global_=(ctxdir is None))
+
+    if event == "notification":
+        # Claude Code fires Notification when it needs tool-use permission or the prompt has been idle
+        # ~60s — exactly "agentic progress is blocked, the user's input is needed" (CELE-t169). Raise the
+        # matching alert on the session's DOING card so it surfaces on the board (locally + hosted). The
+        # message classifies the kind; it clears when the user next replies. Best-effort — never break.
+        if ctxdir is None:
+            return ""
+        try:
+            tid = _session_task_id(ctxdir, sid)
+            if tid:
+                msg = (payload.get("message") or "").strip()
+                low = msg.lower()
+                kind = "permission" if ("permission" in low or "approve" in low or "waiting for your" in low) else "idle"
+                _set_alert(ctxdir, tid, kind, msg or ("Needs permission to proceed." if kind == "permission"
+                                                      else "Waiting for your input."), sid)
+                _refresh_alerted_card(ctxdir, tid)
+                __import__("celeborn_sync").schedule_agents_push(ctxdir, min_interval_s=0)
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
 
     if event == "statusline":
         # cmd_statusline handles its own global fallback; pass the start dir and a transcript if any.
@@ -5191,6 +5661,15 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
     if event == "user-prompt-submit":
         if ctxdir is None or not tp:
             return ""                                  # need a transcript to read the live ctx size
+        # Resume clears the block (CELE-t169): the user has replied, so any permission/idle/stopped
+        # alert on this session's DOING card is stale — drop it and refresh the card. Best-effort.
+        try:
+            _tid = _session_task_id(ctxdir, sid)
+            if _tid and _clear_alert(ctxdir, _tid):
+                _refresh_alerted_card(ctxdir, _tid)
+                __import__("celeborn_sync").schedule_agents_push(ctxdir, min_interval_s=0)
+        except Exception:  # noqa: BLE001
+            pass
         # Per-turn board re-ensure (CELE-t99 safety net): the user taking a turn is a good proxy for
         # "the board tab is open", so revive a downed board here too — covers the gap if even the
         # supervisor was killed. Cheap (~150ms probe; relaunch is detached) and strictly best-effort:
@@ -5244,7 +5723,13 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
             progress_nudge = _progress_hook(ctxdir, sid)
         except Exception:  # noqa: BLE001
             progress_nudge = ""
-        return _compose_user_prompt_envelope(heartbeat, nudge, handoff, claim, directive, progress_nudge)
+        # Auto-architecture-trace (CELE-t201): every few turns (and draining any manifest-edit trace note),
+        # re-detect the stack and remap the hosted Stack when a new piece appears. Best-effort — never breaks.
+        try:
+            arch_notice = _maybe_arch_trace_on_turn(ctxdir)
+        except Exception:  # noqa: BLE001
+            arch_notice = ""
+        return _compose_user_prompt_envelope(heartbeat, nudge, handoff, claim, directive, progress_nudge, arch_notice)
 
     if event == "post-edit":
         # Quality gate (t70 Phase 2), PostToolUse after Edit/Write. CHEAP check only: byte-compile an
@@ -5261,6 +5746,13 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
             rel = str(Path(fp).resolve().relative_to(proj_root.resolve()))
         except (ValueError, OSError):
             rel = fp
+        # Auto-architecture-trace (CELE-t201): a dependency-manifest edit means a piece may have entered
+        # the stack — trace NOW (bypassing the cadence) and remap. The note is stashed for the next
+        # user-prompt-submit to surface (PostToolUse additionalContext reaches the model only). Best-effort.
+        try:
+            _maybe_arch_trace_on_edit(ctxdir, rel)
+        except Exception:  # noqa: BLE001
+            pass
         qcfg = _quality_config(ctxdir)
         gate = _quality_gate_for(rel, qcfg)
         if gate is None:
@@ -5425,6 +5917,9 @@ WIRE_HOOKS = [
     ("PreCompact", "pre-compact", "pre-compact.sh"),
     ("SessionEnd", "session-end", "session-end.sh"),
     ("Stop", "stop", "capture.sh"),
+    # Notification fires on a permission prompt / ~60s idle input — the blocked-progress alert
+    # (CELE-t169). No legacy bash form ever existed; the third field is an inert migration label.
+    ("Notification", "notification", "notification.sh"),
 ]
 WIRE_STATUSLINE = {"type": "command", "command": "celeborn hook statusline"}
 # Safety hooks `wire` installs alongside the five above (t101). Unlike WIRE_HOOKS these carry a
@@ -7784,6 +8279,23 @@ def cmd_doctor(args):
             warnings += len(drifted)
         else:
             ok("no progress-engine drift on doing cards")
+        # Owner-attribution contract (CELE-t194): a DOING card is owned by its SESSION short-id (the
+        # code grabs it), never by a model name and never left "unknown". A card in either bad state
+        # was claimed by an unfixed binary or a hand-run `--by claude` — the fleet then shows @claude /
+        # @unknown and can't attach a context-token chip. Re-claiming from the owning window now grabs
+        # CLAUDE_CODE_SESSION_ID automatically and repairs both. Backstop for the in-path guard.
+        doing = [t for t in all_tasks if t.get("state") == "doing"]
+        mis_owned = [t for t in doing
+                     if (o := (t.get("owner") or "").strip()).lower() in ("", "unknown")
+                     or _looks_like_model_handle(o)]
+        if mis_owned:
+            warn(f"{len(mis_owned)} doing card(s) not owned by a session short-id (shows @unknown/"
+                 f"model, no context chip): " + ", ".join(_display_tid(ctx, t["id"]) for t in mis_owned))
+            print("  Fix:  re-claim from the owning window — `celeborn claim <id>` "
+                  "(auto-grabs CLAUDE_CODE_SESSION_ID; no --by/--session needed)")
+            warnings += len(mis_owned)
+        else:
+            ok("every doing card is owned by a session short-id")
         arch_path = ctx / DONE_ARCHIVE_FILE
         if arch_path.is_file():
             arch_n = len(_parse_tasks(arch_path.read_text()))
@@ -8109,6 +8621,31 @@ def _recompute_progress(t: dict) -> None:
     _normalize_progress(t)
 
 
+# CELE-t176 — the "mandatory complete" gate. A card may not leave DOING for Done until its progress
+# bar is crested to 99% (the ceiling an unshipped card can reach; see _normalize_progress). This makes
+# the final "it's complete" step deliberate, so a card never silently disappears from DOING (in Fleet
+# or board/) at partial progress. The operator crests (`--progress 99`, or all subtasks checked), THEN
+# ships — ship fills the last 1% to 100. Enforced on every path a card can reach `done` by: `ship`,
+# `tasks move … done`, and `tasks edit … --state done`.
+CREST_PCT = 99
+
+
+def _require_crest_for_done(ctx: Path, t: dict) -> None:
+    """Refuse a transition into `done` unless the card's progress bar is crested to CREST_PCT (99).
+    A no-op at/above the crest; otherwise `die`s with the exact commands to crest and ship."""
+    pct = _clamp_pct(t.get("progress", 0))
+    if pct >= CREST_PCT:
+        return
+    disp = _display_tid(ctx, t["id"])
+    die(
+        f"[{disp}] is at {pct}% — a card must be crested to {CREST_PCT}% before it can leave DOING for "
+        f"Done (CELE-t176). Finish the work, then crest and ship:\n"
+        f"  celeborn tasks edit {t['id']} --progress {CREST_PCT}\n"
+        f"  celeborn ship {t['id']}\n"
+        f"(100% is reserved for shipped cards.)"
+    )
+
+
 def _render_subtasks(subs: list[dict]) -> list[str]:
     out = [SUBTASKS_HEADING]
     for s in subs:
@@ -8225,20 +8762,29 @@ def _tasks_doc(ctx: Path, tasks: list[dict]) -> dict:
     and joins the local agent registry so the owner chip can show family/model — tasks.md itself
     stays handle-only (the committed public contract is unchanged)."""
     agents = (_load_agents(ctx).get("agents") or {})
+    alerts = _live_alerts(ctx)   # CELE-t195: an ended session's alert must not surface on the board
     cfg = load_config(ctx)
     slug = project_slug(ctx)
     qualified = bool(cfg.get("qualified_task_ids"))
 
     def _enrich(t: dict) -> dict:
-        reg = agents.get((t.get("owner") or "").strip()) or {}
+        owner = (t.get("owner") or "").strip()
+        reg = agents.get(owner) or {}
+        model = reg.get("model") or ""
         return {
             **t,
             # `id` stays the canonical bare key the viewer's claim/move calls use; `display_id` is the
             # presentation form (qualified when the project opts in) the board chip can show instead.
             "display_id": _display_tid(ctx, t["id"], cfg=cfg),
             "agent_protocol": _agent_card_protocol(t["id"]),
+            # Owner chip shows a session / human handle only — a model-derived owner is suppressed so
+            # model text never lands on the board (CELE-t172). tasks.md itself is untouched.
+            "owner": _display_owner(owner, model),
             "owner_family": reg.get("family") or "",
-            "owner_model": reg.get("model") or "",
+            "owner_model": model,
+            # Live blocked-alert (CELE-t169) — only doing cards can be blocked; None means clear. Rides
+            # the projection so the local board + hosted push both carry the badge; not a tasks.md field.
+            "alert": alerts.get(t["id"]) if t.get("state") == "doing" else None,
         }
 
     enriched = [_enrich(t) for t in tasks]
@@ -8754,6 +9300,52 @@ def cmd_progress(args):
                   f"{rec.get('nudge_level')}    turns_since_change: {rec.get('turns_since_change')}")
 
 
+def cmd_alert(args):
+    """`celeborn alert <id> [--message …] [--kind permission|idle|stopped] [--session …]` — the
+    reusable "coding progress is blocked, the user's input is needed" service (CELE-t169). Raises a
+    live alert on a DOING card so it surfaces on the board (locally + celeborn.thot.ai). The
+    Notification/Stop hooks are its first callers; any external system can call it the same way.
+      celeborn alert <id> --message "…"      raise/refresh an alert
+      celeborn alert <id> --clear            drop it (also happens automatically when the user replies)
+      celeborn alert --list                  show the live alerts on this board
+    No focus-stealing OS dialog — the alert rides the card (dialogs rejected t47/t50/t62)."""
+    ctx = require_context(args)
+    if getattr(args, "list", False) or not getattr(args, "id", None):
+        alerts = _load_alerts(ctx).get("alerts") or {}
+        if not alerts:
+            info("no live alerts.")
+            return
+        for tid, rec in sorted(alerts.items()):
+            disp = _display_tid(ctx, tid)
+            print(f"🔔 [{disp}] {rec.get('kind', 'idle')} — {rec.get('message') or '(no message)'}"
+                  f"  ({rec.get('at', '')})")
+        return
+    resolved = _split_qualified_tid(_resolve_task_arg(ctx, args.id))[1]
+    card = next((t for t in _load_tasks(ctx) if t["id"] == resolved), None)
+    if card is None:
+        die(f"no task with id {args.id!r}")
+    disp = _display_tid(ctx, resolved)
+    if getattr(args, "clear", False):
+        cleared = _clear_alert(ctx, resolved)
+        _refresh_alerted_card(ctx, resolved)
+        info(f"cleared alert on [{disp}]" if cleared else f"[{disp}] had no alert")
+        return
+    if card.get("state") != "doing":
+        die(f"[{disp}] is {card.get('state')} — only a doing card can be blocked.")
+    kind = getattr(args, "kind", None) or "idle"
+    if kind not in ALERT_KINDS:
+        die(f"--kind must be one of {', '.join(ALERT_KINDS)}")
+    rec = _set_alert(ctx, resolved, kind, getattr(args, "message", "") or "", getattr(args, "session", "") or "")
+    _refresh_alerted_card(ctx, resolved)
+    # Push the alert to the hosted board now (not on the throttled heartbeat) so a remote watcher
+    # sees the block promptly. Best-effort; a no-op when hosted sync isn't configured.
+    try:
+        __import__("celeborn_sync").schedule_agents_push(ctx, min_interval_s=0)
+    except Exception:  # noqa: BLE001
+        pass
+    ok(f"🔔 alerted [{disp}] — {rec['kind']}" + (f": {rec['message']}" if rec.get("message") else ""))
+
+
 def _reorder_task(tasks: list[dict], tid: str, direction: str) -> list[dict]:
     """Reprioritize a task within its own column (state group). Display order within a column is
     list order, so we permute only the same-state siblings among the slots they already occupy —
@@ -8867,6 +9459,9 @@ def cmd_tasks(args):
             t["updated"] = now_iso()
             tasks = _bring_to_state_front(tasks, tid)
             _save_tasks(ctx, tasks, autopush_ids=[tid])
+            # Write the session→card link too (CELE-t194) so an add-and-claim from a Bash call gets a
+            # context-token chip like a pasted claim — the fix isn't complete if only `claim` links.
+            _record_agent_session(ctx, _resolve_session(args), by, [tid])
             print(f"Claimed [{_display_tid(ctx, tid)}] {t['title']} → {by or 'unassigned'}")
         return
 
@@ -8875,6 +9470,8 @@ def cmd_tasks(args):
         if not t:
             die(f"no task with id {args.id!r}")
         prev = t["state"]
+        if args.state == "done" and prev == "doing":
+            _require_crest_for_done(ctx, t)   # CELE-t176: must be crested to 99 before leaving DOING
         t["state"] = args.state
         t["updated"] = now_iso()
         if args.state == "done" and prev != "done":
@@ -8915,6 +9512,10 @@ def cmd_tasks(args):
             t["progress"] = _clamp_pct(args.progress)
         if args.note is not None:
             t["notes"] = args.note.strip()
+        # CELE-t176: a DOING card edited to `done` must be crested. Honor any --progress set in the
+        # SAME call (applied just above) before gating — so `edit --progress 99 --state done` works.
+        if t["state"] == "done" and prev_state == "doing":
+            _require_crest_for_done(ctx, t)
         t["updated"] = now_iso()
         if t["state"] == "done" and prev_state != "done":
             tasks = _bring_to_state_front(tasks, t["id"])   # newest-done lands on top of the column
@@ -9051,23 +9652,58 @@ def cmd_tasks(args):
             print(f"  [{_display_tid(ctx, t['id'], cfg=cfg)}] {t['title']}{owner}{blocked}")
 
 
+def _ambient_session_id() -> str:
+    """The current Claude Code session id, as the harness injects it into EVERY tool subprocess
+    (`CLAUDE_CODE_SESSION_ID`). This is the linchpin of CELE-t194: it lets an agent-initiated
+    `celeborn claim` / `tasks add --claim` run from a Bash tool call be session-owned WITHOUT the
+    agent remembering to pass `--session` — the hook's stdin session id never reaches a Bash
+    subprocess, but this env var does. It's per-window (each session's shell inherits its own id),
+    so it's multi-agent-safe where a repo-wide cursor (`last_session_id`) would misattribute.
+    Empty outside a Claude Code window (a plain terminal) — there a manual `--by` still attributes."""
+    import os
+    return (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+
+
+def _resolve_session(args) -> str:
+    """The session id owning this command: explicit `--session` (the hook passes it) → the ambient
+    `CLAUDE_CODE_SESSION_ID` the harness sets in every Bash tool call. Empty only outside a Claude
+    window. Used for BOTH owner attribution (`_claim_identity`) and the session→card link
+    (`_record_agent_session`) so an agent-typed claim tracks context exactly like a pasted one."""
+    return (getattr(args, "session", None) or "").strip() or _ambient_session_id()
+
+
 def _claim_identity(args) -> str:
-    """Who is claiming: explicit --by wins; else the SESSION short-id the hook passes — the session IS
-    the agent's name (CELE-t131), so a card is owned by the live window working it, never by a model
-    handle; else $CELEBORN_AGENT; else '' (unattributed). The short head (6 chars), not the full UUID,
-    so it reads as a clean handle and isn't treated as a raw session id by the board. Mirrors
-    _outbox_identity."""
-    explicit = getattr(args, "by", None)
-    if explicit:
-        return explicit.strip()
-    sess = (getattr(args, "session", None) or "").strip()
-    if sess:
-        return sess[:6]
+    """Who owns the card. The SESSION is authoritative: whenever a real session id is resolvable —
+    the `--session` the hook passes, OR the `CLAUDE_CODE_SESSION_ID` the harness injects into every
+    Bash tool call — the card is owned by that session's short-id (6-char head), and the agent
+    CANNOT rename it. The session IS the agent's name (CELE-t131); the code grabs it, not the model
+    (CELE-t194 — this is what kills the recurring `@claude` / `@unknown` whimsy at the source). `--by`
+    / `$CELEBORN_AGENT` attribute ONLY a session-less manual CLI run (a human at a plain terminal).
+
+    Short head, not the full UUID, so it reads as a clean handle and the board never treats it as a
+    raw session id. Mirrors _outbox_identity. Guard (CELE-t172): a model-shaped handle is never an
+    owner — declare your model with `celeborn identify --model "…"`, not by stuffing it into --by."""
+    explicit = (getattr(args, "by", None) or "").strip()
+    sess = _resolve_session(args)
     import os
     env = (os.environ.get("CELEBORN_AGENT") or "").strip()
-    if env:
-        return env
-    return ""
+    if sess:
+        short = sess[:6]
+        # A live session owns the card, full stop. Surface (but ignore) any superseded --by so the
+        # agent learns the code names the card, not it — with an extra nudge when the --by was a model
+        # name (record that with `celeborn identify`, don't stuff it into the owner).
+        if explicit and explicit != short:
+            tail = (f" Record your model with `celeborn identify --model \"{explicit}\"`."
+                    if _looks_like_model_handle(explicit) or explicit.lower() in _GENERIC_MODEL_FAMILIES
+                    else "")
+            warn(f"--by {explicit!r} is ignored — this card is owned by its session ({short}), not a "
+                 f"name the agent chooses (CELE-t194).{tail}")
+        return short
+    handle = explicit or env
+    if handle and _looks_like_model_handle(handle):
+        warn(f"'{handle}' looks like a model, not an identity — a card should be owned by its "
+             f"session or a handle, not a model. Record your model with `celeborn identify`.")
+    return handle
 
 
 def cmd_identify(args):
@@ -9134,12 +9770,15 @@ def cmd_claim(args):
     if results:
         claimed = [tid for tid in (getattr(args, "ids", None) or []) if _find_task(tasks, tid)]
         _save_tasks(ctx, tasks, autopush_ids=claimed)
-    # Active-agents bridge (CELE-t131): if this claim carries a session id (the claim-on-receipt hook
-    # always passes one), remember which session owns which card so `celeborn agents` can attribute
-    # that session's live context window to this handle + DOING card. Runs even on a re-claim of a card
-    # you already own (no owner change → no `results` line, but the session is still on the card).
+    # Active-agents bridge (CELE-t131/t194): remember which session owns which card so `celeborn
+    # agents` (and the fleet's context-token chip) can attribute that session's live context window to
+    # this DOING card. The session is the RESOLVED one — the `--session` the hook passes OR the
+    # ambient `CLAUDE_CODE_SESSION_ID` every Bash tool call inherits — so an agent-typed `celeborn
+    # claim` tracks context identically to a pasted marker (the fix for cards with no context chip).
+    # Runs even on a re-claim of a card you already own (no owner change → no `results` line, but the
+    # session is still linked).
     owned_now = [tid for tid in claim_ids if (_find_task(tasks, tid) or {}).get("owner") == by]
-    _record_agent_session(ctx, getattr(args, "session", None), by, owned_now)
+    _record_agent_session(ctx, _resolve_session(args), by, owned_now)
     print("\n".join(results))
 
 
@@ -9155,7 +9794,13 @@ def cmd_ship(args):
     t = _find_task(tasks, tid)
     if not t:
         die(f"no task with id {tid!r}")
+    # CELE-t176: a card leaving DOING for Done must be crested to 99 first. Gate BEFORE any side
+    # effect (touch release / note append) so a refused ship leaves the card exactly as it was.
+    # Only DOING is gated — a todo/blocked card shipped as triage isn't "in-flight work vanishing".
+    if t["state"] == "doing":
+        _require_crest_for_done(ctx, t)
     who = _agent_identity(args, ctx)["handle"]  # resolves handle + records family/model for the board
+    _clear_alert(ctx, tid)   # CELE-t195: a shipped card awaits nothing — drop any stale blocked-alert
     released = _release_touches_for_task(ctx, tid)
     note = (getattr(args, "note", None) or "").strip()
     if note:
@@ -9404,6 +10049,852 @@ def cmd_outbox(args):
 
 # --------------------------------------------------------------------------- argparse
 
+# --------------------------------------------------------------------------- architecture (CELE-t187)
+
+INFRA_LOCAL_NAME = "infra-local.json"
+INFRA_SCHEMA = "celeborn-architecture/1"
+
+# Node id → default fields for a vendor detected from repo signals / env-var names. Detection is
+# best-effort and non-authoritative: it seeds a starter map the human/agent then edits. We read only
+# file existence and env-var NAMES — never any secret value.
+_INFRA_ENV_VENDORS = [
+    ("ANTHROPIC", {"id": "anthropic", "name": "Anthropic API", "kind": "vendor", "vendor": "Anthropic",
+                   "control_surface": "https://console.anthropic.com"}),
+    ("OPENAI", {"id": "openai", "name": "OpenAI API", "kind": "vendor", "vendor": "OpenAI",
+                "control_surface": "https://platform.openai.com"}),
+    ("STRIPE", {"id": "stripe", "name": "Stripe", "kind": "vendor", "vendor": "Stripe",
+                "control_surface": "https://dashboard.stripe.com"}),
+    ("SUPABASE", {"id": "db", "name": "Database", "kind": "database", "vendor": "Supabase",
+                  "control_surface": "https://supabase.com/dashboard"}),
+    ("VERCEL", {"id": "web", "name": "Hosted App", "kind": "app", "vendor": "Vercel",
+                "control_surface": "https://vercel.com/dashboard"}),
+    ("CHATWOOT", {"id": "chatwoot", "name": "Chatwoot", "kind": "vendor", "vendor": "Chatwoot",
+                  "control_surface": ""}),
+    ("JIRA", {"id": "jira", "name": "Jira", "kind": "vendor", "vendor": "Atlassian",
+              "control_surface": "https://admin.atlassian.com"}),
+]
+
+_INFRA_NODE_FIELDS = ("id", "name", "kind", "vendor", "role", "endpoint", "ip", "control_surface", "notes")
+
+# Dependency-name → node template (CELE-t201). A NEW dependency in a manifest is the clearest "a piece
+# entered the stack" signal, so the auto-trace (and init) map distinctive package tokens to vendor nodes.
+# We read dependency NAMES only (never lockfile hashes or any secret). Tokens are chosen to be distinctive
+# enough that a substring match over the manifest text won't false-positive on unrelated packages.
+_INFRA_DEP_VENDORS = [
+    (("@anthropic-ai", "anthropic"), {"id": "anthropic", "name": "Anthropic API", "kind": "vendor",
+        "vendor": "Anthropic", "control_surface": "https://console.anthropic.com", "notes": "detected: dependency"}),
+    (("openai",), {"id": "openai", "name": "OpenAI API", "kind": "vendor", "vendor": "OpenAI",
+        "control_surface": "https://platform.openai.com", "notes": "detected: dependency"}),
+    (("openrouter",), {"id": "openrouter", "name": "OpenRouter", "kind": "vendor", "vendor": "OpenRouter",
+        "control_surface": "https://openrouter.ai", "notes": "detected: dependency"}),
+    (("stripe",), {"id": "stripe", "name": "Stripe", "kind": "vendor", "vendor": "Stripe",
+        "control_surface": "https://dashboard.stripe.com", "notes": "detected: dependency"}),
+    (("@supabase", "supabase"), {"id": "db", "name": "Database", "kind": "database", "vendor": "Supabase",
+        "control_surface": "https://supabase.com/dashboard", "notes": "detected: dependency"}),
+    (("@vercel/",), {"id": "web", "name": "Hosted App", "kind": "app", "vendor": "Vercel",
+        "control_surface": "https://vercel.com/dashboard", "notes": "detected: dependency"}),
+    (("@aws-sdk", "boto3", "aws-sdk"), {"id": "aws", "name": "AWS", "kind": "vendor", "vendor": "AWS",
+        "control_surface": "https://console.aws.amazon.com", "notes": "detected: dependency"}),
+    (("mongoose", "mongodb"), {"id": "mongo", "name": "MongoDB", "kind": "database", "vendor": "MongoDB",
+        "control_surface": "https://cloud.mongodb.com", "notes": "detected: dependency"}),
+    (("ioredis", "@upstash/redis"), {"id": "redis", "name": "Redis", "kind": "database", "vendor": "Redis",
+        "control_surface": "", "notes": "detected: dependency"}),
+    (("twilio",), {"id": "twilio", "name": "Twilio", "kind": "vendor", "vendor": "Twilio",
+        "control_surface": "https://console.twilio.com", "notes": "detected: dependency"}),
+    (("@sendgrid", "sendgrid"), {"id": "sendgrid", "name": "SendGrid", "kind": "vendor", "vendor": "SendGrid",
+        "control_surface": "https://app.sendgrid.com", "notes": "detected: dependency"}),
+    (("resend",), {"id": "resend", "name": "Resend", "kind": "vendor", "vendor": "Resend",
+        "control_surface": "https://resend.com", "notes": "detected: dependency"}),
+]
+
+# Manifest basenames (lowercased) whose EDIT means a dependency may have been added → trace immediately.
+# The same set is scanned (root + one dir level) for the dependency tokens above.
+_INFRA_MANIFESTS = ("package.json", "requirements.txt", "pyproject.toml", "go.mod", "gemfile",
+                    "cargo.toml", "composer.json", "pipfile")
+
+
+def _infra_path(ctx: Path) -> Path:
+    return ctx / INFRA_LOCAL_NAME
+
+
+def load_infra(ctx: Path) -> dict:
+    """Read .context/infra-local.json (gitignored, per-machine). {} when absent/invalid."""
+    p = _infra_path(ctx)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        warn(f"{INFRA_LOCAL_NAME} is not valid JSON; treating as empty.")
+        return {}
+
+
+def _full_node(partial: dict) -> dict:
+    """Fill a partial node dict out to the full field set (empty strings for missing fields)."""
+    return {f: partial.get(f, "") for f in _INFRA_NODE_FIELDS}
+
+
+def _detect_infra_nodes(root: Path) -> list[dict]:
+    """Best-effort starter nodes from repo signals + env-var NAMES (never values). Deduped by id."""
+    nodes: dict[str, dict] = {}
+    # The local CLI is always a node (the client edge of every flow).
+    nodes["cli"] = {"id": "cli", "name": "Celeborn CLI", "kind": "client", "vendor": "local",
+                    "role": "developer machine", "endpoint": "localhost", "notes": ""}
+    # File signals.
+    if any((root / f).exists() for f in ("vercel.json", "vercel.ts")) or \
+       any((root / d / "next.config.js").is_file() for d in (".", "web")):
+        nodes.setdefault("web", {"id": "web", "name": "Hosted App", "kind": "app", "vendor": "Vercel",
+                                 "control_surface": "https://vercel.com/dashboard", "notes": "detected: Vercel/Next"})
+    if (root / "supabase").is_dir():
+        nodes.setdefault("db", {"id": "db", "name": "Database", "kind": "database", "vendor": "Supabase",
+                                "role": "postgres", "control_surface": "https://supabase.com/dashboard",
+                                "notes": "detected: supabase/"})
+    # Env-var NAME signals (from any .env* at the root — names only, never values).
+    env_names: set[str] = set()
+    try:
+        for envf in root.glob(".env*"):
+            if not envf.is_file():
+                continue
+            for line in envf.read_text(errors="ignore").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                env_names.add(line.split("=", 1)[0].strip().upper())
+    except OSError:
+        pass
+    for prefix, tmpl in _INFRA_ENV_VENDORS:
+        if any(name.startswith(prefix) for name in env_names):
+            nodes.setdefault(tmpl["id"], dict(tmpl))
+    # Dependency-manifest NAME signals (CELE-t201): scan known manifests at the root and one dir level
+    # for distinctive package tokens → vendor nodes. Names only; lockfiles and values are never read.
+    manifest_text = ""
+    seen_manifest: set[Path] = set()
+    for name in _INFRA_MANIFESTS:
+        for cand in (root / name, *root.glob(f"*/{name}")):
+            if cand in seen_manifest or not cand.is_file():
+                continue
+            seen_manifest.add(cand)
+            try:
+                manifest_text += "\n" + cand.read_text(errors="ignore")[:200_000].lower()
+            except OSError:
+                pass
+    if manifest_text:
+        for tokens, tmpl in _INFRA_DEP_VENDORS:
+            if any(tok in manifest_text for tok in tokens):
+                nodes.setdefault(tmpl["id"], dict(tmpl))
+    return [_full_node(n) for n in nodes.values()]
+
+
+def _architecture_init(ctx: Path, force: bool = False) -> None:
+    p = _infra_path(ctx)
+    if p.is_file() and not force:
+        die(f"{INFRA_LOCAL_NAME} already exists (use --force to overwrite).")
+    nodes = _detect_infra_nodes(ctx.parent)
+    # Seed a naive flow from the CLI to the first detected server-side node so `sync` renders something.
+    flows: list[dict] = []
+    server_ids = [n["id"] for n in nodes if n["id"] != "cli"]
+    if server_ids:
+        flows.append({"from": "cli", "to": server_ids[0], "label": "sync push", "protocol": "https"})
+    doc = {
+        "schema": INFRA_SCHEMA,
+        "updated": now_iso(),
+        "_readme": ("Per-project architecture diagram (CELE-t187). Non-secret topology only. "
+                    "`celeborn architecture sync` pushes nodes+flows to your hosted board with the "
+                    "`credentials` block STRIPPED. Never put keys/tokens/passwords here — env NAMES only."),
+        "nodes": nodes,
+        "flows": flows,
+        "credentials": {"_note": "NEVER synced — store env-var NAMES only, never values."},
+    }
+    p.write_text(json.dumps(doc, indent=2) + "\n")
+    ok(f"wrote {INFRA_LOCAL_NAME} with {len(nodes)} detected node(s).")
+    print("  Edit it to add IPs, endpoints, control-surface URLs, and information flows, then")
+    print("  `celeborn architecture sync` to push it to your hosted board (Pro). It's gitignored.")
+
+
+def _architecture_show(ctx: Path) -> None:
+    doc = load_infra(ctx)
+    nodes = doc.get("nodes") or []
+    flows = doc.get("flows") or []
+    if not nodes:
+        print(f"No {INFRA_LOCAL_NAME} yet. Run `celeborn architecture init`.")
+        return
+    print(f"Architecture — {len(nodes)} node(s), {len(flows)} flow(s):")
+    for n in nodes:
+        head = f"  [{n.get('kind', '?')}] {n.get('name') or n.get('id')}"
+        if n.get("vendor"):
+            head += f" · {n['vendor']}"
+        print(head)
+        for label, key in (("endpoint", "endpoint"), ("ip", "ip"), ("control", "control_surface")):
+            if n.get(key):
+                print(f"      {label}: {n[key]}")
+    if flows:
+        print("  flows:")
+        for f in flows:
+            arrow = f"    {f.get('from')} → {f.get('to')}"
+            if f.get("label"):
+                arrow += f"  ({f['label']})"
+            print(arrow)
+
+
+# --------------------------------------------------------------------------- auto-architecture-trace (CELE-t201)
+#
+# The Stack is captured once (`architecture init`) then kept current AUTOMATICALLY: a lightweight "trace"
+# re-detects the topology and ADDITIVELY merges any newly-discovered pieces into infra-local.json, then
+# remaps the hosted Stack. It runs on a cadence (once every N turns — not every turn; topology changes
+# rarely) and immediately when a dependency manifest is edited (the "a piece entered the stack" event).
+# Two hard rules keep it safe: (1) it is a NO-OP unless the project already opted in (infra-local.json
+# exists) — it never auto-creates a diagram in a random repo; (2) the merge is purely additive — it only
+# APPENDS newly-detected nodes, never overwriting or removing anything a human authored.
+ARCH_TRACE_STATE_NAME = ".arch-trace.json"     # gitignored per-project trace bookkeeping (turn counter + pending)
+ARCH_TRACE_EVERY_TURNS = 3                       # cadence: run a trace once every N user turns
+
+
+def _arch_trace_state_path(ctx: Path) -> Path:
+    return ctx / ARCH_TRACE_STATE_NAME
+
+
+def _load_arch_trace_state(ctx: Path) -> dict:
+    try:
+        d = json.loads(_arch_trace_state_path(ctx).read_text())
+        return d if isinstance(d, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_arch_trace_state(ctx: Path, state: dict) -> None:
+    try:
+        _arch_trace_state_path(ctx).write_text(json.dumps(state) + "\n")
+    except OSError:
+        pass
+
+
+def _merge_infra_nodes(doc: dict, detected: list[dict]) -> tuple[dict, list[str]]:
+    """Additively merge detected nodes into the doc's node list. A detected node is ADDED only when
+    neither its id NOR its (vendor, kind) pair already exists — so hand-authored nodes are never
+    duplicated or overwritten. Returns (doc, added_display_names). Pure."""
+    existing = list(doc.get("nodes") or [])
+    ids = {str(n.get("id")) for n in existing}
+    vendor_kinds = {(str(n.get("vendor")).lower(), str(n.get("kind"))) for n in existing if n.get("vendor")}
+    added: list[str] = []
+    for d in detected:
+        nid = str(d.get("id"))
+        vk = (str(d.get("vendor")).lower(), str(d.get("kind")))
+        if nid in ids or (d.get("vendor") and vk in vendor_kinds):
+            continue
+        existing.append(_full_node(d))
+        ids.add(nid)
+        if d.get("vendor"):
+            vendor_kinds.add(vk)
+        added.append(d.get("name") or nid)
+    doc["nodes"] = existing
+    return doc, added
+
+
+def _architecture_trace(ctx: Path, *, reason: str, allow_push: bool = True) -> list[str]:
+    """Re-detect the topology and additively merge new pieces into infra-local.json; on a change, remap
+    the hosted Stack (detached best-effort push). NO-OP unless infra-local.json already exists (opt-in).
+    Returns the display names of any nodes added this trace ([] when nothing changed). Never raises."""
+    try:
+        if not _infra_path(ctx).is_file():
+            return []                                    # not opted in — the trace stays silent
+        doc = load_infra(ctx)
+        if not doc:
+            return []
+        detected = _detect_infra_nodes(ctx.parent)
+        doc, added = _merge_infra_nodes(doc, detected)
+        if not added:
+            return []
+        doc["updated"] = now_iso()
+        _infra_path(ctx).write_text(json.dumps(doc, indent=2) + "\n")
+        if allow_push:
+            try:
+                __import__("celeborn_sync").schedule_architecture_push(ctx)
+            except Exception:
+                pass                                     # remap is best-effort; local capture already landed
+        return added
+    except Exception:
+        return []
+
+
+def _arch_trace_note(added: list[str], reason: str) -> str:
+    """The SURFACE-THIS line for a trace that added pieces. Empty when nothing changed."""
+    if not added:
+        return ""
+    what = ", ".join(added[:6]) + ("…" if len(added) > 6 else "")
+    return (f"🏹 Celeborn —> architecture trace ({reason}): added {len(added)} new node(s) to the stack "
+            f"— {what}. Remapped your hosted Stack.")
+
+
+def _maybe_arch_trace_on_edit(ctx: Path, rel_path: str) -> str:
+    """PostToolUse hook (CELE-t201): if the edited file is a dependency manifest, trace NOW (bypassing
+    the cadence throttle) and reset the turn counter. Stashes the surface note so the next
+    user-prompt-submit relays it reliably (PostToolUse output is model-only). Returns a note or ""."""
+    if not _infra_path(ctx).is_file():
+        return ""                                        # opt-in only — no footprint until `architecture init`
+    base = Path(rel_path).name.lower()
+    if base not in _INFRA_MANIFESTS:
+        return ""
+    added = _architecture_trace(ctx, reason=f"{base} edited")
+    state = _load_arch_trace_state(ctx)
+    state["turns_since_trace"] = 0                        # the manifest trace resets the cadence clock
+    note = _arch_trace_note(added, f"{base} edited")
+    if note:
+        pending = state.get("pending") or []
+        pending.append(note)
+        state["pending"] = pending
+    _save_arch_trace_state(ctx, state)
+    return note
+
+
+def _maybe_arch_trace_on_turn(ctx: Path) -> str:
+    """UserPromptSubmit hook (CELE-t201): tick the turn counter; every ARCH_TRACE_EVERY_TURNS run a
+    cadence trace. Also drain any pending note a manifest-edit trace stashed. Returns a SURFACE-THIS
+    block (possibly several lines) or ""."""
+    if not _infra_path(ctx).is_file():
+        return ""                                        # opt-in only — no footprint until `architecture init`
+    state = _load_arch_trace_state(ctx)
+    notes: list[str] = list(state.get("pending") or [])
+    state["pending"] = []
+    n = int(state.get("turns_since_trace") or 0) + 1
+    if n >= ARCH_TRACE_EVERY_TURNS:
+        state["turns_since_trace"] = 0
+        added = _architecture_trace(ctx, reason="cadence")
+        note = _arch_trace_note(added, "every 3 turns")
+        if note:
+            notes.append(note)
+    else:
+        state["turns_since_trace"] = n
+    _save_arch_trace_state(ctx, state)
+    return "\n".join(notes)
+
+
+def cmd_architecture(args):
+    """`celeborn architecture [init|show|trace]` — capture non-secret infrastructure topology locally.
+    `sync` is handled in celeborn_sync (needs the network); init/show/trace are pure-local and stay here."""
+    ctx = require_context(args)
+    sub = getattr(args, "arch_cmd", None)
+    if sub == "init":
+        _architecture_init(ctx, force=getattr(args, "force", False))
+    elif sub == "trace":
+        if not _infra_path(ctx).is_file():
+            die(f"No {INFRA_LOCAL_NAME} yet. Run `celeborn architecture init` first.")
+        added = _architecture_trace(ctx, reason="manual")
+        if added:
+            ok(f"trace added {len(added)} node(s): {', '.join(added)} — remapping hosted Stack.")
+        else:
+            print("trace: no new pieces detected — the stack is up to date.")
+    else:
+        _architecture_show(ctx)
+
+
+# --------------------------------------------------------------------------- product federation (CELE-t190)
+#
+# Layer A of CELE-t188 (plan/cele-t188-multi-repo-oss-stewardship.md). A product spans several repo-facets
+# with different roles + publish policies (client:public → PyPI; server:private → never; oss:* → fork+PR).
+# The registry mirrors Celeborn's own authored-vs-machine split EXACTLY:
+#   • product.md            — authored, COMMITTED. Product FACTS only: facet keys, roles, publish policy,
+#                             canonical repo URLs, OSS provenance (Layer C). Portable across every clone.
+#   • product-local.json    — gitignored, PER-MACHINE. Binds each facet key → this machine's checkout path.
+#                             A facet with no binding here degrades gracefully to "not present on this machine".
+# Layers B (git/PR ops) and C (OSS provenance + guard) read this registry; Layer D (README) is gated on C.
+PRODUCT_MD_NAME = "product.md"
+PRODUCT_LOCAL_NAME = "product-local.json"
+PRODUCT_LOCAL_SCHEMA = "celeborn-product-local/1"
+# The role vocabulary from the t188 plan (§3). Determines publish policy + guard posture (guards land on B/C).
+PRODUCT_ROLES = ("client:public", "server:private", "oss:upstream", "oss:dependency", "oss:fork")
+
+
+def _product_md_path(ctx: Path) -> Path:
+    return ctx / PRODUCT_MD_NAME
+
+
+def _product_local_path(ctx: Path) -> Path:
+    return ctx / PRODUCT_LOCAL_NAME
+
+
+def load_product_local(ctx: Path) -> dict:
+    """Read .context/product-local.json (gitignored, per-machine). {} when absent/invalid."""
+    p = _product_local_path(ctx)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        warn(f"{PRODUCT_LOCAL_NAME} is not valid JSON; treating as empty.")
+        return {}
+
+
+def parse_product(text: str) -> dict:
+    """Parse product.md → {'name': str, 'facets': [{key, role, publish, repo, upstream, ...}],
+    'provenance': [raw '- …' lines]}. Section-aware: facet lines live under a line beginning 'Facets',
+    provenance (Layer C) under a line beginning 'Provenance'. HTML comments are stripped first so the
+    managed header never parses as data. Never raises on malformed input — it returns what it can."""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    name, facets, provenance, mode = "", [], [], None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            h = s.lstrip("#").strip()
+            if h.lower().startswith("product"):
+                for sep in ("—", ":", " - ", "-"):
+                    if sep in h:
+                        name = h.split(sep, 1)[1].strip()
+                        break
+            mode = None
+            continue
+        low = s.lower()
+        if low.startswith("facets"):
+            mode = "facets"
+            continue
+        if low.startswith("provenance"):
+            mode = "provenance"
+            continue
+        if not s.startswith("-"):
+            continue
+        body = s[1:].strip()
+        if not body or body.lower().startswith("(none"):
+            continue
+        if mode == "facets":
+            toks = body.split()
+            facet = {"key": toks[0]}
+            for t in toks[1:]:
+                if "=" in t:
+                    k, v = t.split("=", 1)
+                    facet[k] = v
+            facets.append(facet)
+        elif mode == "provenance":
+            provenance.append("- " + body)
+    return {"name": name, "facets": facets, "provenance": provenance}
+
+
+def load_product(ctx: Path) -> dict:
+    """Parsed product.md plus an `exists` flag. Empty/absent → {'exists': False}."""
+    p = _product_md_path(ctx)
+    if not p.is_file():
+        return {"name": "", "facets": [], "provenance": [], "exists": False}
+    d = parse_product(p.read_text())
+    d["exists"] = True
+    return d
+
+
+def _render_product(name: str, facets: list, provenance: list) -> str:
+    """Serialize product.md canonically (Celeborn-maintained file). Provenance lines round-trip verbatim
+    so a Layer-C write is preserved when Layer A rewrites the facet block."""
+    lines = [f"# Product — {name}", ""]
+    lines += [
+        "<!-- Celeborn product registry (CELE-t190, Layer A of CELE-t188). Authored + COMMITTED — product",
+        "     FACTS only: facet keys, roles, publish policy, canonical repo URLs, and OSS provenance",
+        "     (Layer C). No local paths here — this machine's checkout paths live in product-local.json",
+        "     (gitignored). Roles: client:public · server:private · oss:upstream · oss:dependency ·",
+        "     oss:fork. Edit via `celeborn product add|bind`; the orient banner reads this file. -->",
+        "",
+        "Facets (key · role · publish · repo):",
+    ]
+    if facets:
+        for f in facets:
+            parts = [f"- {f['key']}", f"role={f.get('role', '')}"]
+            if f.get("publish"):
+                parts.append(f"publish={f['publish']}")
+            if f.get("repo"):
+                parts.append(f"repo={f['repo']}")
+            if f.get("upstream"):
+                parts.append(f"upstream={f['upstream']}")
+            lines.append("   ".join(parts))
+    else:
+        lines.append("- (none yet — add with `celeborn product add <key> --role <role>`)")
+    lines += ["", "Provenance (portions of the tree that are OSS — Layer C, CELE-t192):"]
+    lines += provenance if provenance else ["- (none yet)"]
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _product_init(ctx: Path, name: str | None = None, force: bool = False) -> None:
+    p = _product_md_path(ctx)
+    if p.is_file() and not force:
+        die(f"{PRODUCT_MD_NAME} already exists (use --force to overwrite).")
+    nm = (name or _project_name(ctx) or ctx.parent.name).strip()
+    p.write_text(_render_product(nm, [], []))
+    ok(f"wrote {PRODUCT_MD_NAME} for product '{nm}'.")
+    print("  Add a facet:  celeborn product add client --role client:public --repo github.com/you/app")
+    print("  Bind it here: celeborn product bind client /path/to/checkout   (gitignored, per-machine)")
+
+
+def _product_add(ctx: Path, key: str, role: str, publish: str | None,
+                 repo: str | None, upstream: str | None) -> None:
+    """Upsert a facet into product.md (add-or-edit by key). Scaffolds product.md if absent."""
+    p = _product_md_path(ctx)
+    if p.is_file():
+        cur = parse_product(p.read_text())
+        name, facets, provenance = cur["name"], cur["facets"], cur["provenance"]
+    else:
+        name, facets, provenance = (_project_name(ctx) or ctx.parent.name), [], []
+    facet = {"key": key, "role": role}
+    if publish:
+        facet["publish"] = publish
+    if repo:
+        facet["repo"] = repo
+    if upstream:
+        facet["upstream"] = upstream
+    existing = next((f for f in facets if f.get("key") == key), None)
+    verb = "updated" if existing else "added"
+    if existing:
+        facets = [facet if f is existing else f for f in facets]
+    else:
+        facets.append(facet)
+    p.write_text(_render_product(name, facets, provenance))
+    ok(f"{verb} facet '{key}' (role={role}) in {PRODUCT_MD_NAME}.")
+
+
+def _product_bind(ctx: Path, key: str, checkout: str) -> None:
+    """Bind a facet key → this machine's checkout path in product-local.json (gitignored)."""
+    prod = load_product(ctx)
+    if prod["exists"] and not any(f.get("key") == key for f in prod["facets"]):
+        warn(f"'{key}' is not a facet in {PRODUCT_MD_NAME} yet — binding it anyway "
+             f"(add it with `celeborn product add {key} --role <role>`).")
+    abspath = str(Path(checkout).expanduser().resolve())
+    if not Path(abspath).is_dir():
+        warn(f"{abspath} is not a directory on this machine — binding recorded, but the facet "
+             f"shows as unbound (—) until the path exists.")
+    local = load_product_local(ctx)
+    if local.get("schema") != PRODUCT_LOCAL_SCHEMA:
+        local["schema"] = PRODUCT_LOCAL_SCHEMA
+    bindings = local.setdefault("bindings", {})
+    bindings[key] = abspath
+    _product_local_path(ctx).write_text(json.dumps(local, indent=2) + "\n")
+    ok(f"bound '{key}' → {abspath} (product-local.json, gitignored).")
+
+
+def _product_list(ctx: Path) -> None:
+    prod = load_product(ctx)
+    if not prod["exists"]:
+        print(f"No {PRODUCT_MD_NAME} yet. Run `celeborn product init` to create the registry.")
+        return
+    facets = prod["facets"]
+    bindings = (load_product_local(ctx).get("bindings") or {})
+    name = prod["name"] or "product"
+    print(f"Product — {name} · {len(facets)} facet(s)")
+    if not facets:
+        print("  (no facets — add with `celeborn product add <key> --role <role>`)")
+    for f in facets:
+        key, role = f.get("key", "?"), f.get("role", "?")
+        path = bindings.get(key)
+        bound = path and Path(path).is_dir()
+        marker = "✓" if bound else "—"
+        line = f"  [{role} {marker}] {key}"
+        if f.get("repo"):
+            line += f"   repo={f['repo']}"
+        print(line)
+        if path:
+            print(f"        → {path}" + ("" if bound else "   (path missing — unbound)"))
+        else:
+            print("        (unbound on this machine — `celeborn product bind %s <path>`)" % key)
+    if prod["provenance"]:
+        print(f"  provenance (OSS — Layer C): {len(prod['provenance'])} entr(y/ies)")
+
+
+def _product_banner(ctx: Path) -> str:
+    """One-line orient banner: product name + facets with ✓ (bound + present here) / — (unbound) markers.
+    '' when no product.md (silent for single-repo projects). Best-effort — never raises."""
+    try:
+        p = _product_md_path(ctx)
+        if not p.is_file():
+            return ""
+        data = parse_product(p.read_text())
+        facets = data.get("facets") or []
+        if not facets:
+            return ""
+        bindings = load_product_local(ctx).get("bindings") or {}
+        parts = []
+        for f in facets:
+            key, role = f.get("key", "?"), f.get("role", "?")
+            path = bindings.get(key)
+            marker = "✓" if (path and Path(path).is_dir()) else "—"
+            parts.append(f"{key} ({role} {marker})")
+        name = data.get("name") or "product"
+        head = f"🏹 Celeborn product —> {name} · {len(facets)} facet{'s' if len(facets) != 1 else ''}: "
+        shown, budget = [], 220
+        for i, part in enumerate(parts):
+            if shown and len(head) + len(" · ".join(shown + [part])) > budget:
+                shown.append(f"+{len(parts) - i} more")
+                break
+            shown.append(part)
+        return head + " · ".join(shown)
+    except Exception:
+        return ""
+
+
+def cmd_product(args):
+    """`celeborn product [list|init|add|bind]` — the product federation registry (Layer A of CELE-t188).
+    Pure-local markdown/JSON maintenance; no network."""
+    ctx = require_context(args)
+    sub = getattr(args, "product_cmd", None)
+    if sub == "init":
+        _product_init(ctx, name=getattr(args, "name", None), force=getattr(args, "force", False))
+    elif sub == "add":
+        _product_add(ctx, args.key, args.role, getattr(args, "publish", None),
+                     getattr(args, "repo", None), getattr(args, "upstream", None))
+    elif sub == "bind":
+        _product_bind(ctx, args.key, args.checkout)
+    else:
+        _product_list(ctx)
+
+
+# --------------------------------------------------------------------------- Multi-repo git/PR ops (t191)
+#
+# Layer B of CELE-t188. `celeborn commit/push/pr --facet <key>` routes git (and a drafted `gh pr create`)
+# to the facet's bound checkout, so a single board coordinates work across every repo of the product.
+# Each op is attributed automatically — commits carry Celeborn-Task/-Agent/-Model trailers and register a
+# cross-repo touch, exactly the multi-agent protocol the single-repo flow already uses. The publish guard
+# (above) is the role enforcement; commit/push/pr are the routing. Reads the Layer A registry (t190).
+
+
+def _facet_role_for_path(ctx: Path, path) -> tuple:
+    """(key, role) of the bound facet whose checkout is `path` or an ancestor of it — longest match wins,
+    so a nested facet resolves to the closest one. (None, None) when no product.md or no enclosing facet."""
+    prod = load_product(ctx)
+    if not prod.get("exists"):
+        return (None, None)
+    roles = {f.get("key"): f.get("role") for f in prod["facets"] if f.get("key")}
+    bindings = load_product_local(ctx).get("bindings") or {}
+    try:
+        target = Path(path).expanduser().resolve()
+    except Exception:
+        return (None, None)
+    best_key, best_role, best_len = None, None, -1
+    for key, co in bindings.items():
+        try:
+            cop = Path(co).expanduser().resolve()
+        except Exception:
+            continue
+        if target == cop or cop in target.parents:
+            if len(str(cop)) > best_len:
+                best_key, best_role, best_len = key, roles.get(key), len(str(cop))
+    return (best_key, best_role)
+
+
+def _publish_guard_targets(ctx: Path, cmd: str, project_dir: str) -> list:
+    """The (key, role) of every forbidden-to-publish facet a publish command targets: a path token in the
+    command that resolves into a bound checkout, else — when the command names no such path — the facet the
+    command's own project resolves into. Resolving the command's OWN tokens (not string-matching the stored
+    binding) makes detection symlink-robust (macOS /var → /private/var). Only server:private/oss:* facets
+    are returned (client:public publishes are allowed), so an empty list means 'let it through'."""
+    if not load_product(ctx).get("exists"):
+        return []
+    hits, seen = [], set()
+    for tok in re.split(r"[\s'\"=]+", cmd):
+        if "/" not in tok:
+            continue                                   # only path-shaped tokens can name a checkout
+        cand = tok.split("*", 1)[0].rstrip("/")        # drop a glob tail (dist/* → dist)
+        if not cand:
+            continue
+        key, role = _facet_role_for_path(ctx, cand)
+        if key and key not in seen and _role_forbids_publish(role):
+            seen.add(key)
+            hits.append((key, role))
+    if hits:
+        return hits
+    key, role = _facet_role_for_path(ctx, project_dir)
+    if key and _role_forbids_publish(role):
+        return [(key, role)]
+    return []
+
+
+def _facet_resolve(ctx: Path, key: str) -> dict:
+    """The facet dict (key/role/repo/upstream/publish) plus its resolved `checkout` Path on this machine.
+    die()s with a corrective message when the facet is undeclared, unbound here, or the bound path is
+    missing / not a git repo — the same graceful-degradation contract as the Layer A banner, but a hard
+    stop because a git op has nowhere to run without a real checkout."""
+    prod = load_product(ctx)
+    if not prod.get("exists"):
+        die("no product registry — run `celeborn product init` and declare facets first (CELE-t190).")
+    facet = next((f for f in prod["facets"] if f.get("key") == key), None)
+    if facet is None:
+        declared = ", ".join(f.get("key", "?") for f in prod["facets"]) or "(none yet)"
+        die(f"'{key}' is not a facet in product.md (declared: {declared}). "
+            f"Add it: celeborn product add {key} --role <role>.")
+    co = (load_product_local(ctx).get("bindings") or {}).get(key)
+    if not co:
+        die(f"facet '{key}' is not bound on this machine. Bind it: celeborn product bind {key} <checkout>.")
+    cop = Path(co).expanduser()
+    if not cop.is_dir():
+        die(f"facet '{key}' is bound to {cop}, which is not a directory here — re-bind it "
+            f"(`celeborn product bind {key} <checkout>`).")
+    if not (cop / ".git").exists():
+        die(f"facet '{key}' checkout {cop} is not a git repository.")
+    return {**facet, "checkout": cop}
+
+
+def _run_git(checkout: Path, git_args: list, timeout: int = 30):
+    """Run `git -C <checkout> <args>` and return the CompletedProcess. die()s only if git can't be spawned
+    at all; a non-zero git exit is left to the caller to report with context."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(checkout), *git_args],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        die(f"could not run git in {checkout}: {e}")
+
+
+def _celeborn_trailers(ident: dict, task: str) -> list:
+    """The commit trailers that attribute a facet-routed commit — bare tN per the machine-parsed
+    convention (CLAUDE.md), agent handle, and model label. Omits any part that isn't known."""
+    trailers = []
+    bare = _split_qualified_tid(task)[1] if task else ""
+    if bare:
+        trailers.append(f"Celeborn-Task: {bare}")
+    handle = (ident.get("handle") or "").strip()
+    if handle and handle != "unknown":
+        trailers.append(f"Celeborn-Agent: {handle}")
+    label = _agent_label(ident.get("family", ""), ident.get("model", ""))
+    if label:
+        trailers.append(f"Celeborn-Model: {label}")
+    return trailers
+
+
+def _facet_touch(ctx: Path, key: str, filepath: str, ident: dict, task: str, why: str) -> None:
+    """Register a cross-repo touch (path namespaced `<key>:<file>`) so agents sharing this .context/ see
+    the facet activity on orient. The registry is this project's — a facet-routed op is coordinated on the
+    one board, even though the file lives in another repo."""
+    data = _load_touches(ctx)
+    files = data.setdefault("files", {})
+    files[f"{key}:{filepath}"] = {
+        "by": ident.get("handle") or "unknown",
+        "family": ident.get("family", ""),
+        "model": ident.get("model", ""),
+        "at": now_iso(),
+        "task": _split_qualified_tid(task)[1] if task else "",
+        "why": why,
+    }
+    _save_touches(ctx, data)
+
+
+def cmd_commit(args):
+    """`celeborn commit --facet KEY -m MSG [files…]` — route a git commit into a bound facet checkout,
+    appending Celeborn-Task/-Agent/-Model trailers automatically and registering a cross-repo touch. Files
+    are staged by name (never `git add -A`); omit them to commit what's already staged. Layer B of CELE-t188."""
+    ctx = require_context(args)
+    facet = _facet_resolve(ctx, args.facet)
+    co = facet["checkout"]
+    ident = _agent_identity(args, ctx)
+    task = (getattr(args, "task", None) or "").strip() or _session_task_id(ctx, _resolve_session(args))
+    files = list(getattr(args, "files", None) or [])
+    trailers = _celeborn_trailers(ident, task)
+    full = args.message.rstrip() + ("\n\n" + "\n".join(trailers) if trailers else "")
+    if files:
+        r = _run_git(co, ["add", "--", *files])
+        if r.returncode != 0:
+            die(f"git add failed in facet '{args.facet}' ({co}):\n{(r.stderr or r.stdout).strip()}")
+    commit_args = ["commit", "-m", full] + (["--", *files] if files else [])
+    r = _run_git(co, commit_args)
+    if r.returncode != 0:
+        die(f"git commit failed in facet '{args.facet}' ({co}):\n{(r.stderr or r.stdout).strip()}")
+    for f in (files or ["(staged)"]):
+        _facet_touch(ctx, args.facet, f, ident, task, f"committed to {args.facet}")
+    ok(f"committed to facet '{args.facet}' ({co})" + (f" · {_split_qualified_tid(task)[1]}" if task else ""))
+    print("  trailers: " + (", ".join(trailers) if trailers
+                            else "(none — run `celeborn identify` so commits show who you are)"))
+    head = _run_git(co, ["log", "-1", "--oneline"])
+    if head.returncode == 0 and head.stdout.strip():
+        print("  " + head.stdout.strip())
+
+
+def cmd_push(args):
+    """`celeborn push --facet KEY [remote] [branch]` — route `git push` to a bound facet checkout. A branch
+    push (even into a private repo's own remote) is fine; a RELEASE push (`--tags`/`--follow-tags`) into a
+    server:private/oss:* facet is refused under the same publish policy the PreToolUse guard enforces —
+    caught here too because that guard can't see the git that runs inside celeborn. Layer B of CELE-t188."""
+    ctx = require_context(args)
+    facet = _facet_resolve(ctx, args.facet)
+    co = facet["checkout"]
+    tags = bool(getattr(args, "tags", False)) or bool(getattr(args, "follow_tags", False))
+    if tags and _role_forbids_publish(facet.get("role", "")):
+        die(_publish_policy_reason(args.facet, facet.get("role", ""), "a tag/release push"))
+    git_args = ["push"]
+    if getattr(args, "set_upstream", False):
+        git_args.append("--set-upstream")
+    if getattr(args, "follow_tags", False):
+        git_args.append("--follow-tags")
+    if getattr(args, "tags", False):
+        git_args.append("--tags")
+    if getattr(args, "remote", None):
+        git_args.append(args.remote)
+    if getattr(args, "branch", None):
+        git_args.append(args.branch)
+    r = _run_git(co, git_args, timeout=120)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        die(f"git push failed in facet '{args.facet}' ({co}):\n{out}")
+    ok(f"pushed facet '{args.facet}' ({co})")
+    if out:
+        print("  " + out.replace("\n", "\n  "))
+
+
+def cmd_pr(args):
+    """`celeborn pr --facet KEY [--base B] [--title T] [--body B]` — DRAFT a pull request for a bound facet
+    checkout: compute branch/base/commits, compose title+body with provenance, and print a ready-to-run
+    `gh pr create` command. Celeborn NEVER auto-opens a PR — for oss:* facets it also prints the fork→PR
+    steps. The human/agent reviews and sends it. Layer B of CELE-t188 (draft-don't-send)."""
+    import shlex
+    ctx = require_context(args)
+    facet = _facet_resolve(ctx, args.facet)
+    co, role = facet["checkout"], facet.get("role", "")
+    repo, upstream = facet.get("repo", ""), facet.get("upstream", "")
+    base = (getattr(args, "base", None) or "main").strip()
+    br = _run_git(co, ["rev-parse", "--abbrev-ref", "HEAD"])
+    branch = br.stdout.strip() if br.returncode == 0 else ""
+    if not branch or branch == "HEAD":
+        die(f"facet '{args.facet}' has no current branch (detached HEAD?) — check out a branch first.")
+    log = _run_git(co, ["log", f"{base}..{branch}", "--oneline"])
+    commits = [l for l in (log.stdout or "").splitlines() if l.strip()] if log.returncode == 0 else []
+    task = (getattr(args, "task", None) or "").strip() or _session_task_id(ctx, _resolve_session(args))
+    ident = _agent_identity(args, ctx)
+    title = (getattr(args, "title", None) or "").strip()
+    if not title:
+        title = (commits[0].split(" ", 1)[1] if commits and " " in commits[0] else f"{branch} → {base}")
+    body = (getattr(args, "body", None) or "").strip()
+    if not body:
+        lines = ["## Changes", ""] + (
+            [f"- {c.split(' ', 1)[1] if ' ' in c else c}" for c in commits] or ["- (no commits ahead of base)"])
+        body = "\n".join(lines)
+    foot = []
+    bare = _split_qualified_tid(task)[1] if task else ""
+    if bare:
+        foot.append(f"Celeborn-Task: {bare}")
+    handle = (ident.get("handle") or "").strip()
+    label = _agent_label(ident.get("family", ""), ident.get("model", ""))
+    if handle and handle != "unknown":
+        foot.append(f"Drafted-by: @{handle}" + (f" ({label})" if label else ""))
+    if foot:
+        body = body + "\n\n" + "\n".join(foot)
+
+    print(f"🏹 Celeborn PR draft — facet '{args.facet}' ({role})")
+    print(f"  repo:        {repo or '(no repo url in product.md — add `--repo` via product add)'}")
+    print(f"  base ← head: {base} ← {branch}")
+    print(f"  commits:     {len(commits)} ahead of {base}")
+    print()
+    print(f"  title: {title}")
+    print("  body:")
+    for line in body.splitlines():
+        print("    " + line)
+    print()
+    if role.startswith("oss:"):
+        print("  ⓘ Stewarded OSS — contribute via a fork, never publish/push as ours:")
+        if upstream:
+            print(f"      upstream: {upstream}")
+        print(f"      1) gh repo fork {repo or upstream or '<upstream>'} --clone=false")
+        print("      2) push this branch to YOUR fork, then open the PR against upstream.")
+    ghr = f" -R {repo}" if repo else ""
+    print("  Ready to send — Celeborn drafts, it never auto-opens a PR. Review the diff, then run:")
+    print(f"      gh pr create{ghr} --base {base} --head {branch} \\")
+    print(f"        --title {shlex.quote(title)} \\")
+    print(f"        --body {shlex.quote(body)}")
+    warn("drafted, not sent (CELE-t191) — send it yourself with the gh command above.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="celeborn", description="Long-term context substrate for coding agents.")
     p.add_argument("--path", default=".", help="project dir to operate in (default: cwd)")
@@ -9482,6 +10973,16 @@ def build_parser() -> argparse.ArgumentParser:
     pgp.add_argument("id", nargs="?", help="card id (default: every doing card)")
     pgp.add_argument("--explain", action="store_true", help="show the signals → floor derivation")
     pgp.set_defaults(func=cmd_progress)
+
+    al = sub.add_parser("alert", help="raise/clear a 'coding blocked — needs the user' alert on a card (surfaces on the board)")
+    al.add_argument("id", nargs="?", help="card id to alert on (omit with --list)")
+    al.add_argument("--message", "-m", default="", help="what is blocking (e.g. the permission request text)")
+    al.add_argument("--kind", choices=list(ALERT_KINDS), default=None,
+                    help="permission (needs approval) · idle (stalled) · stopped (turn ended, awaiting you)")
+    al.add_argument("--session", default="", help="the blocked session's id (attribution; hooks pass this)")
+    al.add_argument("--clear", action="store_true", help="clear the alert (also happens when the user replies)")
+    al.add_argument("--list", action="store_true", help="list the live alerts on this board")
+    al.set_defaults(func=cmd_alert)
 
     tp = sub.add_parser("tasks", help="lightweight task/kanban board (tasks.md truth + derived tasks.json)")
     tp.set_defaults(func=cmd_tasks, task_cmd=None, json=False)
@@ -9971,6 +11472,93 @@ def build_parser() -> argparse.ArgumentParser:
     syp.add_argument("--watch", action="store_true", help="keep syncing on an interval instead of once")
     syp.add_argument("--interval", type=int, default=5, help="seconds between syncs in --watch mode (default 5)")
     syp.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_sync(a))
+
+    # Architecture (CELE-t187): capture NON-SECRET infrastructure topology (vendor names, IPs,
+    # control-surface URLs, DB endpoints) into .context/infra-local.json (gitignored). init/show are
+    # local; sync pushes the topology (credentials stripped) to the hosted architecture diagram (Pro).
+    arp = sub.add_parser("architecture",
+        help="capture infrastructure topology for the hosted architecture diagram")
+    arsub = arp.add_subparsers(dest="arch_cmd")
+    ari = arsub.add_parser("init", help="scaffold .context/infra-local.json (auto-detects vendors)")
+    ari.add_argument("--force", action="store_true", help="overwrite an existing infra-local.json")
+    ari.set_defaults(func=cmd_architecture)
+    arsub.add_parser("show", help="print the captured topology + control-surface links").set_defaults(
+        func=cmd_architecture)
+    arsub.add_parser("sync", help="push the topology (credentials stripped) to the hosted board").set_defaults(
+        func=lambda a: __import__("celeborn_sync").cmd_architecture_sync(a))
+    arsub.add_parser("trace", help="re-detect the stack + additively merge new pieces, then remap the hosted "
+                                   "Stack (runs automatically every 3 turns + on a dependency-manifest edit)").set_defaults(
+        func=cmd_architecture)
+    arp.set_defaults(func=cmd_architecture, arch_cmd=None)  # bare `architecture` → show
+
+    # Product federation registry (CELE-t190, Layer A of CELE-t188): name the repo-facets of one product,
+    # their roles + publish policy (committed product.md) and this machine's checkout paths (gitignored
+    # product-local.json). The orient banner reads it; Layers B/C/D build on it.
+    pdp = sub.add_parser("product",
+        help="product federation registry — repo-facets, roles, publish policy + orient banner (CELE-t190)")
+    pdsub = pdp.add_subparsers(dest="product_cmd")
+    pdsub.add_parser("list", help="print the facet table (roles · publish · bound/unbound here)").set_defaults(
+        func=cmd_product, product_cmd="list")
+    pdi = pdsub.add_parser("init", help="scaffold .context/product.md (the committed registry)")
+    pdi.add_argument("--name", default=None, help="product name (default: project name / folder)")
+    pdi.add_argument("--force", action="store_true", help="overwrite an existing product.md")
+    pdi.set_defaults(func=cmd_product, product_cmd="init")
+    pda = pdsub.add_parser("add", help="add or update a facet in product.md (product FACTS only, no paths)")
+    pda.add_argument("key", help="facet key (e.g. client, server)")
+    pda.add_argument("--role", required=True, choices=list(PRODUCT_ROLES), help="facet role")
+    pda.add_argument("--publish", default=None, help="publish policy (e.g. never, pypi, fork+PR)")
+    pda.add_argument("--repo", default=None, help="canonical remote URL (portable — no local checkout path)")
+    pda.add_argument("--upstream", default=None, help="upstream remote (for oss:* facets)")
+    pda.set_defaults(func=cmd_product, product_cmd="add")
+    pdb = pdsub.add_parser("bind", help="bind a facet → this machine's checkout path (gitignored, per-machine)")
+    pdb.add_argument("key", help="facet key to bind")
+    pdb.add_argument("checkout", help="absolute path to the local checkout on this machine")
+    pdb.set_defaults(func=cmd_product, product_cmd="bind")
+    pdp.set_defaults(func=cmd_product, product_cmd=None)  # bare `product` → list
+
+    # Multi-repo git/PR ops (CELE-t191, Layer B of CELE-t188): route git + a drafted `gh pr create` to a
+    # bound facet checkout, auto-attributing each op (touch + Celeborn-Task/-Agent/-Model trailers). The
+    # publish guard (PreToolUse) enforces role policy; these route. All read the Layer A registry (t190).
+    cmp_ = sub.add_parser("commit",
+        help="facet-routed git commit into a bound checkout, with auto touch + trailers (CELE-t191)")
+    cmp_.add_argument("--facet", required=True, help="facet key to route the commit to (must be bound here)")
+    cmp_.add_argument("-m", "--message", required=True,
+                      help="commit message (Celeborn-Task/-Agent/-Model trailers appended automatically)")
+    cmp_.add_argument("--task", default=None,
+                      help="task id for the Celeborn-Task trailer (default: this session's doing card)")
+    cmp_.add_argument("--by", default=None, help="agent handle (default: this session)")
+    cmp_.add_argument("--family", default=None, help="agent family for attribution (e.g. Claude)")
+    cmp_.add_argument("--model", default=None, help="agent model for attribution (e.g. Opus 4.8)")
+    cmp_.add_argument("--session", default=None, help=argparse.SUPPRESS)
+    cmp_.add_argument("files", nargs="*",
+                      help="files to stage+commit (paths relative to the facet checkout); omit to commit staged")
+    cmp_.set_defaults(func=cmd_commit)
+
+    psp_ = sub.add_parser("push",
+        help="facet-routed git push to a bound checkout (release/tag push guarded by role) (CELE-t191)")
+    psp_.add_argument("--facet", required=True, help="facet key to route the push to (must be bound here)")
+    psp_.add_argument("remote", nargs="?", default=None, help="git remote (e.g. origin); default: git's default")
+    psp_.add_argument("branch", nargs="?", default=None, help="branch/refspec to push; default: git's default")
+    psp_.add_argument("-u", "--set-upstream", dest="set_upstream", action="store_true",
+                      help="pass --set-upstream to git push")
+    psp_.add_argument("--tags", action="store_true",
+                      help="push tags too (a RELEASE push — refused on server:private/oss:* facets)")
+    psp_.add_argument("--follow-tags", dest="follow_tags", action="store_true",
+                      help="pass --follow-tags (a RELEASE push — refused on server:private/oss:* facets)")
+    psp_.set_defaults(func=cmd_push)
+
+    prd_ = sub.add_parser("pr",
+        help="DRAFT a facet-routed pull request (prints a gh command; never auto-sends) (CELE-t191)")
+    prd_.add_argument("--facet", required=True, help="facet key to route the PR to (must be bound here)")
+    prd_.add_argument("--base", default=None, help="base branch for the PR (default: main)")
+    prd_.add_argument("--title", default=None, help="PR title (default: the top commit subject)")
+    prd_.add_argument("--body", default=None, help="PR body (default: a bullet list of the commits)")
+    prd_.add_argument("--task", default=None, help="task id for the PR provenance (default: session's doing card)")
+    prd_.add_argument("--by", default=None, help="agent handle for the drafted-by line (default: session)")
+    prd_.add_argument("--family", default=None, help=argparse.SUPPRESS)
+    prd_.add_argument("--model", default=None, help=argparse.SUPPRESS)
+    prd_.add_argument("--session", default=None, help=argparse.SUPPRESS)
+    prd_.set_defaults(func=cmd_pr)
 
     # Manage hosted projects on celeborn.thot.ai (t97): list them, or remove one (incl. an orphan whose
     # repo was deleted — removal is hosted-only, no local .context/ needed). RM cascades server-side.
