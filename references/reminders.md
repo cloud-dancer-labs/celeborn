@@ -22,7 +22,7 @@ philosophy as the rest of Celeborn — a portable markdown/CLI core, with hooks 
 ## The portable command
 
 ```bash
-celeborn remind --tokens <current_context_tokens> [--every 100000] [--last <prev_tokens>] [--soft-limit <ceiling>] [--clear-cmd "<text>"]
+celeborn remind --tokens <current_context_tokens> [--every 100000] [--last <prev_tokens>] [--soft-limit <n>] [--hard-limit <n>] [--session <id>] [--clear-cmd "<text>"]
 ```
 
 - Prints a reassuring, Tolkien-voiced verse that escalates gently by milestone (≈100k, 200k, 300k+).
@@ -30,10 +30,19 @@ celeborn remind --tokens <current_context_tokens> [--every 100000] [--last <prev
 - `--last` makes it **idempotent per increment**: pass the token count at the previous reminder and
   it stays silent unless a new `--every`-sized boundary was crossed. A host can therefore call it on
   every turn/render and the user only sees it once per band.
-- `--soft-limit <n>` sets a **ceiling**: at or above it the reminder drops the poetry and turns into a
-  plain, urgent warning ("you're at ~165,000 tokens, past your 150,000 line"). Omit it for gentle
-  milestone verses only. It's a per-call flag — not stored in `.celebornrc` — so the host (or the
-  `context-watch.sh` hook) supplies it; tune it where `remind` is invoked.
+- `--soft-limit <n>` / `--hard-limit <n>` set the **context-pressure thresholds** (CELE-t207): newly
+  crossing one (measured against the tracked last-reminded mark) replaces the calm verse with an
+  explicit warning — ⚠ at soft ("wrap the current step, checkpoint, then clear"), ⛔ at hard ("stop
+  and checkpoint NOW"; the future auto-clear trigger). Defaults live in `.celebornrc`
+  (`context_soft_tokens` 100k / `context_hard_tokens` 125k — the same "clear now"/"clear urgent"
+  lines the board bands draw); the flags override per call, and ≤ 0 disables a threshold. Crossing
+  detection needs a tracked mark, so a bare one-shot `--tokens` without `--last` keeps the calm
+  milestone wording.
+- `--session <id>` reads the live window a transcript-less harness (OpenCode) reported onto that
+  session's capture cursor via `celeborn record tokens`. The cursor tracks its own last-reminded
+  mark, quietly re-arms when the window shrinks (post-clear/compaction), and carries a
+  machine-readable `pressure` field (`none`/`soft`/`hard`) that the board chips — and a future
+  auto-clear — read without re-deriving tokens.
 - `--clear-cmd` sets the wording of the action line (e.g. `/clear` in Claude Code).
 - With no `--tokens`, it prints the generic verse — useful for a human or an agent invoking it by hand.
 - The reassurance line names the **Hot-tier cost** and that it reloads automatically (e.g. "your

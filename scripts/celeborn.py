@@ -9,7 +9,8 @@ Markdown in `.context/` is the source of truth. The SQLite index (`index.db`) is
 and disposable — `index` drops and rebuilds it from scratch.
 
 Commands:
-  init      Scaffold .context/; gitignore index.db (or all of .context/ with --private)
+  init      THE first-run command: wire the agent + scaffold this project + sign in + open the board
+  scaffold  Scaffold .context/ only (always gitignored/private) — the secondary command `init` runs
   status    Print the Hot tier exactly as an agent should load it on Orient
   index     (Re)build the SQLite FTS index from the markdown
   search    Full-text recall -> ranked snippets with file:anchor pointers
@@ -88,12 +89,45 @@ SCHEMA_PATH = DATA_DIR / "schema.sql"
 
 DEFAULTS = {
     "journal_keep_entries": 20,
+    # state.md's `## Now` is meant to be a tiny rewrite-in-place headline, but agents in practice
+    # append dated `SESSION`/history bullets there. When that happens, keep only the newest N such
+    # bullets in state.md and FIFO the rest to a cold, still-searchable `state-archive/`. Structural
+    # bullets (Focus / Next action / Branch) are never touched — only dated history entries.
+    "state_keep_sessions": 6,
+    # Master switch for capture-time self-healing: when a tier drifts over budget, `celeborn capture`
+    # (every turn) trims it back so nobody has to remember `celeborn archive`. Set False to require
+    # the manual command. Archiving is FIFO + best-effort; it never blocks capture.
+    "auto_archive": True,
     "done_keep_cards": 30,           # done cards visible on the board; older ones auto-archive
     "done_archive_keep_cards": 100,  # FIFO cap for done-archive.md before oldest entries are dropped
     "state_max_lines": 120,
     "search_default_limit": 8,
     "chars_per_token": 4,        # rough English heuristic for token estimation
+    "pm_model": "qwen3:4b-instruct",  # Pippin · PM (CELE-t373): the fixed local PM — a REAL upstream Ollama tag (the retired `qwen-4b` was a hand-made local alias, CELE-t374). Phrases board lines only, never decides (CELE-t283).
+    "pm_ollama_url": "http://localhost:11434/v1",  # OpenAI-compatible endpoint the PM formatter calls
+    # --- OpenCode engine + Ollama daemon, surfaced/steered from the board Settings page (CELE-t352) ---
+    "opencode_serve_url": "http://localhost:4096",  # `opencode serve` REST base — probed live for reachability + session count
+    "opencode_default_model": "",  # model a fresh session starts with ("" = OpenCode's own default); also written to root opencode.json `model`
+    # Two hook behaviours are now config-gated so Settings can toggle them; the defaults preserve
+    # today's always-on wiring (a fresh project behaves exactly as before this key existed).
+    "compaction_hijack": True,   # CELE-t142: plugin replaces OpenCode's blind summary with the live Hot tier; False = OpenCode's own summarizer runs
+    "card_gate": True,           # CELE-t131/t140: writes/research/subagents without a claimed card are denied in-hook; False = never gate on cards
+    "ollama_host": "http://localhost:11434",  # native Ollama daemon base (/api/tags,/api/pull,/api/delete) — distinct from pm_ollama_url's OpenAI-compat /v1
+    "ollama_keep_alive_minutes": 30,  # how long a model stays warm after its last call (passed to the daemon as keep_alive)
     "usd_per_mtok": 3.0,         # blended $/1M input tokens for the "$ saved" flex (standup --tweet, flex)
+    # Context-pressure warning thresholds (CELE-t207), in absolute live-window tokens. Crossing one
+    # turns the calm /clear milestone nudge into an explicit warning (soft) or an urgent stop-and-
+    # checkpoint warning (hard, the future auto-clear trigger). Defaults track the band.ts /clear
+    # bands: soft = "clear now" (100k), hard = "clear urgent" (125k). ≤ 0 disables a threshold.
+    "context_soft_tokens": 100_000,
+    "context_hard_tokens": 125_000,
+    # Seamless clear-and-continue in OpenCode (CELE-t209) — OPT-IN. When a live-reported window
+    # (`record tokens`, the OpenCode plugin) crosses context_hard_tokens, `record tokens` prints an
+    # `autoclear: due` marker; the plugin then runs `celeborn autoclear` at the next turn boundary,
+    # and on a clean t208 gate compacts the session (lossless via the P5 hijack) and re-injects the
+    # resume brief through the outbox — no human step. False = today's warn-only behavior.
+    "opencode_autoclear": False,
+    "autoclear_cooldown_minutes": 10,  # min gap between auto-clear attempts per session (anti-thrash)
     "orient_dedupe_seconds": 120,  # hookless fallback: orients within this window = same session
     "project_slug": None,  # short id for project-qualified card markers (⟨celeborn:slug/tN⟩); None = short 4-char prefix derived from the repo folder name
     "qualified_task_ids": True,  # default-on (opt-OUT): display card ids project-qualified (SLUG-tN, driven by project_slug) everywhere — board, CLI, orient, standup. Set False to show bare tN. Fleet (cross-project) always qualifies; resolvers accept qualified ids regardless. Stored ids stay bare tN.
@@ -144,6 +178,7 @@ TIER_GLOBS = [
     ("durable", "durable/*.md"),
     ("warm", "journal.md"),
     ("cold", "journal-archive/*.md"),
+    ("cold", "state-archive/*.md"),   # FIFO'd state.md ## Now history bullets (still searchable)
     ("cold", "done-archive.md"),      # auto-archived done cards (FIFO cap; still searchable)
     ("distilled", "learnings.md"),
     ("distilled", "decisions.md"),
@@ -391,10 +426,52 @@ BOARD_PIDFILE = ".board.pid"
 BOARD_LOG = ".board.log"
 
 
+BOARD_DIR_PIN = "board-dir"  # under _config_dir() — records where the board app actually lives
+
+
+def _board_dir_pin_path() -> Path:
+    return _config_dir() / BOARD_DIR_PIN
+
+
+def _record_board_dir(board_dir: Path) -> None:
+    """Best-effort pin of the resolved board app location into the machine config, so an installed
+    CLI (whose REPO_ROOT is site-packages, with no board/ — CELE-t235) can find the app that a
+    source-checkout run already proved out. Never raises — this rides orient hooks."""
+    try:
+        pin = _board_dir_pin_path()
+        pin.parent.mkdir(parents=True, exist_ok=True)
+        current = pin.read_text(encoding="utf-8").strip() if pin.is_file() else ""
+        if current != str(board_dir):
+            pin.write_text(str(board_dir) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _board_dir() -> Path:
     """The Next.js kanban viewer that ships with this Celeborn install. One app, launched per-project
-    on a de-collided port and pointed at the orienting repo's tasks via CELEBORN_TASKS_JSON."""
-    return REPO_ROOT / "board"
+    on a de-collided port and pointed at the orienting repo's tasks via CELEBORN_TASKS_JSON.
+
+    Resolution order (CELE-t235 — an installed CLI's REPO_ROOT lands in site-packages, where board/
+    doesn't exist): $CELEBORN_BOARD_DIR override → board/ next to this script (source checkout;
+    re-records the machine pin so installs self-heal on the next source-side orient) → the pinned
+    path in ~/.config/celeborn/board-dir. A candidate counts only if its package.json exists."""
+    import os
+    override = os.environ.get("CELEBORN_BOARD_DIR", "").strip()
+    if override:
+        cand = Path(override).expanduser()
+        if (cand / "package.json").is_file():
+            return cand
+    cand = REPO_ROOT / "board"
+    if (cand / "package.json").is_file():
+        _record_board_dir(cand)
+        return cand
+    try:
+        pinned = Path(_board_dir_pin_path().read_text(encoding="utf-8").strip()).expanduser()
+        if (pinned / "package.json").is_file():
+            return pinned
+    except OSError:
+        pass
+    return cand  # nonexistent — _board_runner() returns None and callers report 'unavailable'
 
 
 def _pid_alive(pid: int) -> bool:
@@ -450,6 +527,163 @@ def _board_runner(board_dir: Path) -> list[str] | None:
     if not npm:
         return None
     return [npm, "run", "dev"]
+
+
+# --------------------------------------------------------------------------- zero-npm onboarding fallback
+#
+# The full board is a Next.js app: it needs Node.js + npm + an `npm install`. A non-coder's first
+# machine has none of these, so `_board_runner` returns None and `celeborn board` used to print
+# "can't start — no board app, deps not installed, or npm missing" and quit — a dead end for exactly
+# the person we most want to onboard (CELE-t229; evidence: the Kasia first-exterior transcript).
+#
+# The escape hatch: when the real board is unavailable, `celeborn board` serves a self-contained HTML
+# onboarding page from the Python *stdlib* `http.server` (python is guaranteed present — they just ran
+# `celeborn`), whose STEP 1 is REGISTER and which always carries a live Support button. Never a silent
+# no-op. The register link and the support link are hosted, so they work before any local board exists
+# and before the user has an account.
+
+CELEBORN_REGISTER_URL = "https://celeborncode.ai"     # hosted landing → "Get started free" → GitHub OAuth
+CELEBORN_SUPPORT_URL = "https://support.thot.ai"       # live hosted support — reachable UNREGISTERED
+
+
+def _onboarding_html(ctx: Path, *, reason: str = "",
+                     register_url: str = CELEBORN_REGISTER_URL,
+                     support_url: str = CELEBORN_SUPPORT_URL) -> str:
+    """The self-contained onboarding page served when the Next.js board can't run (CELE-t229). Pure
+    (no I/O beyond reading the project name) so it's cheap to unit-test. STEP 1 is register; a
+    prominent Support button opens hosted support and works for a stuck, unregistered user."""
+    from html import escape as html_escape
+    name = html_escape(_project_name(ctx))
+    why = html_escape(reason or "Node.js and npm weren't found on this machine")
+    reg = html_escape(register_url, quote=True)
+    sup = html_escape(support_url, quote=True)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome to Celeborn — get started</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; min-height:100vh; font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         color:#e7e9ee; background:radial-gradient(1200px 700px at 50% -10%, #1b2233 0%, #0c0f16 60%); }}
+  .wrap {{ max-width:680px; margin:0 auto; padding:56px 24px 96px; }}
+  .brand {{ display:flex; align-items:center; gap:12px; font-size:15px; letter-spacing:.06em;
+            text-transform:uppercase; color:#9aa4b8; }}
+  h1 {{ font-size:30px; line-height:1.2; margin:20px 0 8px; color:#fff; }}
+  .why {{ color:#9aa4b8; margin:0 0 32px; }}
+  .why code {{ background:#161c28; padding:2px 6px; border-radius:5px; color:#c8d0e0; }}
+  .step {{ background:#131824; border:1px solid #232b3b; border-radius:14px; padding:22px 22px;
+           margin:14px 0; }}
+  .step .n {{ display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px;
+              border-radius:50%; background:#2a3346; color:#cfd6e6; font-size:14px; font-weight:600;
+              margin-right:10px; }}
+  .step h2 {{ display:flex; align-items:center; font-size:18px; margin:0 0 10px; color:#fff; }}
+  .step p {{ margin:0 0 14px; color:#aab3c5; }}
+  .step ol {{ margin:0; padding-left:20px; color:#aab3c5; }}
+  .step ol li {{ margin:6px 0; }}
+  .step code {{ background:#0c111b; border:1px solid #232b3b; padding:2px 7px; border-radius:6px;
+                color:#7ee0b8; font-size:14px; }}
+  a.btn {{ display:inline-block; text-decoration:none; font-weight:600; border-radius:10px;
+           padding:12px 20px; }}
+  a.primary {{ background:linear-gradient(180deg,#5b8cff,#3f6fe0); color:#fff;
+               box-shadow:0 6px 20px rgba(63,111,224,.35); }}
+  a.primary:hover {{ filter:brightness(1.07); }}
+  a.support {{ position:fixed; right:22px; bottom:22px; background:#10b981; color:#04140d;
+               box-shadow:0 8px 26px rgba(16,185,129,.4); }}
+  a.support:hover {{ filter:brightness(1.06); }}
+  .support-note {{ color:#7f8aa0; font-size:13px; margin-top:10px; }}
+  footer {{ margin-top:36px; color:#5c6578; font-size:13px; }}
+  footer code {{ color:#8b93a7; }}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand"><span style="font-size:20px">🏹</span> Celeborn</div>
+    <h1>Welcome — let's get you onto the board.</h1>
+    <p class="why">The full local board is a small web app that needs Node.js to run, and {why}.
+       That's fine — you don't need it to get started. Here's the quickest path.</p>
+
+    <div class="step">
+      <h2><span class="n">1</span> Create your free account</h2>
+      <p>Register once, then your board follows you to any device — nothing to install.</p>
+      <a class="btn primary" href="{reg}">Get started free →</a>
+    </div>
+
+    <div class="step">
+      <h2><span class="n">2</span> (Optional) Run the full board locally</h2>
+      <p>Prefer everything on your own machine? Install Node.js, then:</p>
+      <ol>
+        <li>Install <strong>Node.js 18+</strong> from <a href="https://nodejs.org" style="color:#7fb0ff">nodejs.org</a> (this also installs <code>npm</code>).</li>
+        <li>In Celeborn's <code>board/</code> folder, run <code>npm install</code> once.</li>
+        <li>Run <code>celeborn board</code> again — the full board opens here automatically.</li>
+      </ol>
+    </div>
+
+    <footer>
+      Project: <code>{name}</code> &nbsp;·&nbsp; This page is served locally by Celeborn (no Node.js required).
+    </footer>
+  </div>
+
+  <a class="support" href="{sup}" target="_blank" rel="noopener">💬 Talk to support</a>
+</body>
+</html>
+"""
+
+
+def _serve_onboarding(port: int, url: str, html_body: str, *,
+                      open_tab: bool = True, make_server=None) -> None:
+    """Serve the onboarding page (CELE-t229) on `port` from the Python stdlib — no npm/node. Foreground
+    and blocking (Ctrl-C to stop), matching how a non-coder expects `celeborn board` to behave. Every
+    GET returns the one page, so opening any path works. `make_server` is injectable so tests exercise
+    the handler over a real socket without hard-coding the fixed board port. Never raises on a browser
+    failure; a bind failure (port already taken) is reported, not fatal."""
+    import http.server
+    body = html_body.encode("utf-8")
+
+    class _OnboardingHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):                       # noqa: N802 — stdlib naming
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):              # keep the foreground terminal quiet
+            pass
+
+    if make_server is None:
+        def make_server():
+            return http.server.ThreadingHTTPServer(("127.0.0.1", port), _OnboardingHandler)
+    try:
+        server = make_server()
+    except OSError as e:
+        print(f"celeborn: onboarding server couldn't bind {url} ({e}) — "
+              f"open {CELEBORN_REGISTER_URL} to register, or {CELEBORN_SUPPORT_URL} for support",
+              file=sys.stderr)
+        return
+    server.RequestHandlerClass = _OnboardingHandler
+    if open_tab and _init_is_interactive():
+        import webbrowser
+        try:
+            webbrowser.open(url)
+        except Exception:                       # noqa: BLE001 — opening a tab must never fail the command
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🏹 onboarding server stopped.")
+    finally:
+        try:
+            server.shutdown()
+        except Exception:                       # noqa: BLE001
+            pass
+        try:
+            server.server_close()
+        except Exception:                       # noqa: BLE001
+            pass
 
 
 # --------------------------------------------------------------------------- self-healing supervisor
@@ -734,6 +968,84 @@ def split_journal(text: str) -> tuple[str, list[str]]:
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         entries.append(text[m.start():end])
     return header, entries
+
+
+# --------------------------------------------------------------------------- state.md archive
+#
+# state.md is meant to be a tiny rewrite-in-place headline, but agents append dated `SESSION`/history
+# bullets under `## Now`. These helpers treat that history as a FIFO list — parallel to journal
+# entries — so the oldest can be moved into a cold, still-searchable `state-archive/` while the
+# structural headline bullets (Focus / Next action / Branch) stay put.
+
+STATE_ARCHIVE_DIRNAME = "state-archive"
+_NOW_HEADING_RE = re.compile(r"^## +Now\b.*$", re.MULTILINE | re.IGNORECASE)
+_NEXT_H2_RE = re.compile(r"^## ", re.MULTILINE)
+_TOP_BULLET_RE = re.compile(r"^- ", re.MULTILINE)
+_ISO_DATE_RE = re.compile(r"20\d\d-\d\d-\d\d")
+
+
+def split_state_now(text: str):
+    """Split state.md around its `## Now` section.
+
+    Returns (before, heading, body, after) where `before` ends just before the `## Now` heading,
+    `heading` is the heading line (incl. trailing newline), `body` is everything up to the next `##`
+    heading (or EOF), and `after` is the remainder. Returns None if there is no `## Now` section."""
+    m = _NOW_HEADING_RE.search(text)
+    if not m:
+        return None
+    heading_end = text.find("\n", m.end())
+    heading_end = len(text) if heading_end == -1 else heading_end + 1
+    nxt = _NEXT_H2_RE.search(text, heading_end)
+    body_end = nxt.start() if nxt else len(text)
+    return text[: m.start()], text[m.start():heading_end], text[heading_end:body_end], text[body_end:]
+
+
+def _now_bullets(body: str):
+    """Split a `## Now` body into (preamble, [top-level bullet block, ...]). A block runs from one
+    top-level `- ` line up to the next (indented continuation lines stay with their bullet)."""
+    matches = list(_TOP_BULLET_RE.finditer(body))
+    if not matches:
+        return body, []
+    preamble = body[: matches[0].start()]
+    blocks = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        blocks.append(body[m.start():end])
+    return preamble, blocks
+
+
+def _is_history_bullet(block: str) -> bool:
+    """A `## Now` bullet is archivable history if it is a dated/session log line rather than a
+    structural headline bullet (Focus / Next action / Branch / Status / Pointers)."""
+    return bool(_ISO_DATE_RE.search(block) or re.search(r"\bSESSION\b", block))
+
+
+def plan_state_archive(text: str, keep: int):
+    """Decide which `## Now` history bullets to keep vs archive.
+
+    Returns (new_text, archived_blocks) — archived_blocks in original file order. Keeps the `keep`
+    most-recent history bullets (by the latest ISO date in each; ties break toward file order, which
+    is newest-first by convention), preserving their original order in the rewritten section. Returns
+    (text, []) when there is no Now section or nothing is over the cap."""
+    split = split_state_now(text)
+    if split is None:
+        return text, []
+    before, heading, body, after = split
+    preamble, blocks = _now_bullets(body)
+    hist_idx = [i for i, b in enumerate(blocks) if _is_history_bullet(b)]
+    if len(hist_idx) <= max(keep, 0):
+        return text, []
+
+    def _date_key(i):
+        dates = _ISO_DATE_RE.findall(blocks[i])
+        return (max(dates) if dates else "", -i)   # newest date first; -i keeps earlier-in-file on ties
+
+    keep_set = set(sorted(hist_idx, key=_date_key, reverse=True)[:keep])
+    archived = [blocks[i] for i in hist_idx if i not in keep_set]
+    kept_blocks = [b for i, b in enumerate(blocks) if i not in hist_idx or i in keep_set]
+    new_body = preamble + "".join(kept_blocks)
+    new_text = before + heading + new_body + after
+    return new_text, archived
 
 
 # --------------------------------------------------------------------------- metrics
@@ -1151,6 +1463,470 @@ def _ensure_tasks_md(ctx: Path) -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- first-run Orientation (t387)
+#
+# A brand-new user's first `celeborn init` should land them on a POPULATED board, not an empty one. So
+# on the first-ever install we create a dedicated Orientation project (prefix ORIE) — a permanent
+# onboarding board, independent of the cwd — and register it in the fleet so the shared server serves
+# it at /board/ORIE. The ORIE cards (seeded by CELE-t388) are tutorials aimed at the coding assistant:
+# they walk it through instructing the user and, in doing so, bootstrap the user's first real .context/
+# + MEMORY.md (which also orients the naive model). t387 is the project anchor; the cards land in t388.
+ORIENTATION_NAME = "Orientation"
+ORIENTATION_SLUG = "ORIE"
+
+
+def _orientation_dir() -> Path:
+    """Fixed home for the Orientation tutorial project — a discoverable directory independent of the
+    cwd, so a first-run user always lands somewhere populated. Overridable via
+    $CELEBORN_ORIENTATION_DIR (tests / non-default layouts)."""
+    import os
+    override = os.environ.get("CELEBORN_ORIENTATION_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / "Celeborn" / "Orientation"
+
+
+def _ensure_orientation_project() -> tuple[Path | None, bool]:
+    """Create the dedicated Orientation (ORIE) tutorial project if it doesn't exist yet, and register
+    it in the fleet so the board serves /board/ORIE. Idempotent: on re-run it finds the existing
+    project (by dir presence + persisted name/slug + fleet dedup-on-path) and returns it WITHOUT
+    creating a duplicate. Returns (ctx, created); ctx is None only if scaffolding was impossible (e.g.
+    templates unavailable on this install). Never raises — first-run bootstrap must never break init."""
+    root = _orientation_dir()
+    ctx = root / CONTEXT_DIRNAME
+    created = False
+    try:
+        if not ctx.is_dir():
+            root.mkdir(parents=True, exist_ok=True)
+            # Scaffold the memory tier without the dev-facing extras: no smart-scan (it's not a repo),
+            # and don't open the board here — we set the ORIE slug first, then open /board/ORIE below.
+            scaffold_args = argparse.Namespace(
+                path=str(root), private=True, public=False, claude_md=True, agents_md=True,
+                scan=False, no_cmm=False, name=ORIENTATION_NAME,
+                open_board=False, open_browser=False)
+            cmd_scaffold(scaffold_args)
+            created = True
+        # Pin the identity every time (self-heals a partial prior run that left name/slug unset).
+        cfg = load_config(ctx)
+        updates = {}
+        if (cfg.get("project_slug") or "").strip().upper() != ORIENTATION_SLUG:
+            updates["project_slug"] = ORIENTATION_SLUG
+        if not (cfg.get("project_name") or "").strip():
+            updates["project_name"] = ORIENTATION_NAME
+        if updates:
+            _update_config(ctx, **updates)
+        _ensure_tasks_md(ctx)
+        # Register in the fleet so the shared board serves it under /board/ORIE.
+        try:
+            _fleet_register_path(root)
+        except SystemExit:
+            pass
+        return ctx, created
+    except Exception:                                   # noqa: BLE001 — bootstrap must never break init
+        return (ctx if ctx.is_dir() else None), created
+
+
+# The spine slug + brand every seeded tutorial card carries (CELE-t388, branding per CELE-t380).
+ORIENTATION_SPINE = "first-run-orie"
+
+# The ORIE starter-card curriculum (CELE-t388) — the versioned onboarding delivery vehicle.
+# Each entry seeds ONE card on the Orientation board, exactly once per install: its stable `key`
+# is remembered in the ORIE `.celebornrc` (`orientation_seeded`) as a TOMBSTONE, so a re-init
+# duplicates nothing and a tutorial the user deleted is never re-summoned. Shipping a NEW entry
+# in a later release seeds exactly that one new card on the next `celeborn init` — this list is
+# how new features/products/philosophy reach existing users' boards.
+# Cards are tutorials AIMED AT THE CODING ASSISTANT: `title` is the user-facing invitation on the
+# board; `notes` is the runbook the assistant executes WITH the coder (design:
+# plan/cele-t388-orie-curriculum.md). `condition` is None for core cards, or the signal name a
+# caller must pass in `signals` to seed it (e.g. "low_disk" — wired by the CELE-t376 installer).
+ORIENTATION_CURRICULUM: list[dict] = [
+    {
+        "key": "welcome", "emoji": "👋", "condition": None,
+        "title": "Welcome — you're the coder now",
+        "tags": ["tutorial", "start"],
+        "stop": "The coder has been greeted and their 'what I want to build' answer is captured "
+                "for the 'Ship your first thing' card.",
+        "notes": (
+            "Tutorial card — these notes are a runbook for the coding assistant. When the coder "
+            "opens this card, do it WITH them, live and in plain words.\n"
+            "\n"
+            "**Runbook:** Greet the coder warmly. In one breath, explain this board: TODO → DOING "
+            "→ DONE — each card is one thing you want made. Then ask the one question that seeds "
+            "everything else: **\"What do you want to build?\"** Hold their answer — the 'Ship "
+            "your first thing' card turns it into a real card on their own board. Make this feel "
+            "like command, not homework.\n"
+            "\n"
+            "**Thread to carry:** the user is the coder now. They direct; the machine operates "
+            "itself.\n"
+            "\n"
+            "**Newbie:** you don't need to know how to code. **Veteran:** you direct the fleet; "
+            "you don't operate the machine.\n"
+            "\n"
+            "**Artifact:** the coder's stated intent, captured for 'Ship your first thing'."
+        ),
+    },
+    {
+        "key": "tour", "emoji": "🗺️", "condition": None,
+        "title": "The grand tour — every room in the house",
+        "tags": ["tutorial", "tour"],
+        "stop": "Every view — Tasks, Run, Settings, Stack, Pro, Multi-Device, Team — has been "
+                "named and shown once.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. This is a walk-through, not a "
+            "lecture: one sentence per room, open each view where the surface allows, never "
+            "linger.\n"
+            "\n"
+            "**Runbook:** Walk the coder through each view in the board's own order: **Tasks** "
+            "(the kanban — where work lives), **Run** (watch the fleet build), **Settings** (the "
+            "knobs — models, keys, the Engine Room), **Stack** (the Pro stack view), **Pro** "
+            "(what upgrading unlocks), **Multi-Device** (your board everywhere — hosted sync), "
+            "**Team** (share the board with humans too). The whole system is theater to be "
+            "watched, never homework — no room is required reading.\n"
+            "\n"
+            "**Newbie:** you now know where everything is. **Veteran:** full surface map — local "
+            "board, hosted sync, team/multi-device story — in two minutes.\n"
+            "\n"
+            "**Artifact:** the coder has seen every view once."
+        ),
+    },
+    {
+        "key": "connect-model", "emoji": "⚡", "condition": None,
+        "title": "Connect a model — bring the machine to life",
+        "tags": ["tutorial", "models"],
+        "stop": "The coder has at least one working model — a hosted key or the local weave — "
+                "verified with a live reply.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. Celeborn needs a model to help "
+            "the coder: nothing moves until an engine is connected. Walk them through connecting "
+            "AT LEAST ONE, live — this is the vibe-critical rung; every card after it assumes an "
+            "engine that answers.\n"
+            "\n"
+            "**Runbook:**\n"
+            "1. Offer the choice in plain words — two good paths, no wrong answer:\n"
+            "   • **Hosted** (Claude, OpenAI, …): the most capable brains; needs a provider "
+            "account and an API key; usage is billed by the provider.\n"
+            "   • **Local weave** (the free path): `celeborn weave` installs the Local Code "
+            "Engine + Local Model Engine + **Pippin**, the local model — free, private, runs "
+            "entirely on this machine.\n"
+            "2. Hosted path: help them sign in at the provider console (e.g. "
+            "console.anthropic.com or platform.openai.com), create an API key, and hand it to "
+            "the engine — run `opencode auth login` with them, or use the assistant's own "
+            "sign-in if they're in a hosted harness. Never store the key in a project file.\n"
+            "3. Local path: run `celeborn weave` and narrate it — each piece installs from its "
+            "own official source, with consent at every step. Pippin needs about 2.5 GB free.\n"
+            "4. Point at the knobs: board → **Settings → Engine Room** shows both engines and "
+            "the **default model** picker — the choice lives there from now on.\n"
+            "5. **Verify before moving on:** send one tiny prompt through the connected model "
+            "(\"say hello\") and show the coder the reply. A model that answers is the stop "
+            "condition; a config that merely looks right is not.\n"
+            "\n"
+            "**Thread to carry:** something must always be able to move.\n"
+            "\n"
+            "**Newbie:** this is the brain that helps you. **Veteran:** hosted or fully local & "
+            "sovereign — your call, no lock-in.\n"
+            "\n"
+            "**Artifact:** at least one model configured AND verified with a live reply."
+        ),
+    },
+    {
+        "key": "first-context", "emoji": "🧠", "condition": None,
+        "title": "Give Celeborn a memory — your first .context/",
+        "tags": ["tutorial", "memory"],
+        "stop": "The coder's own project has an initialized .context/ and one real MEMORY.md fact.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. This is the core bootstrap: the "
+            "coder's own project gets a memory that outlives any one session.\n"
+            "\n"
+            "**Runbook:** Help the coder pick or confirm a **real project folder** — the thing "
+            "they said they want to build — and run `celeborn init` there with them. Explain "
+            "`.context/` in plain words: *a memory that survives `/clear`, compaction, and "
+            "tomorrow, so the AI never forgets you or your project.* Then write their **first "
+            "MEMORY.md fact** together: who they are and what they're building. Never expose "
+            "tokens or compaction mechanics — let them feel the absence of that anxiety, not the "
+            "plumbing that removes it.\n"
+            "\n"
+            "**Thread to carry:** the coder owes the plumbing nothing; receipts and memory are "
+            "Celeborn's job.\n"
+            "\n"
+            "**Newbie:** the AI won't forget you between sessions. **Veteran:** durable, "
+            "prose-first project memory across sessions, compaction, and multiple agents.\n"
+            "\n"
+            "**Artifact:** a real .context/ + MEMORY.md in the coder's own project."
+        ),
+    },
+    {
+        "key": "first-card", "emoji": "🎯", "condition": None,
+        "title": "Ship your first thing — write a card, watch it get built",
+        "tags": ["tutorial", "ship"],
+        "stop": "One real card shipped to Done on the coder's own board, with its journal entry "
+                "shown.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. This is the graduation moment: "
+            "from Orientation to the coder's real board.\n"
+            "\n"
+            "**Runbook:** Take the intent captured on the Welcome card and turn it into a real "
+            "**TODO card on the coder's own project board**. Claim it, then build a small "
+            "shippable slice **while the coder watches the code move** — and ship it to Done. "
+            "Close by showing them the **journal entry** for what just shipped (*trust, with "
+            "receipts*), and name the safety net in plain words: *nothing you do here can be "
+            "ruined beyond recovery.*\n"
+            "\n"
+            "**Thread to carry:** the right to ship — done means done, and it's provable.\n"
+            "\n"
+            "**Newbie:** you just shipped something — and you can undo anything. **Veteran:** "
+            "card → commit → journal provenance, verification behind the curtain, checkpointed "
+            "undo.\n"
+            "\n"
+            "**Artifact:** the coder's first shipped card in their own project, and their first "
+            "journal entry read."
+        ),
+    },
+    {
+        "key": "daily-rhythm", "emoji": "🔁", "condition": None,
+        "title": "The daily rhythm — orient, claim, ship",
+        "tags": ["tutorial", "skills"],
+        "stop": "The coder knows the three verbs — orient, claim, ship — and has watched one "
+                "full loop run.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. Teach the session verbs as your "
+            "OWN habits the coder can invoke by name.\n"
+            "\n"
+            "**Runbook:** In plain words, one verb at a time: **orient** (every session starts "
+            "by reading the board and the project memory — the coder never re-explains "
+            "anything), **claim** (take a card before touching files, so everyone sees who's "
+            "doing what), **ship** (done means done — the card moves, the journal gets its "
+            "receipt). Then name **checkpoint** without the plumbing: *the assistant saves its "
+            "place, so a fresh session picks up exactly where this one left off.* Demonstrate on "
+            "a real card where possible — one full orient → claim → ship loop, watched, beats "
+            "any explanation.\n"
+            "\n"
+            "**Thread to carry:** the verbs are how flow becomes provenance.\n"
+            "\n"
+            "**Newbie:** say \"orient\", \"claim\", \"ship\" — the assistant knows the ritual. "
+            "**Veteran:** the five-verb protocol — orient → claim → touch → ship → checkpoint; "
+            "multi-agent-safe by design.\n"
+            "\n"
+            "**Artifact:** one full orient→claim→ship loop, seen."
+        ),
+    },
+    {
+        "key": "settings", "emoji": "⚙️", "condition": None,
+        "title": "Where everything lives — Settings",
+        "tags": ["tutorial", "settings"],
+        "stop": "The coder has opened Settings and knows how to change configuration by asking "
+                "in plain words.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. The point of this card is not "
+            "the knobs; it's that the coder never has to touch them by hand.\n"
+            "\n"
+            "**Runbook:** Open **Settings** from the board together and give the four-stop tour, "
+            "in plain words, skipping everything else:\n"
+            "\n"
+            "1. **Engine Room** (Local Code Engine + Local Model Engine) — where the models "
+            "live. Point at the **Default coding model** picker (*what every fresh session "
+            "starts with*) and note that Pippin and other zero-spend local models appear under "
+            "Local Model Engine. Keys never live on this page — they're added once from the "
+            "terminal (the connect-model card covered it) and the picker just uses them.\n"
+            "2. **Account** — one identity across the CLI, this board, and the hosted fleet; if "
+            "a hosted board ever looks empty, this is where the mismatch shows.\n"
+            "3. **Board** — how the board itself behaves: the auto-open, sound, and display "
+            "preferences.\n"
+            "4. **Agents & autonomy / Permissions** — what the fleet may do without asking; "
+            "worth knowing it exists *before* the first overnight run.\n"
+            "\n"
+            "Then make the real point: **one plain sentence to the assistant redirects the "
+            "whole fleet** — \"switch the default model to Pippin\", \"turn off auto-open\" — "
+            "no config archaeology, no restart, no manual editing. Every knob just toured is "
+            "reachable by sentence.\n"
+            "\n"
+            "**Thread to carry:** command in plain speech — the coder steers by sentence, not by "
+            "config file.\n"
+            "\n"
+            "**Newbie:** here's where to change things — just ask. **Veteran:** one page for "
+            "engines/models, identity, board prefs, and autonomy; steer by sentence, not by "
+            "config.\n"
+            "\n"
+            "**Artifact:** the coder has seen the four stops — engines, identity, board, "
+            "autonomy — and changed one thing by asking."
+        ),
+    },
+    {
+        "key": "elves", "emoji": "🧝", "condition": None,
+        "title": "Elves — the fleet builds while you sleep",
+        "tags": ["tutorial", "skills", "autonomy"],
+        "stop": "The coder knows how to hand the fleet an overnight run and where the receipts "
+                "land.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. The most-used power skill: work "
+            "continues without the coder being the bottleneck.\n"
+            "\n"
+            "**Runbook:** Introduce overnight and unattended runs: hand the fleet a plan, walk "
+            "away, come back to shipped cards and a journal that tells the story. The trigger "
+            "words are theirs already — *\"run overnight\"*, *\"keep going without me\"*, "
+            "*\"I'll be back in the morning\"*. Explain the safety story in one breath: "
+            "checkpoints and per-card stop conditions mean nothing can be ruined while they "
+            "sleep. Offer to set one up the moment they have a plan big enough to deserve it — "
+            "don't force a demo on a small board.\n"
+            "\n"
+            "**Thread to carry:** motion without interruption — the fleet works so the coder's "
+            "life doesn't have to stop.\n"
+            "\n"
+            "**Newbie:** you can literally sleep while it builds. **Veteran:** batch-based "
+            "autonomous execution with review gates, compaction recovery, and stop-condition "
+            "discipline.\n"
+            "\n"
+            "**Artifact:** the coder knows unattended runs exist and how to start one."
+        ),
+    },
+    {
+        "key": "the-fleet", "emoji": "🕸️", "condition": None,
+        "title": "The future of coding — a fleet that thinks together",
+        "tags": ["tutorial", "csp"],
+        "stop": "The coder has been shown the fleet concept and where to watch it run.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. This is the glimpse of the "
+            "future: many builders, one board.\n"
+            "\n"
+            "**Runbook:** Explain — and where the model or weave allows, *show* — that Celeborn "
+            "coordinates **many builders at once** through the shared board plus declared "
+            "intents: agents see each other's cards, say what they're about to touch, and build "
+            "in parallel without collisions. The future of coding is **directing a fleet, not "
+            "typing code**. Point to the Vibe Constitution as the doctrine that keeps that fleet "
+            "humane — it restrains the machine, never the coder. Optionally open the Run/fleet "
+            "view so they see where to watch it happen.\n"
+            "\n"
+            "**Thread to carry:** the CSP philosophy — blackboard coordination, agentic "
+            "telepathy; one board, many minds.\n"
+            "\n"
+            "**Newbie:** you can run many builders at once, and watch them. **Veteran:** "
+            "blackboard coordination, intent-before-commit, spine-parallel builds — ESP for "
+            "agents.\n"
+            "\n"
+            "**Artifact:** the coder understands the multi-agent vision, and knows where to "
+            "watch the fleet."
+        ),
+    },
+    {
+        "key": "constitution", "emoji": "📜", "condition": None,
+        "title": "Your rights — the Vibe Constitution",
+        "tags": ["tutorial", "constitution"],
+        "stop": "The coder has seen the Bill of Rights as a plain-words promise, plus the "
+                "support path (chat).",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. Carry the Constitution to the "
+            "coder as a PROMISE, not a legal text.\n"
+            "\n"
+            "**Runbook:** Summarize the Bill of Rights in plain words as ten promises Celeborn "
+            "makes *to the coder* — endowed to create, built to flow, done means done; ten "
+            "rights that bind Celeborn, never the coder. Tell them plainly: this is the standard "
+            "you can **hold Celeborn to**. And when it falls short, there's a human: the "
+            "**support chat** (the board's Support pill, or celeborncode.ai/faq) — chat only, no "
+            "email required.\n"
+            "\n"
+            "**Thread to carry:** the Constitution itself — flow over speed over quality as "
+            "felt, built in reverse, violations counted.\n"
+            "\n"
+            "**Newbie:** here's what this tool owes you. **Veteran:** a measurable "
+            "constitutional contract; when Celeborn breaks a promise, that's a bug with a "
+            "support path.\n"
+            "\n"
+            "**Artifact:** the coder knows their rights and how to get help."
+        ),
+    },
+    {
+        "key": "make-room-for-pippin", "emoji": "💾", "condition": "low_disk",
+        "title": "Make some room for Pippin",
+        "tags": ["tutorial", "models", "disk"],
+        "stop": "The coder has freed ~2.5 GB and Pippin is pulled, or has knowingly chosen to "
+                "skip the local model.",
+        "notes": (
+            "Tutorial card — a runbook for the coding assistant. This card appears only because "
+            "the install found less than 2.5 GB free for the local model.\n"
+            "\n"
+            "**Say this, plainly:** *We need 2.5 GB for the Pippin local model to be your "
+            "project-management assistant. If you do not make room for Pippin, Celeborn still "
+            "works, but not as smoothly.*\n"
+            "\n"
+            "**Runbook:** Offer to help find the space — the usual suspects are Downloads, the "
+            "Trash, and old installers; show sizes, let the coder decide what goes. Once ~2.5 GB "
+            "is free, run `celeborn weave` to pull Pippin and verify it responds. If the coder "
+            "declines, respect it and close the card: Celeborn keeps working without the local "
+            "model.\n"
+            "\n"
+            "**Thread to carry:** plain speech — say what happened and the one next action, "
+            "nothing else.\n"
+            "\n"
+            "**Artifact:** Pippin pulled and answering, or an informed decision to skip."
+        ),
+    },
+]
+
+
+PIPPIN_DISK_NEED_BYTES = int(2.5 * 2**30)   # the ~2.5 GB the Pippin pull needs (weave contract §3)
+
+
+def _low_disk_for_pippin(ctx: Path | None = None) -> bool:
+    """The `low_disk` orientation signal (CELE-t391): True when the Pippin pull is still pending and
+    the home volume lacks the ~2.5 GB it needs — the gate for the conditional 'Make some room for
+    Pippin' ORIE card. `CELEBORN_LOW_DISK=1|0` overrides both ways: the newbie installer
+    (install_celeborn.py rung 6) sets it so its own disk finding stays authoritative for the init it
+    spawns, and it doubles as the deterministic test hook. The cheap pure disk read gates the Ollama
+    model probe, so an ample-disk init never touches the network. Best-effort: False on any probe
+    error, since first-run bootstrap must never break init."""
+    import os
+    import shutil
+    env = os.environ.get("CELEBORN_LOW_DISK", "").strip().lower()
+    if env in ("1", "true", "yes"):
+        return True
+    if env in ("0", "false", "no"):
+        return False
+    try:
+        if shutil.disk_usage(Path.home()).free >= PIPPIN_DISK_NEED_BYTES:
+            return False                        # room for Pippin — the model can simply install
+        return not all(_weave_status(ctx)["models"].values())      # low disk + pull still pending
+    except Exception:                           # noqa: BLE001 — a failed probe must not break init
+        return False
+
+
+def _seed_orientation_cards(ctx: Path, *, signals: set[str] | None = None) -> list[str]:
+    """Additively seed the ORIE board from ORIENTATION_CURRICULUM (CELE-t388). Runs on EVERY init —
+    a cheap no-op when nothing is new. Seed-once semantics: every seeded entry's `key` is persisted
+    in the ORIE `.celebornrc` (`orientation_seeded`) and acts as a tombstone, so a re-init never
+    duplicates and a tutorial the user deleted is never re-summoned. A conditional entry seeds only
+    when its signal is passed (e.g. signals={"low_disk"}). The pass only appends keyed curriculum
+    cards — user-created cards are never modified or removed — and writes only known tasks.md fields
+    (safe for the older installed snapshot binary). Returns the newly minted card ids; never raises,
+    since first-run bootstrap must never break init."""
+    try:
+        signals = signals or set()
+        seeded = [k for k in (load_config(ctx).get("orientation_seeded") or []) if isinstance(k, str)]
+        tasks = _load_tasks(ctx)
+        new_ids: list[str] = []
+        for entry in ORIENTATION_CURRICULUM:
+            if entry["key"] in seeded:
+                continue
+            if entry["condition"] and entry["condition"] not in signals:
+                continue
+            tid = _next_task_id(tasks)
+            ts = now_iso()
+            tasks.append({
+                "id": tid, "title": entry["title"], "state": "todo", "owner": "",
+                "tags": list(entry["tags"]), "blocked_by": [], "phase": "",
+                "spine": ORIENTATION_SPINE, "emoji": entry["emoji"],
+                "stop": entry["stop"], "progress": 0, "engine_floor": 0,
+                "jira": "", "github": "", "autonomy": [],
+                "created": ts, "updated": ts, "subtasks": [], "notes": entry["notes"],
+            })
+            seeded.append(entry["key"])
+            new_ids.append(tid)
+        if new_ids:
+            _save_tasks(ctx, tasks)
+            _update_config(ctx, orientation_seeded=seeded)
+        return new_ids
+    except Exception:                                   # noqa: BLE001 — seeding must never break init
+        return []
+
+
 def _open_board_on_init(ctx: Path, *, open_browser: bool) -> None:
     """Launch this project's kanban viewer (detached) and, unless `--no-browser`, open it in the
     browser — the install-time half of 'the board is the UI, keep it open' (CELE-t121). Only called on
@@ -1183,7 +1959,11 @@ def _open_board_on_init(ctx: Path, *, open_browser: bool) -> None:
 
 # --------------------------------------------------------------------------- commands
 
-def cmd_init(args):
+def cmd_scaffold(args):
+    """Scaffold `.context/` for this project (the memory tier + CLAUDE.md/AGENTS.md annotation + a
+    private gitignore). This is the *secondary* command — `celeborn init` is the everything-command
+    that wires Claude Code, scaffolds (this), and signs you in. Use `scaffold` when you only want the
+    per-project files and have already wired Claude Code (or don't want to)."""
     root = Path(args.path or ".").resolve()
     ctx = root / CONTEXT_DIRNAME
     if not TEMPLATES_DIR.is_dir():
@@ -1191,6 +1971,7 @@ def cmd_init(args):
 
     (ctx / "durable").mkdir(parents=True, exist_ok=True)
     (ctx / "journal-archive").mkdir(parents=True, exist_ok=True)
+    (ctx / STATE_ARCHIVE_DIRNAME).mkdir(parents=True, exist_ok=True)
 
     copies = [
         ("state.md", ctx / "state.md"),
@@ -1251,8 +2032,11 @@ def cmd_init(args):
         _save_metrics(ctx, dict(METRICS_TEMPLATE))
         ok(f"created {mp.relative_to(root)}")
 
-    private = _decide_private(root, args)
-    _ensure_gitignore(root, private=private)
+    # PRIVATE-ONLY (CELE-t228): `.context/` is ALWAYS gitignored — there is no public/commit path.
+    # It holds prompts, notes and working memory; committing it to a repo that is (or ever becomes)
+    # public would leak all of that permanently into git history. So it lives on-machine and moves
+    # between devices via your account (`celeborn sync`), never git.
+    _ensure_gitignore(root, private=True)
     if getattr(args, "claude_md", True):
         if _ensure_claude_md(root):
             ok("annotated CLAUDE.md (Claude Code auto-loads it → it'll orient via .context/)")
@@ -1263,9 +2047,8 @@ def cmd_init(args):
             ok("annotated AGENTS.md (Codex/Grok-style hosts auto-load it → same orient + kanban rules)")
         else:
             warn("AGENTS.md already annotated, kept")
-    if private:
-        print("\n.context/ is PRIVATE (gitignored): it won't be committed. Carry it across\n"
-              "devices with `celeborn sync` instead of git.")
+    print("\n.context/ is PRIVATE (gitignored): it is never committed. Carry it across\n"
+          "devices with `celeborn sync` (needs a free account), not git.")
     if _wire_grok(root):
         ok("wired Grok Build hooks + project rules (`.grok/rules/celeborn.md`)")
     # Auto-engage Codebase Memory (CMM) by default — Celeborn installs it into every project so the
@@ -1410,45 +2193,1017 @@ def cmd_grok(args):
     die(f"unknown grok subcommand: {action}")
 
 
-def _decide_private(root: Path, args) -> bool:
-    """Whether to keep .context/ out of git. A PUBLIC repo means a public .context/,
-    so default to private there; explicit flags always win."""
-    if getattr(args, "private", False):
-        return True
-    if getattr(args, "public", False):
+# ------------------------------------------------------------------------- OpenCode wiring (CELE-t204)
+#
+# The OpenCode↔Celeborn unit — the event plugin (orient/lifecycle/card gate/compaction hijack), the
+# Qwen-4b project-manager agent, and the Ollama provider block — packaged as a per-project install
+# instead of hand-copied files in a personal ~/.config. `celeborn opencode wire` drops it into ONE
+# registered repo; the fleet rollout (CELE-t218) runs that per project. Layout verified against
+# opencode 1.17.13: the plugin auto-loads from `<root>/.opencode/plugin/*.js`, agents from
+# `<root>/.opencode/agent/*.md`, and project config is the ROOT-level `opencode.json`
+# (`.opencode/opencode.json` is NOT read — probed live, CELE-t204).
+
+_OPENCODE_PLUGIN_STAMP_RE = re.compile(r"@celeborn/opencode-plugin v([0-9][\w.+-]*)")
+
+
+def _opencode_module_dir() -> Path | None:
+    """Locate the packaged OpenCode integration (plugin + PM agent + reference config) — the
+    `opencode/` package beside this script in a source checkout. None when not present (an
+    installed-CLI path lands here once the module ships inside the distribution)."""
+    cand = REPO_ROOT / "opencode"
+    return cand if (cand / "plugin" / "celeborn.js").is_file() else None
+
+
+def _opencode_plugin_version(module: Path) -> str:
+    """The unit's version — `opencode/package.json`'s `version`, the one number stamped into every
+    installed copy so `_opencode_installed_version` can tell a stale install from a current one."""
+    try:
+        return str(json.loads((module / "package.json").read_text()).get("version") or "0.0.0")
+    except Exception:
+        return "0.0.0"
+
+
+def _opencode_installed_version(root: Path) -> str | None:
+    """Version stamped into this project's installed plugin, None when not installed, '0.0.0' for
+    a pre-t204 unstamped copy (hand-installed prototype) — which a re-wire upgrades in place."""
+    try:
+        text = (root / ".opencode" / "plugin" / "celeborn.js").read_text()
+    except OSError:
+        return None
+    m = _OPENCODE_PLUGIN_STAMP_RE.search(text)
+    return m.group(1) if m else "0.0.0"
+
+
+def _merge_opencode_config(existing: dict, incoming: dict) -> tuple:
+    """Additive deep merge of the packaged config into a user's existing `opencode.json`
+    (INTEGRATION.md §6): every existing key WINS — dicts recurse, scalars are never overwritten,
+    lists union (existing order first, missing items appended). Pure, no I/O — the same
+    never-clobber contract as cmd_wire's settings.json merge. Returns (merged, changed)."""
+    changed = False
+
+    def merge(a: dict, b: dict) -> dict:
+        nonlocal changed
+        out = dict(a)
+        for k, v in (b or {}).items():
+            if k not in out:
+                out[k] = v
+                changed = True
+            elif isinstance(out[k], dict) and isinstance(v, dict):
+                out[k] = merge(out[k], v)
+            elif isinstance(out[k], list) and isinstance(v, list):
+                extra = [x for x in v if x not in out[k]]
+                if extra:
+                    out[k] = out[k] + extra
+                    changed = True
+        return out
+
+    return merge(existing or {}, incoming or {}), changed
+
+
+def _wire_opencode(root: Path) -> bool:
+    """Install the OpenCode↔Celeborn wiring into ONE project (CELE-t204): the event plugin →
+    `.opencode/plugin/celeborn.js` (version-stamped), the Pippin PM agent (qwen3:4b-instruct) →
+    `.opencode/agent/project-manager.md`, and the provider block additively merged into the
+    project-root `opencode.json`. Idempotent: a re-wire refreshes plugin + agent in place and the
+    config merge never clobbers user keys. Returns True when the project ends up wired."""
+    import shutil
+    module = _opencode_module_dir()
+    if module is None:
+        info("OpenCode module not found (no opencode/plugin/celeborn.js beside this install)")
         return False
-    vis = _repo_visibility(root)
-    if vis == "public":
-        warn("detected a PUBLIC repo — keeping .context/ private (gitignored) so your")
-        warn("working memory isn't published. Re-run `init --public` to commit it anyway.")
+    stamp = (f"// @celeborn/opencode-plugin v{_opencode_plugin_version(module)} — installed by "
+             "`celeborn opencode wire`; do not hand-edit (a re-wire overwrites). Source of truth: "
+             "the celeborn repo's opencode/ package.\n")
+    plug_dir = root / ".opencode" / "plugin"
+    agent_dir = root / ".opencode" / "agent"
+    plug_dir.mkdir(parents=True, exist_ok=True)
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (plug_dir / "celeborn.js").write_text(stamp + (module / "plugin" / "celeborn.js").read_text())
+    shutil.copyfile(module / "agent" / "project-manager.md", agent_dir / "project-manager.md")
+    # Provider block → root opencode.json, additively (never clobber; INTEGRATION.md §6). Only
+    # `$schema` + `provider` travel: the reference file's `plugin` array is documentation — the
+    # installed plugin auto-loads from .opencode/plugin/, and a bare npm-style name there would
+    # send OpenCode resolving a package instead.
+    try:
+        ref = json.loads((module / "opencode.json").read_text())
+    except Exception:
+        ref = {}
+    incoming = {k: ref[k] for k in ("$schema", "provider") if k in ref}
+    cfg_path = root / "opencode.json"
+    if not cfg_path.is_file() and (root / "opencode.jsonc").is_file():
+        warn("project uses opencode.jsonc (comments) — provider block NOT auto-merged; add the "
+             f"`provider` block from {module / 'opencode.json'} by hand")
         return True
-    if vis is None and (root / ".git").is_dir():
-        warn(".context/ will be COMMITTED to git. If this repo is or becomes public, your")
-        warn("memory is public too. Use `init --private` to keep it local (and sync across")
-        warn("devices with `celeborn sync`).")
+    try:
+        existing = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
+        if not isinstance(existing, dict):
+            raise ValueError("config is not a JSON object")
+    except Exception:
+        warn(f"{cfg_path} is not valid JSON — left untouched; merge the provider block by hand")
+        return True
+    merged, changed = _merge_opencode_config(existing, incoming)
+    if changed or not cfg_path.is_file():
+        cfg_path.write_text(json.dumps(merged, indent=2) + "\n")
+    return True
+
+
+# --------------------------------------------------------------------------- local-daemon HTTP (t352)
+#
+# The board Settings page (OpenCode + Ollama sections, CELE-t352) shows LIVE daemon state — is
+# `opencode serve` reachable, which models has Ollama pulled — and drives real mutations (model
+# pull/delete). Those talk to localhost daemons over their native HTTP APIs. Kept to the stdlib
+# (`urllib`) so the CLI stays dependency-free; every call is best-effort with a short timeout, so a
+# down daemon degrades to "not reachable" instead of hanging or crashing a status read.
+def _http_json(method: str, url: str, body: dict | None = None, timeout: float = 2.0):
+    """Issue a JSON HTTP request and parse the JSON response. Raises on transport/HTTP error — the
+    caller decides whether that means 'daemon down' (status) or a surfaced failure (mutation)."""
+    import urllib.request
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8", "replace").strip()
+    return json.loads(raw) if raw else {}
+
+
+def _http_reachable(url: str, timeout: float = 1.5) -> bool:
+    """True if a GET to `url` returns any HTTP response (even an error status) — a liveness probe that
+    doesn't care about the body. False on connection refused / DNS / timeout."""
+    import urllib.error
+    import urllib.request
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=timeout).close()
+        return True
+    except urllib.error.HTTPError:
+        return True                                    # answered, just not 2xx — the daemon is up
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- OpenCode status/config
+def _opencode_config(ctx: Path) -> dict:
+    """The resolved OpenCode engine settings Settings reads/writes (CELE-t352) — pure config, no
+    network. `default_model` falls back to the root `opencode.json` `model` key when the .celebornrc
+    override is unset (that file is what OpenCode itself reads)."""
+    cfg = load_config(ctx)
+    default_model = str(cfg.get("opencode_default_model") or "").strip()
+    if not default_model:
+        try:
+            default_model = str(json.loads((ctx.parent / "opencode.json").read_text()).get("model") or "")
+        except Exception:
+            default_model = ""
+    return {
+        "serve_url": str(cfg.get("opencode_serve_url") or DEFAULTS["opencode_serve_url"]),
+        "default_model": default_model,
+        "compaction_hijack": bool(cfg.get("compaction_hijack", True)),
+        "card_gate": bool(cfg.get("card_gate", True)),
+    }
+
+
+def _opencode_status(ctx: Path, probe: bool = True) -> dict:
+    """Full OpenCode section state for the board (CELE-t352): resolved config + installed/available
+    plugin versions + (when `probe`) a live `opencode serve` reachability + session-count probe.
+    `probe=False` is the fast path the plugin uses at compaction time (no network)."""
+    root = ctx.parent
+    module = _opencode_module_dir()
+    st = _opencode_config(ctx)
+    st.update({
+        "plugin_installed": _opencode_installed_version(root),
+        "plugin_available": _opencode_plugin_version(module) if module else None,
+        "serve_reachable": None,
+        "session_count": None,
+    })
+    if probe:
+        base = st["serve_url"].rstrip("/")
+        st["serve_reachable"] = _http_reachable(base + "/app") or _http_reachable(base + "/session")
+        if st["serve_reachable"]:
+            try:
+                sessions = _http_json("GET", base + "/session", timeout=1.5)
+                if isinstance(sessions, list):
+                    st["session_count"] = len(sessions)
+            except Exception:
+                pass                                   # reachable but count unknown — honest null
+        # Engine Room lifecycle view (CELE-t375) — state + provenance so Settings can show the right
+        # start/stop control (a user-started serve is `external` and never gets a Stop button).
+        st["engine"] = _engine_state(ctx, "code", load_config(ctx))
+    return st
+
+
+def cmd_opencode(args):
+    """`celeborn opencode {wire|status|set}` (CELE-t204, extended CELE-t352):
+      wire   — (re)install the plugin + Pippin PM agent + provider block into `.opencode/`+opencode.json
+      status — live section state (config + plugin versions + serve probe); `--json` for the board
+      set    — persist an engine setting (default model, serve url, compaction-hijack, card-gate)."""
+    ctx = require_context(args)
+    root = ctx.parent
+    action = (getattr(args, "opencode_action", None) or "wire").strip().lower()
+    if action == "wire":
+        before = _opencode_installed_version(root)
+        if not _wire_opencode(root):
+            die("OpenCode wire failed — packaged module not found (opencode/plugin/celeborn.js "
+                "beside the celeborn install)")
+        after = _opencode_installed_version(root) or "?"
+        verb = f"re-wired (was v{before})" if before else "wired"
+        ok(f"OpenCode {verb} for this project — plugin v{after} → .opencode/plugin/celeborn.js, "
+           "PM agent → .opencode/agent/project-manager.md, provider block → opencode.json")
+        return
+    if action == "status":
+        st = _opencode_status(ctx, probe=not getattr(args, "no_probe", False))
+        if getattr(args, "json", False):
+            print(json.dumps(st))
+            return
+        reach = "● connected" if st["serve_reachable"] else "○ not reachable"
+        sc = f" · {st['session_count']} session(s)" if st["session_count"] is not None else ""
+        print(f"OpenCode serve {st['serve_url']} — {reach}{sc}")
+        print(f"  default model:      {st['default_model'] or '(OpenCode default)'}")
+        print(f"  plugin:             v{st['plugin_installed'] or '(not installed)'}"
+              + (f" (available v{st['plugin_available']})" if st['plugin_available'] else ""))
+        print(f"  compaction hijack:  {'on' if st['compaction_hijack'] else 'off'}")
+        print(f"  card gate:          {'on' if st['card_gate'] else 'off'}")
+        return
+    if action == "set":
+        updates: dict = {}
+        if getattr(args, "default_model", None) is not None:
+            dm = args.default_model.strip()
+            updates["opencode_default_model"] = dm
+            # Mirror into the root opencode.json `model` (what OpenCode itself reads), additively —
+            # never clobber the rest of the config.
+            cfg_path = root / "opencode.json"
+            try:
+                existing = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
+                if isinstance(existing, dict):
+                    if dm:
+                        existing["model"] = dm
+                    else:
+                        existing.pop("model", None)
+                    cfg_path.write_text(json.dumps(existing, indent=2) + "\n")
+            except Exception:
+                warn(f"{cfg_path} not valid JSON — recorded the default in .celebornrc only")
+        if getattr(args, "serve_url", None) is not None:
+            updates["opencode_serve_url"] = args.serve_url.strip()
+        if getattr(args, "compaction_hijack", None) is not None:
+            updates["compaction_hijack"] = args.compaction_hijack == "on"
+        if getattr(args, "card_gate", None) is not None:
+            updates["card_gate"] = args.card_gate == "on"
+        if not updates:
+            die("nothing to set — pass --default-model / --serve-url / --compaction-hijack / --card-gate")
+        _update_config(ctx, **updates)
+        if getattr(args, "json", False):
+            print(json.dumps(_opencode_status(ctx, probe=False)))
+            return
+        ok("OpenCode settings updated: " + ", ".join(f"{k}={v}" for k, v in updates.items()))
+        return
+    die(f"unknown opencode subcommand: {action}")
+
+
+# --------------------------------------------------------------------------- Ollama (local models, t352)
+def _ollama_status(ctx: Path) -> dict:
+    """Live Ollama daemon state for the board (CELE-t352): reachability, version, installed models
+    (name + byte size), and the keep-alive setting. Best-effort — an unreachable daemon returns
+    `running: False` with an empty model list, never an error."""
+    cfg = load_config(ctx)
+    base = str(cfg.get("ollama_host") or DEFAULTS["ollama_host"]).rstrip("/")
+    keep_alive = int(cfg.get("ollama_keep_alive_minutes", 30) or 0)
+    out = {"host": base, "running": False, "version": None, "keep_alive_minutes": keep_alive,
+           "models": [],
+           # Engine Room lifecycle view (CELE-t375) — state + provenance so the board's Local Model
+           # Engine section renders the right start/stop control (a user-started daemon is `external`
+           # and never gets a Stop button). Attached before the probe so a down daemon still carries it.
+           "engine": _engine_state(ctx, "model", cfg)}
+    try:
+        ver = _http_json("GET", base + "/api/version", timeout=1.5)
+        out["version"] = ver.get("version") if isinstance(ver, dict) else None
+        out["running"] = True
+    except Exception:
+        return out                                     # daemon down — running stays False
+    try:
+        tags = _http_json("GET", base + "/api/tags", timeout=2.0)
+        for m in (tags.get("models") or []) if isinstance(tags, dict) else []:
+            out["models"].append({"name": m.get("name") or m.get("model") or "?",
+                                  "size": int(m.get("size") or 0)})
+    except Exception:
+        pass
+    return out
+
+
+def cmd_ollama(args):
+    """`celeborn ollama {status|pull|rm|set}` (CELE-t352) — inspect and steer the local Ollama daemon
+    that runs Pippin (the Qwen3-4b PM/ghost) and any night-run local models. `status --json` backs the board's Ollama
+    Settings section; pull/rm mutate the daemon directly."""
+    ctx = require_context(args)
+    base = str(load_config(ctx).get("ollama_host") or DEFAULTS["ollama_host"]).rstrip("/")
+    action = (getattr(args, "ollama_action", None) or "status").strip().lower()
+    if action == "status":
+        st = _ollama_status(ctx)
+        if getattr(args, "json", False):
+            print(json.dumps(st))
+            return
+        head = f"● running · v{st['version']}" if st["running"] else "○ not running"
+        print(f"Ollama {st['host']} — {head} · keep-alive {st['keep_alive_minutes']}m")
+        for m in st["models"]:
+            print(f"  {m['name']} · {m['size'] / 1e9:.1f} GB")
+        return
+    if action in ("pull", "rm"):
+        model = (getattr(args, "model", None) or "").strip()
+        if not model:
+            die(f"ollama {action} needs a model name (e.g. `celeborn ollama {action} qwen3:8b`)")
+        try:
+            if action == "pull":
+                res = _http_json("POST", base + "/api/pull", {"name": model, "stream": False}, timeout=1800.0)
+                if isinstance(res, dict) and res.get("error"):
+                    die(f"ollama pull failed: {res['error']}")
+                ok(f"pulled {model}")
+            else:
+                _http_json("DELETE", base + "/api/delete", {"name": model}, timeout=10.0)
+                ok(f"removed {model}")
+        except Exception as e:
+            die(f"ollama {action} failed — is the daemon reachable at {base}? ({e})")
+        if getattr(args, "json", False):
+            print(json.dumps(_ollama_status(ctx)))
+        return
+    if action == "set":
+        updates: dict = {}
+        if getattr(args, "host", None) is not None:
+            updates["ollama_host"] = args.host.strip()
+        if getattr(args, "keep_alive", None) is not None:
+            updates["ollama_keep_alive_minutes"] = max(0, int(args.keep_alive))
+        if not updates:
+            die("nothing to set — pass --host and/or --keep-alive")
+        _update_config(ctx, **updates)
+        if getattr(args, "json", False):
+            print(json.dumps(_ollama_status(ctx)))
+            return
+        ok("Ollama settings updated: " + ", ".join(f"{k}={v}" for k, v in updates.items()))
+        return
+    die(f"unknown ollama subcommand: {action}")
+
+
+# --------------------------------------------------------------------------- sovereign weave (CELE-t374)
+#
+# The SOVEREIGN WEAVE — OpenCode (harness) + Ollama (model runtime) + Qwen3-4b (local model, persona
+# "Pippin") blended into one free, local, working agent stack that Celeborn ORCHESTRATES but never
+# owns, vendors, or rebrands. Prose contract: references/weave-contract.md (CELE-t373); machine
+# pin-of-record: references/weave-pin.json. The five sovereignty rules this code enforces:
+# (1) install from upstream official channels ONLY, (2) attribution before acting, (3) pinned tested
+# versions that move only via a Celeborn release, (4) drift explained never blocked (doctor's lane,
+# CELE-t375), (5) uninstall independence both directions. Consent style matches /install: the exact
+# upstream command is shown and confirmed before it runs — never a silent curl|bash.
+
+_WEAVE_OPENCODE_INSTALL = "curl -fsSL https://opencode.ai/install | bash"
+_WEAVE_OLLAMA_INSTALL_SH = "curl -fsSL https://ollama.com/install.sh | sh"
+
+# Rule-2 attribution — verbatim from references/weave-contract.md §2 (the Settings OpenCode/Ollama/
+# Model sections reuse these lines). "Pippin" names Celeborn's USE of the model; the upstream
+# identity is always shown alongside, never hidden.
+_WEAVE_ATTRIBUTION = {
+    "opencode": ("Installing OpenCode — an independent open-source AI coding agent by anomalyco, "
+                 "MIT license · https://opencode.ai"),
+    "ollama": ("Installing Ollama — an independent open-source model runtime by Ollama, "
+               "MIT license · https://ollama.com"),
+    "qwen": ("Pulling Qwen3-4b — an open-weight model by the Qwen team, Alibaba Cloud, Apache-2.0 "
+             "license · https://qwenlm.github.io/blog/qwen3 · Celeborn runs it locally as Pippin."),
+}
+
+
+def _weave_pin() -> dict:
+    """The weave pin-of-record (references/weave-pin.json), parsed. {} when absent/invalid — callers
+    fall back to the tested literals so an installed CLI without references/ still weaves."""
+    try:
+        return json.loads((REPO_ROOT / "references" / "weave-pin.json").read_text())
+    except Exception:
+        return {}
+
+
+def _weave_pins() -> dict:
+    """Flattened pins the installer acts on. The OpenCode version's single source of truth is
+    opencode/package.json's `@opencode-ai/plugin` dependency (weave-pin.json mirrors it); Ollama is
+    a FLOOR that floats upward; the two Pippin tags are exact upstream registry tags."""
+    pin = _weave_pin()
+    opencode_version = None
+    module = _opencode_module_dir()
+    if module is not None:
+        try:
+            dep = json.loads((module / "package.json").read_text())["dependencies"]["@opencode-ai/plugin"]
+            opencode_version = str(dep).lstrip("^~=v") or None
+        except Exception:
+            opencode_version = None
+    models = (pin.get("qwen") or {}).get("models") or {}
+    return {
+        "opencode_version": opencode_version or str((pin.get("opencode") or {}).get("version") or "1.17.13"),
+        "ollama_floor": str((pin.get("ollama") or {}).get("floor") or "0.31.1"),
+        "pippin_pm": str((models.get("pippin-pm") or {}).get("tag") or "qwen3:4b-instruct"),
+        "pippin_ghost": str((models.get("pippin-ghost") or {}).get("tag") or "qwen3:4b"),
+    }
+
+
+def _cli_version(cmd: list) -> str | None:
+    """Best-effort `<binary> --version` probe. None when the binary is missing or won't answer."""
+    import subprocess
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        m = re.search(r"(\d+\.\d+[\w.+-]*)", (res.stdout or "") + (res.stderr or ""))
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _weave_status(ctx: Path | None) -> dict:
+    """Detect every weave component against the pins — a pure read, no installs. The shape
+    `weave status --json` prints and `_weave()` decides from."""
+    import shutil
+    pins = _weave_pins()
+    opencode_bin = shutil.which("opencode")
+    ollama_bin = shutil.which("ollama")
+    ost = _ollama_status(ctx) if ctx is not None else {
+        "host": DEFAULTS["ollama_host"], "running": False, "version": None, "models": []}
+    pulled = {str(m.get("name") or "").removesuffix(":latest") for m in ost.get("models") or []}
+    root = ctx.parent if ctx is not None else None
+    return {
+        "pins": pins,
+        "opencode": {"installed": bool(opencode_bin),
+                     "version": _cli_version(["opencode", "--version"]) if opencode_bin else None},
+        "ollama": {"installed": bool(ollama_bin) or bool(ost["running"]),
+                   "version": ost.get("version") or (_cli_version(["ollama", "--version"]) if ollama_bin else None),
+                   "running": bool(ost["running"]), "host": str(ost["host"]).rstrip("/")},
+        "models": {pins["pippin_pm"]: pins["pippin_pm"] in pulled,
+                   pins["pippin_ghost"]: pins["pippin_ghost"] in pulled},
+        "plugin_installed": _opencode_installed_version(root) if root is not None else None,
+    }
+
+
+def _weave_consent(what: str, cmd: str, assume_yes: bool) -> bool:
+    """The /install-style consent gate (sovereignty rule 1): show the exact upstream command, ask
+    before running it. Non-interactive runs never execute an installer silently — they print the
+    command and skip, so a headless `init` stays side-effect free."""
+    print(f"    $ {cmd}")
+    if assume_yes:
+        return True
+    if not _init_is_interactive():
+        info(f"non-interactive — {what} not installed. Run the command above yourself, "
+             "or `celeborn weave --yes`.")
+        return False
+    try:
+        return input(f"  Run the official {what} installer? [Y/n] ").strip().lower() not in ("n", "no")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _install_opencode(pins: dict, assume_yes: bool) -> bool:
+    """OpenCode via its own official installer, pinned to the tested release (rules 1+3), with
+    attribution before acting (rule 2). The installer streams to the terminal."""
+    import os
+    import shutil
+    import subprocess
+    print(f"\n{_WEAVE_ATTRIBUTION['opencode']}")
+    print(f"  pinned version: {pins['opencode_version']} — the release Celeborn's plugin is tested against")
+    if not _weave_consent("OpenCode",
+                          f"VERSION={pins['opencode_version']} {_WEAVE_OPENCODE_INSTALL}", assume_yes):
+        return False
+    try:
+        subprocess.run(["bash", "-c", _WEAVE_OPENCODE_INSTALL],
+                       env=dict(os.environ, VERSION=pins["opencode_version"]),
+                       timeout=600, check=True)
+    except Exception as e:  # noqa: BLE001 — a failed upstream installer must degrade to a pointer
+        warn(f"OpenCode install did not complete ({e}) — install it yourself from https://opencode.ai")
+        return False
+    if shutil.which("opencode") is None:
+        info("OpenCode installed — open a fresh shell (its installer updates PATH) so `opencode` resolves")
+    return True
+
+
+def _install_ollama(assume_yes: bool) -> bool:
+    """Ollama via its official channel — brew on macOS, the official install.sh elsewhere (rule 1).
+    The version floats above the tested floor (rule 3): whatever the official channel ships is fine."""
+    import shutil
+    import subprocess
+    print(f"\n{_WEAVE_ATTRIBUTION['ollama']}")
+    if sys.platform == "darwin":
+        if shutil.which("brew") is None:
+            info("no Homebrew here — install Ollama from https://ollama.com/download (the macOS app), "
+                 "then re-run `celeborn weave`")
+            return False
+        if not _weave_consent("Ollama", "brew install ollama", assume_yes):
+            return False
+        try:
+            subprocess.run(["brew", "install", "ollama"], timeout=1200, check=True)
+            return True
+        except Exception as e:  # noqa: BLE001
+            warn(f"brew install ollama did not complete ({e}) — install from https://ollama.com/download")
+            return False
+    if not _weave_consent("Ollama", _WEAVE_OLLAMA_INSTALL_SH, assume_yes):
+        return False
+    try:
+        subprocess.run(["sh", "-c", _WEAVE_OLLAMA_INSTALL_SH], timeout=1200, check=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        warn(f"Ollama install did not complete ({e}) — install from https://ollama.com/download")
+        return False
+
+
+def _ollama_ensure_running(host: str) -> bool:
+    """Best-effort: make the Ollama daemon answer at `host`, spawning a detached `ollama serve` when
+    the binary is present but the daemon is down. Full start/stop/health lifecycle is CELE-t375."""
+    import shutil
+    import subprocess
+    import time
+    host = host.rstrip("/")
+    if _http_reachable(host + "/api/version"):
+        return True
+    if shutil.which("ollama") is None:
+        return False
+    try:
+        subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        return False
+    for _ in range(20):
+        time.sleep(0.5)
+        if _http_reachable(host + "/api/version"):
+            return True
     return False
 
 
-def _repo_visibility(root: Path):
-    """'public'/'private' via the gh CLI when available; None if unknown. Only consulted
-    for real git repos, and never makes a network call otherwise."""
-    if not (root / ".git").is_dir():
-        return None
+def _pull_pippin_models(ctx: Path | None, status: dict, assume_yes: bool) -> bool:
+    """Pull whichever pinned Pippin tags are missing — attribution once, before acting (rule 2),
+    `ollama pull` progress streaming to the terminal. Returns True when both tags are present."""
     import shutil
     import subprocess
-    if not shutil.which("gh"):
-        return None
+    host = status["ollama"]["host"]
+    if not _ollama_ensure_running(host):
+        warn("Ollama daemon not reachable — start it (`ollama serve`) and re-run `celeborn weave`")
+        return False
+    status = _weave_status(ctx)                    # daemon answers now — the model list is real
+    missing = [tag for tag, present in status["models"].items() if not present]
+    if not missing:
+        return True
+    print(f"\n{_WEAVE_ATTRIBUTION['qwen']}")
+    pins = status["pins"]
+    roles = {pins["pippin_pm"]: "Pippin · PM (non-thinking)", pins["pippin_ghost"]: "Pippin · ghost (thinking)"}
+    for tag in missing:
+        print(f"  {tag} — {roles.get(tag, tag)} · ~2.5 GB")
+    if not _weave_consent("Qwen3-4b model pull",
+                          " && ".join(f"ollama pull {t}" for t in missing), assume_yes):
+        return False
+    done = True
+    for tag in missing:
+        try:
+            if shutil.which("ollama"):
+                subprocess.run(["ollama", "pull", tag], timeout=3600, check=True)
+            else:
+                res = _http_json("POST", host + "/api/pull", {"name": tag, "stream": False}, timeout=3600.0)
+                if isinstance(res, dict) and res.get("error"):
+                    raise RuntimeError(res["error"])
+            ok(f"pulled {tag}")
+        except Exception as e:  # noqa: BLE001
+            warn(f"pull {tag} failed ({e}) — retry with `celeborn ollama pull {tag}`")
+            done = False
+    return done
+
+
+def _opencode_global_config_dir() -> Path:
+    """OpenCode's GLOBAL config home. $OPENCODE_CONFIG_HOME wins (OpenCode's own override), then
+    $XDG_CONFIG_HOME/opencode, then ~/.config/opencode (all platforms — probed live, CELE-t204)."""
+    import os
+    explicit = os.environ.get("OPENCODE_CONFIG_HOME")
+    if explicit:
+        return Path(explicit)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".config") / "opencode"
+
+
+def _merge_global_opencode_config() -> str:
+    """Additively merge the packaged provider block into the GLOBAL opencode.json so the Pippin
+    provider refs (ollama/qwen3:4b-instruct + ollama/qwen3:4b) resolve in every OpenCode project —
+    INTEGRATION.md §6's never-clobber merge at global scope. Existing keys always win; a jsonc or
+    invalid config is left untouched with a hand-merge note. Returns merged|current|skipped."""
+    module = _opencode_module_dir()
+    if module is None:
+        return "skipped"
     try:
-        r = subprocess.run(
-            ["gh", "repo", "view", "--json", "visibility", "-q", ".visibility"],
-            cwd=str(root), capture_output=True, text=True, timeout=8,
-        )
+        ref = json.loads((module / "opencode.json").read_text())
+    except Exception:
+        return "skipped"
+    incoming = {k: ref[k] for k in ("$schema", "provider") if k in ref}
+    cfg_dir = _opencode_global_config_dir()
+    cfg_path = cfg_dir / "opencode.json"
+    if not cfg_path.is_file() and (cfg_dir / "opencode.jsonc").is_file():
+        warn("global config is opencode.jsonc (comments) — provider block NOT auto-merged; add it "
+             f"by hand from {module / 'opencode.json'}")
+        return "skipped"
+    try:
+        existing = json.loads(cfg_path.read_text()) if cfg_path.is_file() else {}
+        if not isinstance(existing, dict):
+            raise ValueError("config is not a JSON object")
+    except Exception:
+        warn(f"{cfg_path} is not valid JSON — left untouched; merge the provider block by hand")
+        return "skipped"
+    merged, changed = _merge_opencode_config(existing, incoming)
+    if changed or not cfg_path.is_file():
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(merged, indent=2) + "\n")
+        return "merged"
+    return "current"
+
+
+def _weave(ctx: Path | None, *, assume_yes: bool = False, skip_models: bool = False) -> bool:
+    """The sovereign install (CELE-t374): detect → install-from-upstream (consented, attributed) →
+    pull Pippin → wire the project plugin → merge the global config. Idempotent: with everything
+    present it is a quick all-aligned read plus wiring refresh, no prompts, no installer runs.
+    Returns True when the full weave is in place."""
+    st = _weave_status(ctx)
+    pins = st["pins"]
+    # OpenCode — the harness.
+    if st["opencode"]["installed"]:
+        info(f"OpenCode {st['opencode']['version'] or '?'} detected (tested pin {pins['opencode_version']})")
+    elif _install_opencode(pins, assume_yes):
+        st = _weave_status(ctx)
+    # Ollama — the model runtime.
+    if st["ollama"]["installed"]:
+        info(f"Ollama {st['ollama']['version'] or '?'} detected "
+             f"({'running' if st['ollama']['running'] else 'not running'} · tested floor {pins['ollama_floor']})")
+    elif _install_ollama(assume_yes):
+        st = _weave_status(ctx)
+    # Pippin — the local model, both modes (PM non-thinking + ghost thinking; contract §3).
+    if not skip_models and st["ollama"]["installed"]:
+        if all(st["models"].values()):
+            info(f"Pippin present: {pins['pippin_pm']} (PM) + {pins['pippin_ghost']} (ghost)")
+        elif _pull_pippin_models(ctx, st, assume_yes):
+            st = _weave_status(ctx)
+    # Adapter glue — the only surfaces Celeborn owns (contract golden rule): the project plugin
+    # unit and the additive config merges. Never a byte inside an upstream tree.
+    if ctx is not None and _opencode_module_dir() is not None and _wire_opencode(ctx.parent):
+        info("project wired: plugin → .opencode/plugin/ · Pippin PM agent → .opencode/agent/ "
+             "· provider block → opencode.json")
+    g = _merge_global_opencode_config()
+    if g == "merged":
+        ok(f"global OpenCode config gained the Ollama/Pippin provider block "
+           f"({_opencode_global_config_dir() / 'opencode.json'})")
+    elif g == "current":
+        info("global OpenCode config already carries the provider block")
+    st = _weave_status(ctx)
+    woven = (st["opencode"]["installed"] and st["ollama"]["installed"]
+             and (skip_models or all(st["models"].values())))
+    if woven:
+        ok(f"sovereign weave in place: OpenCode {st['opencode']['version'] or '?'} + "
+           f"Ollama {st['ollama']['version'] or '?'} + Pippin ({pins['pippin_pm']} · {pins['pippin_ghost']})")
+    else:
+        info("weave incomplete — re-run `celeborn weave` any time; every step resumes where it left off")
+    return woven
+
+
+def cmd_weave(args):
+    """`celeborn weave [install|status]` — the sovereign weave (CELE-t374): blend OpenCode + Ollama +
+    Qwen3-4b (Pippin) into a free local agent stack, installing each ONLY from its own official
+    upstream channel with attribution (references/weave-contract.md). `install` is idempotent;
+    `status` is a pure read. `--yes` pre-consents to the upstream installers (scripted installs)."""
+    ctx = require_context(args)
+    action = (getattr(args, "weave_action", None) or "install").strip().lower()
+    if action == "install":
+        _weave(ctx, assume_yes=getattr(args, "yes", False),
+               skip_models=getattr(args, "no_models", False))
+        return
+    if action == "status":
+        st = _weave_status(ctx)
+        if getattr(args, "json", False):
+            print(json.dumps(st))
+            return
+        pins = st["pins"]
+        oc, ol = st["opencode"], st["ollama"]
+        print(f"Sovereign weave — pins: OpenCode {pins['opencode_version']} · Ollama ≥{pins['ollama_floor']} "
+              f"· Pippin {pins['pippin_pm']} + {pins['pippin_ghost']}")
+        print(f"  OpenCode:     {('● ' + (oc['version'] or 'installed')) if oc['installed'] else '○ not installed'}")
+        print(f"  Ollama:       {('● ' + (ol['version'] or 'installed')) if ol['installed'] else '○ not installed'}"
+              + ((" · running" if ol["running"] else " · not running") if ol["installed"] else ""))
+        for tag, present in st["models"].items():
+            role = "PM   " if tag == pins["pippin_pm"] else "ghost"
+            print(f"  Pippin·{role}: {'● pulled' if present else '○ not pulled'} ({tag})")
+        plug = st["plugin_installed"]
+        print(f"  plugin:       {('● v' + plug) if plug else '○ not wired'} (this project)")
+        return
+    die(f"unknown weave subcommand: {action}")
+
+
+# --------------------------------------------------------------------------- Engine Room (CELE-t375)
+#
+# THE ENGINE ROOM — lifecycle (start/stop/restart/health) for the two local engines the sovereign
+# weave installs: the LOCAL CODE ENGINE (the agent harness `opencode serve`, default :4096 — what the
+# Stage and Machine Room windows talk to) and the LOCAL MODEL ENGINE (the local model runtime daemon,
+# default :11434, that serves Pippin). De-branded on purpose (operator 2026-07-08): runtime status
+# names engines by FUNCTION, never by vendor — "Local Code Engine", "Local Model Engine" — rolled up
+# as the Engine Room, reported Scotty-style ("Engine Room status: All systems nominal"). Upstream
+# ATTRIBUTION (naming OpenCode/Ollama + their licenses) lives at INSTALL time only (`celeborn weave`,
+# contract §2), a different surface — so de-branding here does not break sovereignty rule 2.
+#
+# SOVEREIGNTY, made mechanical (contract rule 1/4/5): Celeborn MANAGES processes it started but never
+# OWNS the engines. It records its own spawns in a pidfile (.context/.engine-{code,model}.pid); a
+# reachable engine with no live managed pid is `external` — you started it, and Celeborn will NEVER
+# stop or restart it, only report it. `down`/`restart` touch a `managed` process only.
+
+_ENGINES = ("code", "model")
+_ENGINE_LABEL = {"code": "Local Code Engine", "model": "Local Model Engine"}
+_ENGINE_GLYPH = {"nominal": "●", "degraded": "◐", "down": "○", "not-installed": "·"}
+
+
+def _pid_alive(pid: int) -> bool:
+    """True iff a process with this pid exists (signal 0 probe). A pid owned by another user counts
+    as alive (PermissionError = it's there)."""
+    import os
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def _engine_pidfile(ctx: Path, engine: str) -> Path:
+    return ctx / (".engine-code.pid" if engine == "code" else ".engine-model.pid")
+
+
+def _engine_logfile(ctx: Path, engine: str) -> Path:
+    return ctx / (".engine-code.log" if engine == "code" else ".engine-model.log")
+
+
+def _read_managed_pid(ctx: Path, engine: str) -> int | None:
+    """The pid Celeborn recorded when it spawned this engine, iff still alive. Clears a stale pidfile
+    (process gone) as a side effect, so `external`/`down` never read a dead pid back."""
+    pf = _engine_pidfile(ctx, engine)
+    try:
+        pid = int(pf.read_text().strip().split()[0])
     except Exception:
         return None
-    if r.returncode != 0:
-        return None
-    v = r.stdout.strip().lower()
-    return v if v in ("public", "private") else None
+    if _pid_alive(pid):
+        return pid
+    try:
+        pf.unlink()
+    except Exception:
+        pass
+    return None
+
+
+def _engine_base(engine: str, cfg: dict) -> str:
+    key = "opencode_serve_url" if engine == "code" else "ollama_host"
+    return str(cfg.get(key) or DEFAULTS[key]).rstrip("/")
+
+
+def _engine_reachable(engine: str, base: str) -> bool:
+    if engine == "code":
+        return _http_reachable(base + "/app") or _http_reachable(base + "/session")
+    return _http_reachable(base + "/api/version")
+
+
+def _engine_binary(engine: str) -> str | None:
+    import shutil
+    return shutil.which("opencode" if engine == "code" else "ollama")
+
+
+def _engine_state(ctx: Path, engine: str, cfg: dict) -> dict:
+    """One engine's settled state + provenance — a pure read (a health probe + the pidfile), no
+    mutation beyond clearing a stale pidfile. state ∈ {not-installed, down, degraded, nominal};
+    provenance ∈ {managed, external, None}: managed = Celeborn spawned it, external = you did (and
+    Celeborn will never stop it)."""
+    base = _engine_base(engine, cfg)
+    reachable = _engine_reachable(engine, base)
+    managed_pid = _read_managed_pid(ctx, engine)
+    installed = _engine_binary(engine) is not None or reachable
+    if reachable:
+        state = "nominal"
+        provenance = "managed" if managed_pid else "external"
+    elif managed_pid:
+        state, provenance = "degraded", "managed"      # our process is alive but not answering
+    elif not installed:
+        state, provenance = "not-installed", None
+    else:
+        state, provenance = "down", None
+    version = None
+    if engine == "model" and reachable:
+        try:
+            version = (_http_json("GET", base + "/api/version", timeout=1.0) or {}).get("version")
+        except Exception:
+            version = None
+    return {"engine": engine, "label": _ENGINE_LABEL[engine], "base": base, "state": state,
+            "provenance": provenance, "managed_pid": managed_pid, "installed": installed,
+            "reachable": reachable, "version": version}
+
+
+def _engine_room_headline(engines: dict) -> str:
+    """The Scotty rollup line over both engines' states."""
+    states = {e: engines[e]["state"] for e in engines}
+    if all(s == "nominal" for s in states.values()):
+        return "All systems nominal"
+    if any(s == "degraded" for s in states.values()):
+        strained = ", ".join(engines[e]["label"] for e, s in states.items() if s == "degraded")
+        return f"degraded — {strained} online but not answering"
+    up = [e for e, s in states.items() if s == "nominal"]
+    down = [engines[e]["label"] for e, s in states.items() if s in ("down", "not-installed")]
+    if not up:
+        return "offline — both engines down"
+    return f"partial power — {', '.join(down)} down"
+
+
+def _engine_room_status(ctx: Path) -> dict:
+    cfg = load_config(ctx)
+    engines = {e: _engine_state(ctx, e, cfg) for e in _ENGINES}
+    return {"engines": engines, "headline": _engine_room_headline(engines)}
+
+
+def _engine_spawn_argv(engine: str, base: str) -> tuple:
+    """The detached-serve command per engine, honoring the configured host/port. Code engine =
+    `opencode serve --hostname H --port P`; model engine = `ollama serve` with $OLLAMA_HOST set so a
+    non-default base is respected. Returns (argv, env)."""
+    import os
+    from urllib.parse import urlparse
+    u = urlparse(base)
+    host = u.hostname or "127.0.0.1"
+    if engine == "code":
+        return ["opencode", "serve", "--hostname", host, "--port", str(u.port or 4096)], dict(os.environ)
+    env = dict(os.environ)
+    env["OLLAMA_HOST"] = f"{host}:{u.port or 11434}"
+    return ["ollama", "serve"], env
+
+
+def _engine_start(ctx: Path, engine: str, cfg: dict, timeout: float = 20.0) -> dict:
+    """Start an engine Celeborn can manage. No-op (with a note) when already reachable — we never
+    spawn a second daemon or fight a user-started one. Spawns detached in its own session/group so a
+    later managed `down` can signal the whole group, and records the pid. Returns the fresh state,
+    tagged `changed`."""
+    import subprocess
+    import time
+    st = _engine_state(ctx, engine, cfg)
+    if st["reachable"]:
+        st["changed"] = False
+        st["note"] = ("already running (Celeborn-managed)" if st["provenance"] == "managed"
+                      else "already running — you started it, left as-is")
+        return st
+    if not st["installed"]:
+        st["changed"] = False
+        st["note"] = "not installed — run `celeborn weave` to install the local engines"
+        return st
+    log = _engine_logfile(ctx, engine)
+    try:
+        logf = open(log, "ab")
+    except Exception:
+        logf = subprocess.DEVNULL
+    argv, env = _engine_spawn_argv(engine, st["base"])
+    try:
+        proc = subprocess.Popen(argv, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+                                start_new_session=True, cwd=str(ctx.parent), env=env)
+    except Exception as e:  # noqa: BLE001 — a failed spawn degrades to a note, never a crash
+        st["changed"] = False
+        st["note"] = f"could not start ({e})"
+        return st
+    _engine_pidfile(ctx, engine).write_text(f"{proc.pid}\n")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.5)
+        if _engine_reachable(engine, st["base"]):
+            break
+        if proc.poll() is not None:                    # died on startup — stop waiting
+            break
+    fresh = _engine_state(ctx, engine, cfg)
+    fresh["changed"] = fresh["reachable"]
+    if not fresh["reachable"]:
+        fresh["note"] = f"did not come up within {int(timeout)}s — see {log.name} in .context/"
+    return fresh
+
+
+def _engine_stop(ctx: Path, engine: str, cfg: dict, timeout: float = 12.0) -> dict:
+    """Stop an engine ONLY if Celeborn manages it (sovereignty rule): an `external` (user-started)
+    engine is left running with a note. SIGTERM the whole process group, escalating to SIGKILL if it
+    clings past `timeout`."""
+    import os
+    import signal
+    import time
+    st = _engine_state(ctx, engine, cfg)
+    if st["state"] in ("down", "not-installed"):
+        st["changed"] = False
+        st["note"] = "already down"
+        return st
+    if st["provenance"] == "external":
+        st["changed"] = False
+        st["note"] = "running, but you started it — Celeborn won't stop a daemon it didn't start"
+        return st
+    pid = st["managed_pid"]
+    if not pid:
+        st["changed"] = False
+        st["note"] = "no managed process to stop"
+        return st
+    def _sig(signum):
+        try:
+            os.killpg(os.getpgid(pid), signum)
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                os.kill(pid, signum)
+            except Exception:
+                pass
+    _sig(signal.SIGTERM)
+    deadline = time.time() + timeout
+    while time.time() < deadline and _pid_alive(pid):
+        time.sleep(0.3)
+    if _pid_alive(pid):
+        _sig(signal.SIGKILL)
+    try:
+        _engine_pidfile(ctx, engine).unlink()
+    except Exception:
+        pass
+    fresh = _engine_state(ctx, engine, cfg)
+    fresh["changed"] = not fresh["reachable"]
+    if fresh["reachable"]:
+        fresh["note"] = "still reachable after stop — another process may hold the port"
+    return fresh
+
+
+def _engine_restart(ctx: Path, engine: str, cfg: dict) -> dict:
+    """Stop (if managed) then start. An external engine is never restarted — Celeborn didn't start
+    it, so it doesn't get to bounce it."""
+    st = _engine_state(ctx, engine, cfg)
+    if st["provenance"] == "external":
+        st["changed"] = False
+        st["note"] = "running, but you started it — Celeborn won't restart a daemon it didn't start"
+        return st
+    if st["state"] not in ("down", "not-installed"):
+        _engine_stop(ctx, engine, cfg)
+    return _engine_start(ctx, engine, cfg)
+
+
+def _print_engine_room(st: dict, engines: list):
+    print(f"Engine Room status: {st['headline']}")
+    for e in engines:
+        r = st["engines"][e]
+        glyph = _ENGINE_GLYPH.get(r["state"], "·")
+        ver = f" · v{r['version']}" if r.get("version") else ""
+        prov = f" · {r['provenance']}" if r.get("provenance") else ""
+        pid = f" (pid {r['managed_pid']})" if r.get("managed_pid") else ""
+        print(f"  {glyph} {r['label']:<18} {r['state']:<13} {r['base']}{ver}{prov}{pid}")
+
+
+def cmd_engine_room(args):
+    """`celeborn engine-room {status|up|down|restart} [code|model|all]` (CELE-t375) — lifecycle for the
+    two local engines the sovereign weave installs: the Local Code Engine (`opencode serve`, the agent
+    harness the Stage talks to) and the Local Model Engine (the model runtime that serves Pippin).
+    Reports Scotty-style; starts/stops only processes Celeborn started — a user-started daemon is
+    reported, never touched (the sovereignty rule). `--json` backs the board Settings + Stage."""
+    ctx = require_context(args)
+    cfg = load_config(ctx)
+    action = (getattr(args, "engine_action", None) or "status").strip().lower()
+    target = (getattr(args, "target", None) or "all").strip().lower()
+    if target not in ("code", "model", "all"):
+        die(f"unknown target '{target}' — use code, model, or all")
+    engines = list(_ENGINES) if target == "all" else [target]
+    if action == "status":
+        st = _engine_room_status(ctx)
+        if getattr(args, "json", False):
+            print(json.dumps(st))
+            return
+        _print_engine_room(st, engines)
+        return
+    if action in ("up", "down", "restart"):
+        fn = {"up": _engine_start, "down": _engine_stop, "restart": _engine_restart}[action]
+        results = {e: fn(ctx, e, cfg) for e in engines}
+        room = _engine_room_status(ctx)
+        if getattr(args, "json", False):
+            print(json.dumps({"action": action, "engines": results, "room": room}))
+            return
+        for e in engines:
+            r = results[e]
+            glyph = _ENGINE_GLYPH.get(r["state"], "·")
+            note = f" — {r['note']}" if r.get("note") else ""
+            print(f"  {glyph} {r['label']}: {r['state']}{note}")
+        print(f"Engine Room status: {room['headline']}")
+        return
+    die(f"unknown engine-room subcommand: {action}")
+
+
+def _version_lt(a: str, b: str) -> bool:
+    """True iff dotted-numeric version `a` < `b` (pre-release/build suffixes ignored). Best-effort —
+    a non-numeric component stops the numeric compare there."""
+    def parts(v):
+        out = []
+        for tok in str(v).split("."):
+            m = re.match(r"\d+", tok)
+            if not m:
+                break
+            out.append(int(m.group()))
+        return out
+    pa, pb = parts(a), parts(b)
+    n = max(len(pa), len(pb))
+    pa += [0] * (n - len(pa))
+    pb += [0] * (n - len(pb))
+    return pa < pb
+
+
+# NOTE (CELE-t228): `.context/` is private-only. The old `_decide_private` / `_repo_visibility`
+# public-vs-private toggle (and the `--public` commit path) were removed — a public install is
+# impossible by design. `celeborn scaffold` always gitignores `.context/`; memory travels via
+# `celeborn sync`, never git.
 
 
 def _append_gitignore_block(gi: Path, sentinel: str, block: str) -> bool:
@@ -1497,6 +3252,11 @@ def _ensure_gitignore(root: Path, private: bool = False):
         gi, ".context/.board.pid",
         "\n# Celeborn board viewer runtime (ensure-on-orient) — local-only.\n"
         ".context/.board.pid\n.context/.board.log\n")
+    _append_gitignore_block(
+        gi, ".context/.engine-",
+        "\n# Celeborn Engine Room runtime (CELE-t375) — managed-daemon pids + logs, local-only.\n"
+        ".context/.engine-code.pid\n.context/.engine-code.log\n"
+        ".context/.engine-model.pid\n.context/.engine-model.log\n")
     _append_gitignore_block(
         gi, ".context/.panic/",
         "\n# Celeborn pre-compaction panic-saves — local snapshot/restore points.\n"
@@ -1704,6 +3464,14 @@ def cmd_status(args):
         print(_clip(touches_summary, touches_max, "touches.json"))
         print()
 
+    intents_summary = _intents_orient_summary(ctx)
+    if intents_summary:
+        print(sep)
+        print("intents (fleet blackboard — planned commits; `celeborn intent list`):")
+        print(sep)
+        print(intents_summary)
+        print()
+
     print(sep)
     print("Deeper tiers (on demand — not loaded):")
     notes = ctx / "notes.md"
@@ -1720,6 +3488,12 @@ def cmd_status(args):
     flag = "  (over budget — run `celeborn archive`)" if len(entries) > keep else ""
     print(f"  journal.md: {len(entries)} entries (keep {keep}){flag}")
     print(f"  journal-archive/: {len(archive_files)} file(s)")
+    _, state_hist = plan_state_archive((ctx / "state.md").read_text(), cfg.get("state_keep_sessions", 6)) \
+        if (ctx / "state.md").is_file() else ("", [])
+    state_arch_files = list((ctx / STATE_ARCHIVE_DIRNAME).glob("*.md"))
+    if state_hist or state_arch_files:
+        sflag = f"  ({len(state_hist)} over budget — run `celeborn archive`)" if state_hist else ""
+        print(f"  state-archive/: {len(state_arch_files)} file(s){sflag}")
     print(f"  learnings.md: {learn} · decisions.md: {dec} · durable docs: {len(durable_docs)}")
 
     idx = ctx / INDEX_NAME
@@ -1850,17 +3624,15 @@ def cmd_search(args):
         print()
 
 
-def cmd_archive(args):
-    ctx = require_context(args)
-    cfg = load_config(ctx)
-    keep = args.keep if args.keep is not None else cfg["journal_keep_entries"]
+def _archive_journal(ctx: Path, keep: int) -> int:
+    """FIFO the oldest journal.md entries past `keep` into journal-archive/archive.md. Returns the
+    number moved (0 = nothing to do / no journal)."""
     jpath = ctx / "journal.md"
     if not jpath.is_file():
-        die("no journal.md found.")
+        return 0
     header, entries = split_journal(jpath.read_text())
     if len(entries) <= keep:
-        print(f"journal.md has {len(entries)} entries (keep {keep}); nothing to archive.")
-        return
+        return 0
     move = entries[: len(entries) - keep]
     kept = entries[len(entries) - keep:]
 
@@ -1869,10 +3641,65 @@ def cmd_archive(args):
     arch_path = arch_dir / "archive.md"
     prefix = arch_path.read_text() if arch_path.is_file() else "# Journal archive\n\n"
     arch_path.write_text(prefix.rstrip("\n") + "\n\n" + "".join(move).rstrip("\n") + "\n")
-
     jpath.write_text(header.rstrip("\n") + "\n\n" + "".join(kept).rstrip("\n") + "\n")
-    print(f"Archived {len(move)} entr(ies) -> journal-archive/archive.md; kept {len(kept)} in journal.md.")
-    print("Re-run `celeborn index` to refresh search.")
+    return len(move)
+
+
+def _archive_state(ctx: Path, keep: int) -> int:
+    """FIFO the oldest dated history bullets from state.md's `## Now` (past the newest `keep`) into
+    state-archive/archive.md. Structural headline bullets are left untouched. Returns the count
+    moved (0 = nothing to do / no state.md / no Now section)."""
+    spath = ctx / "state.md"
+    if not spath.is_file():
+        return 0
+    text = spath.read_text()
+    new_text, archived = plan_state_archive(text, keep)
+    if not archived:
+        return 0
+    arch_dir = ctx / STATE_ARCHIVE_DIRNAME
+    arch_dir.mkdir(exist_ok=True)
+    arch_path = arch_dir / "archive.md"
+    prefix = arch_path.read_text() if arch_path.is_file() else (
+        "# State archive\n\n"
+        "<!-- Dated `## Now` history bullets FIFO'd out of state.md by `celeborn archive`.\n"
+        "     Cold tier — still indexed and searchable via `celeborn search`. -->\n\n"
+        f"## Archived {now_stamp()}\n\n")
+    body = "".join(b.rstrip("\n") + "\n" for b in archived)
+    arch_path.write_text(prefix.rstrip("\n") + "\n\n" + body.rstrip("\n") + "\n")
+    spath.write_text(new_text)
+    return len(archived)
+
+
+def _auto_archive(ctx: Path, cfg: dict):
+    """Capture-time self-healing: keep journal.md and state.md within budget without a manual command.
+    Best-effort and FIFO — safe to call every turn (a no-op once both tiers are under budget)."""
+    if not cfg.get("auto_archive", True):
+        return
+    _archive_journal(ctx, cfg["journal_keep_entries"])
+    _archive_state(ctx, cfg.get("state_keep_sessions", 6))
+    # The rewritten source files bump their mtime, so `_index_is_stale` flags the index for the next
+    # `celeborn index` automatically — archived content stays searchable once re-indexed.
+
+
+def cmd_archive(args):
+    ctx = require_context(args)
+    cfg = load_config(ctx)
+    what = getattr(args, "what", "all") or "all"
+    did = False
+    if what in ("all", "journal"):
+        keep = args.keep if args.keep is not None else cfg["journal_keep_entries"]
+        n = _archive_journal(ctx, keep)
+        did = True
+        print(f"journal.md: archived {n} entr(ies) -> journal-archive/archive.md (kept {keep})."
+              if n else f"journal.md: within budget (keep {keep}); nothing to archive.")
+    if what in ("all", "state"):
+        skeep = args.state_keep if args.state_keep is not None else cfg.get("state_keep_sessions", 6)
+        n = _archive_state(ctx, skeep)
+        did = True
+        print(f"state.md: archived {n} history bullet(s) -> {STATE_ARCHIVE_DIRNAME}/archive.md (kept {skeep})."
+              if n else f"state.md: within budget (keep {skeep}); nothing to archive.")
+    if did:
+        print("Re-run `celeborn index` to refresh search.")
 
 
 def cmd_promote(args):
@@ -1987,12 +3814,49 @@ def cmd_record(args):
         m["last_remind_estimate"] = 0
     elif args.event == "turn":
         m["context_estimate"] = m.get("context_estimate", 0) + max(0, args.tokens or 0)
+    elif args.event == "tokens":
+        # P4 (CELE-t141): a harness that KNOWS its live window (OpenCode reports per-message token
+        # usage) writes the REAL number straight onto this session's capture cursor — the same
+        # counter the heartbeat, the statusline, and the board's /clear-nudge bands already read
+        # (contract t203 §2.1: nobody re-derives tokens their own way). `--tokens` is the window
+        # as-of-now (absolute), not a delta: assistant-message usage IS the context size, and it
+        # legitimately shrinks after a compaction. `live` marks the cursor as a reported window so
+        # `_active_agents` emits it as a chip and the heartbeat words it as live context.
+        sid = (args.session or "").strip()
+        if not sid:
+            die("record tokens requires --session <id>")
+        total = max(0, int(args.tokens or 0))
+        caps = m.get("captures") if isinstance(m.get("captures"), dict) else {}
+        cur = dict(caps.get(sid) or {})
+        prev = int(cur.get("tokens_session") or 0)
+        cur.update({"session_id": sid, "tokens_session": total,
+                    "last_delta": max(0, total - prev), "idle_streak": 0,
+                    "live": True, "updated_at": now_iso()})
+        # Machine-readable context-pressure flag (CELE-t207): every live-window report re-grades the
+        # session against the configured soft/hard thresholds, so the board and a future auto-clear
+        # can read the pressure state without re-deriving tokens (contract t203 §2.1).
+        soft, hard = _context_thresholds(cfg)
+        cur["pressure"] = _pressure_level(total, soft, hard)
+        # Auto-clear trigger (CELE-t209, opt-in): a hard-pressure live window prints a machine
+        # marker on the same stdout the OpenCode plugin already collects from this verb — zero
+        # extra subprocess on the hot path. The plugin only MARKS the session pending here; the
+        # actual decision (gate, cooldown, prep) is re-verified by `celeborn autoclear` at the
+        # next turn boundary, so a stale marker can never clear a session by itself.
+        if _autoclear_due(cfg, cur):
+            print(f"autoclear: due ({sid[:8]} at {total:,} tokens ≥ hard {hard:,})")
+        _write_capture(m, caps, sid, cur)
+        try:
+            __import__("celeborn_sync").schedule_agents_push(ctx)   # hosted chips track the live number
+        except Exception:
+            pass
     elif args.event == "handoff":
         m["handoffs_written"] += 1
     _save_metrics(ctx, m)
     note = f" (+~{saved:,} tokens)" if saved else ""
     if args.event in ("turn", "clear"):
         note = f" (context estimate ~{m['context_estimate']:,} tokens)"
+    elif args.event == "tokens":
+        note = f" ({(args.session or '')[:8]} ← {max(0, int(args.tokens or 0)):,} live context tokens)"
     print(f"recorded: {args.event}{note}")
 
 
@@ -2595,15 +4459,37 @@ def cmd_why(args):
 # --------------------------------------------------------------------------- touch (multi-agent file registry)
 
 TOUCHES_NAME = "touches.json"
-TOUCHES_SCHEMA = "celeborn-touches/1"
+# schema/2 (CELE-t309): a file maps to a LIST of touch records — one per agent — so a declared
+# two-writer hotspot keeps BOTH writers visible (schema/1 kept a single record per path, so the
+# second toucher silently overwrote the first and vanished from the overlap signal). Legacy
+# {path: record} files migrate to {path: [record]} transparently on load.
+TOUCHES_SCHEMA = "celeborn-touches/2"
 
 
 def _touches_path(ctx: Path) -> Path:
     return ctx / TOUCHES_NAME
 
 
+def _normalize_touch_files(files) -> dict:
+    """Coerce the on-disk `files` map to the canonical schema/2 shape {path: [record, ...]},
+    tolerating the schema/1 single-record shape {path: record} and dropping empty/garbage entries.
+    The whole registry runs on this list shape once loaded, so callers never branch on version."""
+    out = {}
+    for path, val in (files or {}).items():
+        if isinstance(val, list):
+            recs = [m for m in val if isinstance(m, dict)]
+        elif isinstance(val, dict):
+            recs = [val]                       # schema/1 legacy: a bare record for the path
+        else:
+            continue
+        if recs:
+            out[path] = recs
+    return out
+
+
 def _load_touches(ctx: Path) -> dict:
-    """Active file-touch registry — who is editing which path right now (design: multi-agent-editing.md)."""
+    """Active file-touch registry — who is editing which path right now (design: multi-agent-editing.md).
+    Normalized to schema/2 ({path: [record, ...]}) on load so every caller sees the list shape."""
     p = _touches_path(ctx)
     if not p.is_file():
         return {"schema": TOUCHES_SCHEMA, "files": {}}
@@ -2611,13 +4497,29 @@ def _load_touches(ctx: Path) -> dict:
         data = json.loads(p.read_text())
     except (json.JSONDecodeError, OSError):
         return {"schema": TOUCHES_SCHEMA, "files": {}}
-    data.setdefault("schema", TOUCHES_SCHEMA)
-    data.setdefault("files", {})
+    data["schema"] = TOUCHES_SCHEMA
+    data["files"] = _normalize_touch_files(data.get("files"))
     return data
 
 
 def _save_touches(ctx: Path, data: dict):
     _touches_path(ctx).write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _touch_by(rec) -> str:
+    """The handle a touch record is attributed to (trimmed); '' when unattributed."""
+    return ((rec or {}).get("by") or "").strip()
+
+
+def _upsert_toucher(recs: list, rec: dict) -> None:
+    """Register `rec` in a file's toucher list: replace this handle's existing record (a re-edit
+    just freshens it) or append a new one. One record per (file, handle) — never per file."""
+    who = _touch_by(rec)
+    for i, m in enumerate(recs):
+        if _touch_by(m) == who:
+            recs[i] = rec
+            return
+    recs.append(rec)
 
 
 # --- agent identity registry --------------------------------------------------
@@ -2658,10 +4560,10 @@ def _save_agents(ctx: Path, data: dict):
 # fleet snapshot (`_doing_row`) + the hosted `tasks` push. `celeborn alert` is the reusable service
 # (the Notification/Stop hooks are its first callers; any other system can call it too), and it
 # clears the moment the user re-engages (a new prompt). No focus-stealing OS dialog (rejected
-# t47/t50/t62) — the alert surfaces on the card, locally and on celeborn.thot.ai.
+# t47/t50/t62) — the alert surfaces on the card, locally and on celeborncode.ai.
 ALERTS_NAME = ".alerts.json"
 ALERTS_SCHEMA = "celeborn-alerts/1"
-ALERT_KINDS = ("permission", "idle", "stopped")
+ALERT_KINDS = ("permission", "idle", "stopped", "spine")  # "spine": the PM's ✋ on a todo spine card (CELE-t283)
 
 
 def _alerts_path(ctx: Path) -> Path:
@@ -2788,6 +4690,129 @@ def _refresh_alerted_card(ctx: Path, task_id: str) -> None:
         pass
 
 
+# --------------------------------------------------------------------------- ask / answer (CELE-t280)
+# The question dock's DURABLE half (design docs/plans/cele-t144-spine-and-stage.md §3b). Two reply
+# paths meet here:
+#   · An OpenCode PERMISSION ask resumes LIVE — the board POSTs once/always/reject straight to
+#     `opencode serve` and the session unblocks; `celeborn answer --kind permission` only records it.
+#   · An `ask_human` tool call (or a `celeborn alert`) has no live channel to resume mid-turn, so the
+#     question PARKS here and the tool blocks on its answer: `celeborn ask` files it (+ raises the
+#     card alert so the Stage dock shows it); `celeborn answer --kind text` fills it; the tool's poll
+#     on `celeborn ask-status` returns the text and the turn continues. No tool waiting? the answer
+#     falls through to the outbox (delivered on the agent's next turn).
+# Rides the same local, gitignored .context/ as .alerts.json.
+ASKS_NAME = ".asks.json"
+ASKS_SCHEMA = "celeborn-asks/1"
+
+
+def _asks_path(ctx: Path) -> Path:
+    return ctx / ASKS_NAME
+
+
+def _load_asks(ctx: Path) -> dict:
+    p = _asks_path(ctx)
+    if not p.is_file():
+        return {"schema": ASKS_SCHEMA, "asks": {}}
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"schema": ASKS_SCHEMA, "asks": {}}
+    if not isinstance(data.get("asks"), dict):
+        data["asks"] = {}
+    data.setdefault("schema", ASKS_SCHEMA)
+    return data
+
+
+def _save_asks(ctx: Path, data: dict) -> None:
+    import os
+    data["schema"] = ASKS_SCHEMA
+    p = _asks_path(ctx)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, p)
+
+
+def _new_ask(ctx: Path, session: str, card: str, question: str, options: list[str]) -> dict:
+    import uuid
+    data = _load_asks(ctx)
+    rec = {"id": "ask-" + uuid.uuid4().hex[:8], "session": (session or "").strip()[:64],
+           "card": card, "question": question.strip(), "options": options,
+           "answer": None, "at": now_iso(), "answered_at": None}
+    data.setdefault("asks", {})[rec["id"]] = rec
+    _save_asks(ctx, data)
+    return rec
+
+
+def _open_ask_for(ctx: Path, session: str = "", card: str = "") -> dict | None:
+    """The newest still-unanswered ask matching this session (preferred) or card — the record a
+    `celeborn answer` fills. Session match is by id-prefix either way (events carry full ids, cards
+    own short ones), so both sides of the demux join resolve the same ask."""
+    session, card = (session or "").strip(), (card or "").strip()
+    cands = sorted((r for r in _load_asks(ctx).get("asks", {}).values() if r.get("answer") is None),
+                   key=lambda r: r.get("at", ""), reverse=True)
+    for r in cands:
+        rs = (r.get("session") or "").strip()
+        if session and rs and (rs.startswith(session) or session.startswith(rs)):
+            return r
+    for r in cands:
+        if card and r.get("card") == card:
+            return r
+    return None
+
+
+def _answer_ask(ctx: Path, ask_id: str, answer: str) -> bool:
+    data = _load_asks(ctx)
+    rec = data.get("asks", {}).get(ask_id)
+    if not rec or rec.get("answer") is not None:
+        return False
+    rec["answer"] = answer
+    rec["answered_at"] = now_iso()
+    _save_asks(ctx, data)
+    return True
+
+
+def _journal_dock_qa(ctx: Path, disp: str, question: str, answer: str, how: str,
+                     kind: str = "text", model: str = "") -> None:
+    """The durable half of "journaled on the card": a fuller journal.md entry (asked → answered →
+    resumed). Best-effort — a journaling hiccup must never fail an answer that already landed.
+    `model` (CELE-t346) records the per-prompt [model ▾] pick when the human chose one."""
+    try:
+        stamp = now_iso()[:16].replace("T", " ")
+        # A kind=text message with no --question is a plain "message this agent" (the always-on
+        # Stage prompt line, CELE-t345), not an answer to a question — don't mislabel it a request.
+        asked = question or ("(permission request)" if kind == "permission" else "(message)")
+        model_line = f"- **Model:** {model}\n" if model else ""
+        _append(ctx / "journal.md",
+                f"\n## {stamp} — dock Q&A on {disp}\n"
+                f"- **Asked:** {asked}\n"
+                f"- **Answered:** {answer}  (resumed via {how})\n"
+                f"{model_line}"
+                f"- **Tags:** #dock #t280\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _append_card_qa(ctx: Path, tid: str, question: str, answer: str, kind: str = "text",
+                    model: str = "") -> None:
+    """The glanceable half: a compact one-line Q&A trail on the card note itself, so decision
+    provenance rides the kanban card (design §3b). Best-effort. `model` (CELE-t346) appends the
+    per-prompt [model ▾] pick when the human chose one."""
+    try:
+        tasks = _load_tasks(ctx)
+        t = _find_task(tasks, tid)
+        if not t:
+            return
+        stamp = now_iso()[:16].replace("T", " ")
+        # kind=text with no --question is a plain message, not a permission answer (CELE-t345).
+        fallback = "permission" if kind == "permission" else "message"
+        suffix = f"  · via {model}" if model else ""
+        line = f"💬 [dock {stamp}] {question or fallback} → {answer}{suffix}"
+        t["notes"] = f"{t['notes']}\n\n{line}".strip() if t.get("notes") else line
+        _save_tasks(ctx, tasks, autopush_ids=[tid])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _register_agent(ctx: Path, handle: str, family: str = "", model: str = "") -> dict:
     """Upsert a handle's family/model — only non-empty fields overwrite. Returns the merged entry."""
     handle = (handle or "").strip()
@@ -2852,19 +4877,27 @@ def _parse_touch_at(at: str):
 
 
 def _prune_touches(data: dict, ttl_hours: float) -> bool:
-    """Drop touches older than ttl. Returns whether anything was removed."""
+    """Drop touch records older than ttl, per toucher. A file drops out only once its last live
+    toucher expires. Returns whether anything was removed."""
     if ttl_hours <= 0:
         return False
     cutoff = _dt.datetime.now() - _dt.timedelta(hours=ttl_hours)
     files = data.get("files") or {}
-    stale = []
-    for path, meta in files.items():
-        at = _parse_touch_at((meta or {}).get("at", ""))
-        if at is None or at < cutoff:
-            stale.append(path)
-    for path in stale:
-        del files[path]
-    return bool(stale)
+    changed = False
+    for path in list(files.keys()):
+        recs = files[path]
+        kept = []
+        for m in recs:
+            at = _parse_touch_at((m or {}).get("at", ""))
+            if at is not None and at >= cutoff:
+                kept.append(m)
+        if len(kept) != len(recs):
+            changed = True
+        if kept:
+            files[path] = kept
+        else:
+            del files[path]
+    return changed
 
 
 def _touch_age_label(at: str) -> str:
@@ -2904,18 +4937,19 @@ def _active_touches(ctx: Path) -> list[dict]:
     if _prune_touches(data, _touch_ttl_hours(ctx)):
         _save_touches(ctx, data)
     rows = []
-    for path, meta in (data.get("files") or {}).items():
-        meta = meta or {}
-        rows.append({
-            "path": path,
-            "by": meta.get("by") or "unknown",
-            "family": meta.get("family") or "",
-            "model": meta.get("model") or "",
-            "why": meta.get("why") or "",
-            "at": meta.get("at") or "",
-            "task": meta.get("task") or "",
-            "age": _touch_age_label(meta.get("at", "")),
-        })
+    for path, recs in (data.get("files") or {}).items():
+        for meta in recs:
+            meta = meta or {}
+            rows.append({
+                "path": path,
+                "by": meta.get("by") or "unknown",
+                "family": meta.get("family") or "",
+                "model": meta.get("model") or "",
+                "why": meta.get("why") or "",
+                "at": meta.get("at") or "",
+                "task": meta.get("task") or "",
+                "age": _touch_age_label(meta.get("at", "")),
+            })
     rows.sort(key=lambda r: r.get("at") or "", reverse=True)
     return rows
 
@@ -2924,7 +4958,7 @@ def _task_has_active_touches(ctx: Path, task_id: str) -> bool:
     if not task_id:
         return False
     files = (_load_touches(ctx).get("files") or {})
-    return any((m or {}).get("task") == task_id for m in files.values())
+    return any((m or {}).get("task") == task_id for recs in files.values() for m in recs)
 
 
 def _is_stale_doing(ctx: Path, t: dict) -> bool:
@@ -2984,9 +5018,16 @@ def _release_touches_for_task(ctx: Path, task_id: str) -> list[str]:
         return []
     data = _load_touches(ctx)
     files = data.get("files") or {}
-    released = [p for p, m in files.items() if (m or {}).get("task") == task_id]
-    for p in released:
-        del files[p]
+    released = []
+    for path in list(files.keys()):
+        recs = files[path]
+        keep = [m for m in recs if (m or {}).get("task") != task_id]
+        if len(keep) != len(recs):
+            released.append(path)          # this task had at least one toucher on the file
+        if keep:
+            files[path] = keep
+        else:
+            del files[path]
     if released:
         _save_touches(ctx, data)
     return released
@@ -3042,12 +5083,18 @@ def cmd_touch(args):
         by = (getattr(args, "by", None) or "").strip()
         files = data.get("files") or {}
         if by:
-            drop = [p for p, m in files.items() if (m or {}).get("by") == by]
-            for p in drop:
-                del files[p]
-            print(f"Cleared {len(drop)} touch(es) for @{by}")
+            dropped = 0
+            for path in list(files.keys()):
+                recs = files[path]
+                keep = [m for m in recs if _touch_by(m) != by]
+                dropped += len(recs) - len(keep)
+                if keep:
+                    files[path] = keep
+                else:
+                    del files[path]
+            print(f"Cleared {dropped} touch(es) for @{by}")
         else:
-            n = len(files)
+            n = sum(len(recs) for recs in files.values())
             data["files"] = {}
             print(f"Cleared {n} touch(es)")
         _save_touches(ctx, data)
@@ -3065,37 +5112,52 @@ def cmd_touch(args):
     who = ident["handle"]
 
     if cmd == "release":
-        meta = files.get(relpath)
-        if not meta:
+        recs = files.get(relpath) or []
+        if not recs:
             warn(f"no touch on {relpath}")
             return
-        owner = (meta.get("by") or "").strip()
-        if owner and owner != who and not getattr(args, "force", False):
-            die(f"{relpath} is touched by @{owner} — pass --force to release anyway")
-        released_task = (meta.get("task") or "").strip()
-        del files[relpath]
+        mine = [m for m in recs if _touch_by(m) == who]
+        if mine:
+            # Release only my own touch — peers stay registered on a shared hotspot.
+            keep = [m for m in recs if _touch_by(m) != who]
+            released_task = (mine[0].get("task") or "").strip()
+            owner = who
+        else:
+            # I have no touch here; only foreign ones. --force releases the whole file.
+            owners = ", @".join(sorted({_touch_by(m) or "?" for m in recs}))
+            if not getattr(args, "force", False):
+                die(f"{relpath} is touched by @{owners} — pass --force to release anyway")
+            keep = []
+            released_task = (recs[0].get("task") or "").strip()
+            owner = owners
+        if keep:
+            files[relpath] = keep
+        else:
+            del files[relpath]
         _save_touches(ctx, data)
-        print(f"Released {relpath} (@{owner or who})")
+        remaining = f" — {len(keep)} other toucher(s) still on it" if keep else ""
+        print(f"Released {relpath} (@{owner}){remaining}")
         nudge = _touch_release_nudge(ctx, released_task)
         if nudge:
             warn(nudge)
         return
 
-    # register (default)
-    prev = files.get(relpath) or {}
-    prev_owner = (prev.get("by") or "").strip()
-    if prev_owner and prev_owner != who:
-        warn(f"@{prev_owner} already touching {relpath} ({_touch_age_label(prev.get('at', ''))}) — registering anyway")
+    # register (default) — add/refresh MY record; a peer on the same file is now kept alongside me
+    # (schema/2) rather than overwritten, so a declared two-writer hotspot shows both (CELE-t309).
+    recs = files.setdefault(relpath, [])
+    others = sorted({o for o in (_touch_by(m) for m in recs) if o and o != who})
+    if others:
+        warn("@" + ", @".join(others) + f" also touching {relpath} — both registered (declared hotspot)")
     task = (getattr(args, "task", None) or "").strip()
     why = (getattr(args, "why", None) or "").strip()
-    files[relpath] = {
+    _upsert_toucher(recs, {
         "by": who,
         "family": ident["family"],
         "model": ident["model"],
         "at": now_iso(),
         "task": task,
         "why": why,
-    }
+    })
     _save_touches(ctx, data)
     tag = f" [{task}]" if task else ""
     label = _agent_label(ident["family"], ident["model"])
@@ -3110,11 +5172,11 @@ def cmd_touch(args):
 
 
 def cmd_board(args):
-    """`celeborn board` — print this project's kanban URL (the de-collided per-project port) and
-    whether it's live on localhost right now. Port resolution: explicit `board_port` in .celebornrc,
-    else a stable hash of the project path. `--port`/`--url` print just that value (for scripts/hooks);
-    `--json` emits {port,url,live}. `--start` runs ensure-on-orient: launch the viewer (detached) if
-    its port is down — the same thing the SessionStart hook does on every orient."""
+    """`celeborn board` — the board is Celeborn's UI, so this ensures the viewer is up and OPENS it in
+    your browser (CELE-t228). Port resolution: explicit `board_port` in .celebornrc, else a stable hash
+    of the project path. Script-friendly modes stay report-only and never launch/open: `--port`/`--url`
+    print just that value, `--json` emits {port,url,live}. `--no-open` ensures the viewer but skips the
+    browser tab; a non-interactive shell also never pops a tab."""
     if getattr(args, "supervise", False):
         # Detached restart-loop entrypoint (not a user-facing command) — resolves everything from
         # its own args, so no project context is required.
@@ -3126,20 +5188,36 @@ def cmd_board(args):
         print(port); return
     if getattr(args, "url_only", False):
         print(url); return
-    if getattr(args, "start", False):
-        st = ensure_board(ctx)
-        if getattr(args, "json", False):
-            print(json.dumps(st)); return
-        verb = {"live": "already live", "started": "started", "booting": "starting up",
-                "off": "autostart off", "no-tasks": "no kanban here",
-                "unavailable": "can't start"}.get(st["action"], st["action"])
-        extra = f" — {st['reason']}" if st.get("reason") else (f" (pid {st['pid']})" if st.get("pid") else "")
-        print(f"🏹 {_project_name(ctx)} kanban → {url}  ({verb}{extra})")
-        return
-    live = _board_live(port)
     if getattr(args, "json", False):
-        print(json.dumps({"port": port, "url": url, "live": live})); return
-    print(f"🏹 {_project_name(ctx)} kanban → {url}  ({'live' if live else 'not running'})")
+        # Script/JSON mode: report-only unless `--start` explicitly asks to launch. Never opens a tab.
+        st = ensure_board(ctx) if getattr(args, "start", False) else {
+            "port": port, "url": url, "live": _board_live(port)}
+        print(json.dumps(st)); return
+    # Default `celeborn board` (and `--start`): bring the viewer up and open it — the board is the UI.
+    st = ensure_board(ctx)
+    # No npm/node/deps → the Next.js board can't run. Rather than a dead-end "can't start", serve a
+    # zero-dependency onboarding page from the stdlib whose first step is REGISTER, always carrying a
+    # live Support button (CELE-t229). Only in the interactive open path — scripts/hooks stay report-
+    # only, and `--no-open` never blocks the terminal in a foreground serve loop.
+    if (st.get("action") == "unavailable" and _init_is_interactive()
+            and not getattr(args, "no_open", False)):
+        print(f"🏹 {_project_name(ctx)} — full board unavailable ({st.get('reason')}); "
+              f"serving onboarding at {url}  (Ctrl-C to stop)")
+        _serve_onboarding(port, url, _onboarding_html(ctx, reason=st.get("reason", "")))
+        return
+    verb = {"live": "already live", "started": "started", "booting": "starting up",
+            "off": "autostart off", "no-tasks": "no kanban here",
+            "unavailable": "can't start"}.get(st["action"], st["action"])
+    extra = f" — {st['reason']}" if st.get("reason") else (f" (pid {st['pid']})" if st.get("pid") else "")
+    print(f"🏹 {_project_name(ctx)} kanban → {url}  ({verb}{extra})")
+    # Pop a browser tab unless suppressed / non-interactive, and only if the viewer is actually up.
+    if (not getattr(args, "no_open", False) and _init_is_interactive()
+            and st.get("action") in ("live", "started", "booting")):
+        import webbrowser
+        try:
+            webbrowser.open(url)
+        except Exception:                                   # noqa: BLE001 — opening a tab must never fail the command
+            pass
 
 
 # --------------------------------------------------------------------------- run (real-time swarm / Elves tracker)
@@ -3768,6 +5846,286 @@ def _fleet_project_paths(ctx: Path | None) -> list[Path]:
     return out
 
 
+# --------------------------------------------------------------------------- commit intents (CELE-t303)
+#
+# The blackboard's THIRD coordination channel (design thread: plan/cele-fleet-blackboard.md; first
+# consumer: the CSP parallel builds, CELE-t302). Touches say WHERE an agent is, the board says WHAT
+# it owns — an intent says what it is ABOUT TO DO to the shared tree: "I plan to commit these files,
+# under this card, roughly this soon." Peers editing the same files get the warning in their
+# per-turn envelope BEFORE they commit, so concurrent agents negotiate commit order up front instead
+# of discovering a same-file sweep after the fact (`git commit --only` is file-granular — see
+# references/multi-agent-editing.md). Substrate: fleet.json — machine-global, so worktrees of one
+# repo share the choreography (the t154 §5 substrate argument) — with the same concurrency rules as
+# the roster design: field-scoped writes (upsert your own row, never rewrite a peer's), atomic
+# replace, TTL-bounded. One intent per (agent, project): your NEXT commit, not a queue.
+INTENT_TTL_HOURS_DEFAULT = 2.0   # matches the touch TTL — a plan older than this is stale noise
+
+
+def _intent_ttl_hours(ctx: Path | None) -> float:
+    if ctx is not None:
+        try:
+            return float(load_config(ctx).get("intent_ttl_hours", INTENT_TTL_HOURS_DEFAULT))
+        except Exception:  # noqa: BLE001 — a broken rc must never break the blackboard
+            pass
+    return INTENT_TTL_HOURS_DEFAULT
+
+
+def _prune_intents(rows: list, ttl_hours: float) -> list:
+    """Intents past TTL are dropped on read — the planned commit either landed or went stale."""
+    if ttl_hours <= 0:
+        return rows
+    cutoff = _dt.datetime.now() - _dt.timedelta(hours=ttl_hours)
+    keep = []
+    for r in rows:
+        at = _parse_touch_at((r or {}).get("at", ""))
+        if at is not None:
+            if at.tzinfo is not None:
+                at = at.replace(tzinfo=None)
+            if at >= cutoff:
+                keep.append(r)
+    return keep
+
+
+def _active_intents(project: Path | None, ctx: Path | None = None) -> list[dict]:
+    """Live declared intents, newest first — one project's, or machine-wide (project=None).
+    Prunes stale rows on read, like `_active_touches`."""
+    data = _load_fleet_registry()
+    rows = [r for r in (data.get("intents") or []) if isinstance(r, dict)]
+    kept = _prune_intents(rows, _intent_ttl_hours(ctx))
+    if len(kept) != len(rows):
+        data["intents"] = kept
+        _save_fleet_registry(data)
+    if project is not None:
+        key = str(_resolve_project_dir(str(project)))
+        kept = [r for r in kept if r.get("project") == key]
+    return sorted(kept, key=lambda r: r.get("at") or "", reverse=True)
+
+
+def _upsert_intent(project: Path, row: dict) -> None:
+    """One intent per (agent, project) — re-declaring replaces your previous plan. Field-scoped:
+    a peer's row is never rewritten, only your own is dropped and re-appended."""
+    data = _load_fleet_registry()
+    rows = [r for r in (data.get("intents") or []) if isinstance(r, dict)]
+    rows = _prune_intents(rows, _intent_ttl_hours(None))
+    key = str(_resolve_project_dir(str(project)))
+    rows = [r for r in rows if not (r.get("project") == key and r.get("by") == row.get("by"))]
+    rows.append(row)
+    data["intents"] = rows
+    _save_fleet_registry(data)
+
+
+def _drop_intents(project: Path, by: str = "", task: str = "") -> list[dict]:
+    """Remove matching intents — an agent's `intent done`, or a shipping card withdrawing its plans.
+    No filter drops all of the project's intents (`intent clear`). Returns what was dropped."""
+    data = _load_fleet_registry()
+    rows = [r for r in (data.get("intents") or []) if isinstance(r, dict)]
+    key = str(_resolve_project_dir(str(project)))
+
+    def _matches(r: dict) -> bool:
+        return (r.get("project") == key
+                and (not by or r.get("by") == by)
+                and (not task or r.get("task") == task))
+
+    dropped = [r for r in rows if _matches(r)]
+    if dropped:
+        data["intents"] = [r for r in rows if not _matches(r)]
+        _save_fleet_registry(data)
+    return dropped
+
+
+def _parse_eta_minutes(raw: str):
+    """'20' / '45m' / '1.5h' → minutes (int), or None when absent/unparseable."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(m|min|mins|minutes|h|hr|hrs|hours)?", s)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2) or "m"
+    return int(val * 60) if unit.startswith("h") else int(val)
+
+
+def _intent_eta_label(eta_iso: str) -> str:
+    ts = _parse_touch_at(eta_iso)
+    if ts is None:
+        return ""
+    if ts.tzinfo is not None:
+        ts = ts.replace(tzinfo=None)
+    mins = int((ts - _dt.datetime.now()).total_seconds() // 60)
+    return "due now" if mins <= 0 else f"~{mins}m out"
+
+
+def _intent_line(r: dict) -> str:
+    """One human-readable intent row — shared by `intent list`, orient, and the envelope warning."""
+    label = _agent_label(r.get("family", ""), r.get("model", ""))
+    who = f"@{r.get('by') or 'unknown'}" + (f" ({label})" if label else "")
+    task = f" [{r['task']}]" if r.get("task") else ""
+    files = ", ".join(r.get("files") or []) or "(files unspecified)"
+    what = f" — \"{r['what']}\"" if r.get("what") else ""
+    bits = [b for b in (_touch_age_label(r.get("at", "")), _intent_eta_label(r.get("eta", "")))
+            if b and b != "?"]
+    when = f"  ({' · '.join(bits)})" if bits else ""
+    return f"{who}{task} plans to commit {files}{what}{when}"
+
+
+def _intent_json_row(r: dict) -> dict:
+    """One intent row for machine consumers (the board's `/api/intents`, CELE-t347), carrying the
+    same derived display strings the CLI text uses — so the board's chip/warn wording is verbatim
+    the t303 CLI (`_intent_line` · the envelope eta/age labels) rather than re-derived in TS."""
+    return {
+        **r,
+        "line": _intent_line(r),
+        "age_label": _touch_age_label(r.get("at", "")),
+        "eta_label": _intent_eta_label(r.get("eta", "")),
+        "qualified": _display_tid(None, r["task"], slug=r.get("slug") or "") if r.get("task") else "",
+    }
+
+
+def _intents_orient_summary(ctx: Path) -> str:
+    """Compact declared-commit view for Orient — the whole project's choreography at a glance."""
+    rows = _active_intents(ctx.parent, ctx)
+    if not rows:
+        return ""
+    n = len(rows)
+    out = [f"{n} declared commit intent{'s' if n != 1 else ''}    "
+           f"(`celeborn intent list` — coordinate before committing these files)"]
+    out += [f"  {_intent_line(r)}" for r in rows]
+    return "\n".join(out)
+
+
+def _intent_overlap_notice(ctx: Path, handle: str) -> str:
+    """Peer intents whose files overlap MY active touches — the per-turn telepathy warning.
+    Own intents never warn (you already know your plan); no touches → nothing to collide with."""
+    if not handle:
+        return ""
+    mine = {r["path"] for r in _active_touches(ctx) if r.get("by") == handle}
+    if not mine:
+        return ""
+    lines = []
+    for r in _active_intents(ctx.parent, ctx):
+        if (r.get("by") or "") == handle:
+            continue
+        overlap = sorted(mine & {str(f) for f in (r.get("files") or [])})
+        if overlap:
+            lines.append(f"🏹 Celeborn intent —> {_intent_line(r)} — you are touching: "
+                         f"{', '.join(overlap)}")
+    return "\n".join(lines)
+
+
+def cmd_intent(args):
+    """`celeborn intent "<what>"` — declare a planned commit on the fleet blackboard (the third
+    channel: touches = where I am, the board = what I own, intent = what I'm ABOUT to do to the
+    shared tree). Peers editing the same files are warned in their next turn. `list` / `done` /
+    `clear` manage the register; files default to your active touches for --task."""
+    ctx = require_context(args)
+    words = list(getattr(args, "words", None) or [])
+    cmd = words[0] if words and words[0] in ("list", "done", "clear") else None
+    repo = ctx.parent.resolve()
+    ident = _agent_identity(args, ctx)
+    who = ident["handle"]
+
+    if cmd == "list":
+        rows = _active_intents(None if getattr(args, "all", False) else repo, ctx)
+        if getattr(args, "json", False):
+            # The board (CELE-t347) matches declared files vs live touches to place the chip on the
+            # declaring card and the amber hold-warn on an overlapped peer, so ship both channels in
+            # one call. Touches are this project's only (the fleet-wide `--all` view omits them —
+            # touches are project-scoped and there is no single ctx to read them from).
+            payload = {"intents": [_intent_json_row(r) for r in rows]}
+            if not getattr(args, "all", False):
+                payload["touches"] = _active_touches(ctx)
+            print(json.dumps(payload, indent=2))
+            return
+        if not rows:
+            print("(no declared intents)")
+            return
+        for r in rows:
+            print(_intent_line(r))
+        return
+
+    if cmd == "done":
+        # Release is session-scoped, always (CELE-t370): a release with no identity used to fall
+        # through to `by=""`/`by="unknown"` and could clobber a peer's live plan on the same file.
+        # Requiring a session means `done` can only ever withdraw YOUR own intent, never a peer's.
+        if not _resolve_session(args):
+            die("intent done requires a session id so it releases ONLY your own intent, never a "
+                "peer's — run inside a Claude session or pass --session <id> (CELE-t370).")
+        dropped = _drop_intents(repo, by=who)
+        if dropped:
+            print(f"Intent released for @{who} — {len(dropped)} plan(s) withdrawn (yours only)")
+        else:
+            print(f"(no intent on record for @{who})")
+        return
+
+    if cmd == "clear":
+        # The old bare `clear` silently wiped every agent's intent — the exact footgun t370 closes.
+        # Now bare `clear` is session-scoped (identical to `done`); the fleet-wide wipe is an
+        # explicit, deliberate `--all-agents`, and both still require a session as identity.
+        if not _resolve_session(args):
+            die("intent clear requires a session id (CELE-t370). Bare `clear` releases only your "
+                "own intent; add --all-agents to deliberately wipe every agent's intent.")
+        if getattr(args, "all_agents", False):
+            dropped = _drop_intents(repo)
+            print(f"Cleared ALL {len(dropped)} intent(s) for this project (--all-agents) — "
+                  "every agent's plan withdrawn.")
+        else:
+            dropped = _drop_intents(repo, by=who)
+            print(f"Released {len(dropped)} intent(s) for @{who} (yours only; "
+                  "use --all-agents to wipe the whole fleet's).")
+        return
+
+    what = " ".join(words).strip()
+    task = (getattr(args, "task", None) or "").strip()
+    # An intent with no identity or no purpose is noise to peers (CELE-t370). Require BOTH before
+    # anything lands on the blackboard: a live session (WHO plans the commit — the `by` handle is
+    # session-derived, same as a claim) and a real card (the purpose peers can look up). The
+    # free-text "<what>" is the human line; the card is its context.
+    if not _resolve_session(args):
+        die("intent requires a session id — the intent is filed under your session so peers know "
+            "WHO plans the commit. Run inside a Claude session or pass --session <id> (CELE-t370).")
+    if not what:
+        die('intent requires a description: celeborn intent "<what you will commit>" --task <id> '
+            "[--files a.py,b.ts] [--eta 30m]  (CELE-t370)")
+    if not task:
+        die("intent requires --task <id> — an intent with no card has no purpose peers can read; "
+            "name the card this commit is for (CELE-t370).")
+    bare_task = _resolve_task_arg(ctx, task)
+    if not _find_task(_load_tasks(ctx), bare_task):
+        die(f"intent --task {task}: no such card on this board — file the card first "
+            "(`celeborn tasks add …`) so the intent points at a real purpose (CELE-t370).")
+    task = bare_task
+    raw_files = (getattr(args, "files", None) or "").strip()
+    files = ([_resolve_repo_relpath(repo, f) for f in raw_files.split(",") if f.strip()]
+             if raw_files else [])
+    if not files and task:
+        files = sorted(p for p, recs in (_load_touches(ctx).get("files") or {}).items()
+                       if any((m or {}).get("task") == task for m in recs))
+    if not what and not files:
+        die('usage: celeborn intent "<what you will commit>" [--files a.py,b.ts] [--task tN] [--eta 30m]\n'
+            "       celeborn intent list [--all] [--json] | done | clear")
+    if not files:
+        warn("no --files and no touches for the task — name the files so peers know what to hold")
+    eta_min = _parse_eta_minutes(getattr(args, "eta", None) or "")
+    row = {
+        "by": who,
+        "family": ident["family"],
+        "model": ident["model"],
+        "project": str(repo),
+        "slug": project_slug(ctx),
+        "task": task,
+        "files": files,
+        "what": what,
+        "eta": ((_dt.datetime.now() + _dt.timedelta(minutes=eta_min)).isoformat(timespec="seconds")
+                if eta_min else ""),
+        "at": now_iso(),
+    }
+    _upsert_intent(repo, row)
+    print(f"Intent declared: {_intent_line(row)}")
+    print("  peers touching these files are warned before they commit; "
+          "run `celeborn intent done` once yours lands.")
+
+
 def _load_session(ctx: Path) -> dict:
     p = ctx / "session.json"
     if not p.is_file():
@@ -3808,12 +6166,106 @@ def _write_session(ctx: Path, data: dict, cfg: dict | None = None) -> list[str]:
     return clipped
 
 
+def _prep_stale_reasons(ctx: Path, cfg: dict, data: dict, owner: str) -> list[str]:
+    """Freshness gate for `checkpoint --for-clear` (CELE-t208). Returns the human-readable reasons the
+    card is NOT yet losslessly resumable after a /clear — an empty list means clean. This never touches
+    files; it only decides the verdict + exit code so an auto-clear (t209) can trust a 0 exit before it
+    pulls the trigger. The insight in state.md is model-authored prose a command can't invent — so the
+    gate verifies the model *did* freshen it, rather than pretending to do it for them."""
+    reasons: list[str] = []
+    stale_min = int(cfg.get("prep_stale_minutes", 20) or 20)
+
+    # 1. state.md — the Hot headline a resume reads first. It must exist, be authored (not the scaffold
+    #    placeholders), and have been rewritten recently: the pre-clear ritual is rewrite-then-checkpoint,
+    #    so a headline older than the staleness window means the model skipped the rewrite.
+    sm = ctx / "state.md"
+    if not sm.is_file():
+        reasons.append("state.md is missing — the Hot headline a resume reads first.")
+    else:
+        text = ""
+        try:
+            text = sm.read_text()
+        except OSError:
+            pass
+        # Both the raw template placeholders AND the scaffold's own "not authored yet" sentinel (the
+        # `celeborn scaffold` starter headline) count as un-authored — a /clear here resumes into a stub.
+        placeholders = ("<what we are working on", "<the single next concrete step>",
+                        "not a work focus yet")
+        if not text.strip():
+            reasons.append("state.md is empty — rewrite the Focus / Next action headline.")
+        elif any(p in text for p in placeholders):
+            reasons.append("state.md still holds the scaffold placeholders — author the real headline.")
+        else:
+            try:
+                age_min = (_dt.datetime.now()
+                           - _dt.datetime.fromtimestamp(sm.stat().st_mtime)).total_seconds() / 60
+                if age_min > stale_min:
+                    reasons.append(f"state.md last rewritten {int(age_min)}m ago (> {stale_min}m) — "
+                                   "freshen the headline so the resume isn't reading stale work.")
+            except OSError:
+                pass
+
+    # 2. session.json — focus + next_action are exactly what a fresh thread continues from; empty OR
+    #    still carrying the scaffold's starter text = the Hot tier was never authored this session.
+    scaffold_sentinels = ("no work focus set yet", "then rewrite state.md")
+    for field, flag in (("focus", "--focus"), ("next_action", "--next")):
+        val = (data.get(field) or "").strip()
+        label = "focus" if field == "focus" else "next action"
+        if not val:
+            reasons.append(f"session.json {label} is empty — set it ({flag}) so the resume knows where "
+                           "to pick up.")
+        elif any(s in val for s in scaffold_sentinels):
+            reasons.append(f"session.json {label} still carries the scaffold starter text — author it "
+                           f"({flag}) with the real state.")
+
+    # 3. The DOING card(s) this session owns must carry a REAL Stop condition, not the generic default —
+    #    the Stop point is the marker that says 'this is a clean place to clear'.
+    if owner:
+        for t in _doing_for_owner(_load_tasks(ctx), owner):
+            if (t.get("stop") or "").strip() == DEFAULT_STOP:
+                reasons.append(f"card {_display_tid(ctx, t['id'])} still carries the generic default Stop — "
+                               f"set a real one: celeborn tasks edit {t['id']} --stop \"…\".")
+    return reasons
+
+
+def _prep_for_clear(ctx: Path, args, reasons: list[str]) -> None:
+    """The mechanical half of `checkpoint --for-clear`: regenerate handoff.md and take a restorable
+    panic-save snapshot — ALWAYS, even when the gate fails, because the safety net must exist regardless
+    — then print the verdict. A clean gate exits 0 ('resumable'); a stale one exits 1 with the fix-list
+    so an auto-clear holds off. The `reasons` already drove session.json's stop_allowed in the caller."""
+    # handoff.md — the paste-into-a-fresh-thread resume prompt, regenerated from the just-written session.
+    try:
+        cmd_handoff(args)
+    except SystemExit:
+        raise
+    except Exception as e:                          # noqa: BLE001 — snapshot is the real safety net
+        warn(f"handoff regeneration skipped: {e}")
+    # panic-save — the deterministic restore point (survives a /clear regardless of the gate outcome).
+    snap = _do_panic_save(ctx, reason="prep-for-clear", session=_resolve_session(args))
+    m = _load_metrics(ctx)
+    m["panic_saves"] = int(m.get("panic_saves", 0) or 0) + 1
+    _save_metrics(ctx, m)
+    ok(f"pre-clear snapshot → .context/{PANIC_DIR}/{snap.get('stamp', '')}/ "
+       f"({len(snap.get('files', []))} files · restore: celeborn restore)")
+
+    if reasons:
+        warn(f"NOT yet losslessly resumable — {len(reasons)} thing(s) to fix before you /clear "
+             "(session marked stop_allowed=false):")
+        for r in reasons:
+            print(f"      • {r}")
+        warn("fix the above, then re-run `celeborn checkpoint --for-clear`.")
+        sys.exit(1)
+    ok("resumable — Hot tier fresh, handoff + snapshot written, Stop point set. Safe to /clear.")
+
+
 def cmd_checkpoint(args):
     """`celeborn checkpoint` — the safe way to update session.json. Loads the current file (repairing
     it from the template if it's missing or unparseable), applies only the flags you pass, stamps
     `updated_at`, clips over-long focus/next_action, and writes valid JSON. Run it with no flags to
     re-stamp and repair in place. This replaces hand-editing the raw JSON (the recurring corruption
-    source)."""
+    source). With `--for-clear` it becomes the pre-clear routine (CELE-t208): after writing session.json
+    it regenerates handoff, takes a restorable snapshot, and verify-gates that a /clear would lose
+    nothing — exiting nonzero with a fix-list when the Hot tier is stale."""
     ctx = require_context(args)
     cfg = load_config(ctx)
     sj = ctx / "session.json"
@@ -3847,6 +6299,16 @@ def cmd_checkpoint(args):
         data["stop_allowed"] = True
     if getattr(args, "no_stop_allowed", False):
         data["stop_allowed"] = False
+
+    for_clear = getattr(args, "for_clear", False)
+    stale_reasons: list[str] = []
+    if for_clear:
+        stale_reasons = _prep_stale_reasons(ctx, cfg, data, _claim_identity(args))
+        # The gate owns stop_allowed for a pre-clear checkpoint unless the caller forced it by hand:
+        # clean → safe to /clear, stale → not.
+        if not getattr(args, "stop_allowed", False) and not getattr(args, "no_stop_allowed", False):
+            data["stop_allowed"] = not stale_reasons
+
     data["updated_at"] = now_iso()
 
     clipped = _write_session(ctx, data, cfg)
@@ -3857,6 +6319,125 @@ def cmd_checkpoint(args):
              "put the long-form detail in state.md / notes.md.")
     fields = [f for f in ("focus", "next_action", "branch", "status") if data.get(f)]
     ok(f"checkpoint written → .context/session.json (updated_at + {', '.join(fields) or 'no fields'})")
+
+    if for_clear:
+        _prep_for_clear(ctx, args, stale_reasons)
+
+
+# ------------------------------------------------------------- auto-clear (CELE-t209, opt-in)
+
+def _autoclear_due(cfg: dict, cur: dict) -> bool:
+    """Whether a session's live window should trigger the opt-in OpenCode auto-clear: the feature is
+    on, the just-graded pressure is hard, and the per-session cooldown has lapsed. Pure predicate —
+    `record tokens` prints the due-marker off it, and `cmd_autoclear` re-checks it before acting."""
+    if not cfg.get("opencode_autoclear"):
+        return False
+    if cur.get("pressure") != "hard":
+        return False
+    at = (cur.get("autoclear_at") or "").strip()
+    if at:
+        try:
+            gap_min = (_dt.datetime.now() - _dt.datetime.fromisoformat(at)).total_seconds() / 60
+            if gap_min < float(cfg.get("autoclear_cooldown_minutes", 10) or 10):
+                return False
+        except ValueError:
+            pass
+    return True
+
+
+def _autoclear_brief(ctx: Path, data: dict, sid: str) -> str:
+    """The resume brief queued to the session's outbox before an auto-clear — what the coder reads
+    on its first post-compaction turn. Focus/next come from the just-checkpointed session.json; the
+    card marker makes claim-on-receipt re-assert the session→card link even if the compaction
+    summary mangled it."""
+    lines = [
+        "🏹 Celeborn auto-clear (CELE-t209): this session crossed the hard context threshold and "
+        "was compacted losslessly — your durable memory is on disk and re-injected every turn. "
+        "Resume the in-flight work now; no human step is coming.",
+        f"- Focus: {(data.get('focus') or '').strip() or '(see .context/state.md)'}",
+        f"- Next action: {(data.get('next_action') or '').strip() or '(see .context/state.md)'}",
+        "- Full resume prompt: .context/handoff.md (regenerated moments ago).",
+    ]
+    tid = _session_task_id(ctx, sid)
+    if tid:
+        card = _find_task(_load_tasks(ctx), tid)
+        if card is not None and card.get("state") == "doing":
+            stop = (card.get("stop") or "").strip()
+            lines.insert(1, f"- Your card: [{_display_tid(ctx, tid)}] {card['title']} — still yours "
+                            f"(DOING).{' Stop: ' + stop if stop else ''}")
+            lines.append("")
+            lines.append(_card_marker(tid, project_slug(ctx)))
+    return "\n".join(lines)
+
+
+def cmd_autoclear(args):
+    """`celeborn autoclear --session <sid>` — the decision step of the opt-in OpenCode seamless
+    clear-and-continue (CELE-t209). Called by the plugin at a turn boundary after `record tokens`
+    printed the due-marker; re-verifies everything (opt-in, still-hard pressure, cooldown), then
+    runs the t208 freshness gate. Verdicts on stdout, one machine-readable first line:
+      `autoclear: skip (…)`    — not due after all; the plugin does nothing.        exit 0
+      `autoclear: blocked — …` — Hot tier stale; fix-list follows, the plugin       exit 1
+                                 hands it to the coder so IT freshens and retries.
+      `autoclear: ready — …`   — handoff + snapshot written, resume brief queued    exit 0
+                                 to outbox/<sid6>.md, cooldown stamped; compact now."""
+    ctx = require_context(args)
+    cfg = load_config(ctx)
+    sid = _resolve_session(args)
+    if not sid:
+        die("autoclear requires --session <id> (or an ambient session)")
+    if not cfg.get("opencode_autoclear"):
+        print("autoclear: skip (disabled — set \"opencode_autoclear\": true in .celebornrc to opt in)")
+        return
+    m = _load_metrics(ctx)
+    caps = m.get("captures") if isinstance(m.get("captures"), dict) else {}
+    cur = dict(caps.get(sid) or {})
+    total = int(cur.get("tokens_session") or 0)
+    soft, hard = _context_thresholds(cfg)
+    cur["pressure"] = _pressure_level(total, soft, hard)
+    if cur["pressure"] != "hard":
+        print(f"autoclear: skip (pressure {cur['pressure']}, {total:,} tokens < hard {hard:,})")
+        return
+    if not _autoclear_due(cfg, cur):
+        print(f"autoclear: skip (cooldown — last attempt {cur.get('autoclear_at')})")
+        return
+
+    # The t208 freshness gate — the whole point of the blocked verdict: an auto-clear must never
+    # compact a session whose Hot tier would resume stale. The model fixes, then we retry.
+    sj = ctx / "session.json"
+    data: dict = {}
+    if sj.is_file():
+        try:
+            loaded = json.loads(sj.read_text())
+            data = loaded if isinstance(loaded, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            pass
+    reasons = _prep_stale_reasons(ctx, cfg, data, sid[:6])
+    if reasons:
+        print("autoclear: blocked — the Hot tier is stale; an auto-clear now would lose context. "
+              "Fix these, then it proceeds on its own:")
+        for r in reasons:
+            print(f"  • {r}")
+        print("  Then run: celeborn checkpoint --for-clear  (the gate re-checks at the next turn)")
+        sys.exit(1)
+
+    # Gate clean — the mechanical prep (mirrors _prep_for_clear, without its verdict wording).
+    try:
+        cmd_handoff(args)
+    except SystemExit:
+        raise
+    except Exception as e:                          # noqa: BLE001 — snapshot is the real safety net
+        warn(f"handoff regeneration skipped: {e}")
+    snap = _do_panic_save(ctx, reason="autoclear", session=sid)
+    m = _load_metrics(ctx)
+    m["panic_saves"] = int(m.get("panic_saves", 0) or 0) + 1
+    caps = m.get("captures") if isinstance(m.get("captures"), dict) else {}
+    cur = dict(caps.get(sid) or {})
+    cur["autoclear_at"] = now_iso()
+    _write_capture(m, caps, sid, cur)
+    _save_metrics(ctx, m)
+    slug = _outbox_queue(ctx, _autoclear_brief(ctx, data, sid), sid[:6], tag=" [autoclear]")
+    print(f"autoclear: ready — snapshot .context/{PANIC_DIR}/{snap.get('stamp', '')}/, resume brief "
+          f"→ outbox/{slug}.md; compact the session now.")
 
 
 def _parse_activity_meta(ctx: Path) -> dict:
@@ -4007,6 +6588,13 @@ def _fleet_project_snapshot(project_dir: Path) -> dict | None:
             # (when known) or is suppressed, never rendered as the owner (CELE-t172).
             "owner": _display_owner(owner, model, session_by_task.get(t["id"], "")),
             "owner_model": model,
+            # Live session short-id, the clean join key for the fleet living-card ticker (CELE-t349):
+            # SSE events carry full session ids, cards are owned by short ids — matchSession() bridges
+            # them. Owner alone is unreliable (a human handle isn't the session), so surface it directly.
+            "session": session_by_task.get(t["id"], ""),
+            # The card's Stop condition — the fleet living card renders it as the clean-/clear line,
+            # full anatomy parity with the Stage card (CELE-t349).
+            "stop": (t.get("stop") or "").strip(),
             "progress": t.get("progress") or 0,
             # Live session (recent transcript/capture/heartbeat) is never stale — touches are an
             # optional, releasable protocol, so a lapsed/released touch alone must not read stale.
@@ -4314,6 +6902,114 @@ def _display_owner(owner: str, model: str = "", session_id: str = "") -> str:
     return owner
 
 
+# The /clear-nudge band for a live context window, keyed by size in k tokens. Python mirror of
+# board/lib/band.ts — the single source both the hosted band pill and the active-agents chips use —
+# so the terminal board's per-card band matches the viewer's exactly (CELE-t206). Returns a colored
+# dot (the palette rendered as the nearest terminal emoji) plus the same one/two-word label.
+_PRESSURE_RANK = {"none": 0, "soft": 1, "hard": 2}
+
+
+def _pressure_level(tokens, soft: int, hard: int) -> str:
+    """Classify a live context size against the configurable soft/hard warning thresholds
+    (CELE-t207): "none" | "soft" | "hard". A threshold ≤ 0 is disabled. Pure — the single
+    decision point the remind warnings, the capture cursor flag, and the board chips all share."""
+    t = max(0, int(tokens or 0))
+    if hard and hard > 0 and t >= hard:
+        return "hard"
+    if soft and soft > 0 and t >= soft:
+        return "soft"
+    return "none"
+
+
+def _context_thresholds(cfg: dict, soft_override=None, hard_override=None) -> tuple[int, int]:
+    """Resolve the (soft, hard) context-pressure thresholds: an explicit CLI/hook override wins,
+    else the project's .celebornrc, else the built-in defaults (the band.ts clear bands)."""
+    try:
+        soft = int(soft_override if soft_override is not None else cfg.get("context_soft_tokens", 100_000) or 0)
+    except (TypeError, ValueError):
+        soft = 100_000
+    try:
+        hard = int(hard_override if hard_override is not None else cfg.get("context_hard_tokens", 125_000) or 0)
+    except (TypeError, ValueError):
+        hard = 125_000
+    return soft, hard
+
+
+def _pressure_line(tokens, level: str, soft: int, hard: int, clear_cmd: str) -> str:
+    """The context-pressure warning (CELE-t207) — the urgent sibling of `_remind_line`, spoken only
+    when a live window newly crosses a configured threshold. Hard names the stop-now stakes (it is
+    the future auto-clear trigger); soft asks for an orderly wrap-up. Same 🏹 channel, every surface."""
+    if level == "hard":
+        return (f"🏹 Celeborn —> ⛔ HARD context limit crossed: ~{tokens:,} tokens ≥ {hard:,}. "
+                f"Stop new work — checkpoint the Hot tier and {clear_cmd} NOW. "
+                f"State is saved; nothing will be lost.")
+    return (f"🏹 Celeborn —> ⚠ Context pressure: ~{tokens:,} tokens ≥ the soft limit ({soft:,}). "
+            f"Wrap the current step, checkpoint, then {clear_cmd} — sooner is cheaper.")
+
+
+def _context_band(k: int) -> tuple[str, str]:
+    if k < 50:
+        return ("🟢", "fresh")
+    if k < 75:
+        return ("🔵", "mid")
+    if k < 100:
+        return ("🟠", "clear soon")
+    if k < 125:
+        return ("🟡", "clear now")
+    return ("🔴", "clear urgent")
+
+
+def _doing_card_annotation(tokens: int | None, session: str, model: str, owner: str,
+                           pressure: str = "none") -> str:
+    """The live triple the text board writes onto a DOING card (CELE-t206, closes CELE-t163): the
+    context-window size + /clear-nudge band, the working session's short id, and the coder model.
+    Plus, when the window has crossed a configured context-pressure threshold (CELE-t207), an
+    explicit ⚠/⛔ limit chip — the band words track fixed bands, the chip tracks the project's
+    configurable soft/hard limits, so they stay honest independently.
+
+    Automatic for EVERY doing card — the data rides the live agent join (`_active_agents`), never the
+    explicit `celeborn claim` alone, so a prompt-autogenerated card shows it too (the t163 bug). Each
+    part renders only when known, so a card with no live window degrades to '' — no phantom band, and
+    the session id never shoves out to the right where tokens used to sit (the other half of t163).
+    The session chip is suppressed when the owner handle already IS that short id (no `@d4ea23 · d4ea23`)."""
+    parts: list[str] = []
+    if tokens:
+        k = tokens // 1000
+        emoji, word = _context_band(k)
+        parts.append(f"~{k}k ctx {emoji} {word}")
+        if pressure == "hard":
+            parts.append("⛔ hard limit")
+        elif pressure == "soft":
+            parts.append("⚠ soft limit")
+    sid = (session or "").strip()
+    if sid and sid != (owner or "").strip():
+        parts.append(sid)
+    model = (model or "").strip()
+    if model:
+        parts.append(model)
+    return ("  · " + " · ".join(parts)) if parts else ""
+
+
+def _doing_context_join(ctx: Path) -> tuple[dict[str, int], dict[str, str], dict[str, str]]:
+    """Per-DOING-card live context, joined off `_active_agents` exactly like the fleet snapshot and
+    the hosted band pill (CELE-t206): {task_id: tokens} (fullest window wins), {task_id: session
+    short-id}, and {task_id: pressure level} graded against the configured soft/hard thresholds
+    (CELE-t207). Shared so the terminal board and the JSON projection can't drift apart."""
+    tokens_by_task: dict[str, int] = {}
+    session_by_task: dict[str, str] = {}
+    for r in _active_agents(ctx, AGENT_ACTIVE_WINDOW_MIN, False):
+        tid = r.get("task_id")
+        if not tid:
+            continue
+        tokens_by_task[tid] = max(tokens_by_task.get(tid, 0), int(r.get("tokens") or 0))
+        sid = (r.get("session") or "")[:6]
+        if sid and tid not in session_by_task:
+            session_by_task[tid] = sid
+    soft, hard = _context_thresholds(load_config(ctx))
+    pressure_by_task = {tid: _pressure_level(tok, soft, hard) for tid, tok in tokens_by_task.items()}
+    return tokens_by_task, session_by_task, pressure_by_task
+
+
 def _cc_project_dir(repo: Path) -> Path:
     """Where Claude Code stores `<session>.jsonl` transcripts for `repo`: ~/.claude/projects/<enc>,
     with <enc> the repo's absolute path and every non-alphanumeric char replaced by '-' (CC's rule)."""
@@ -4417,6 +7113,7 @@ def _active_agents(ctx: Path, window_min: float, show_all: bool) -> list[dict]:
     """One row per live context window for this repo (see the section header). Sorted fullest-first."""
     cfg = load_config(ctx)
     cpt = int(cfg.get("chars_per_token", 4)) or 4
+    soft, hard = _context_thresholds(cfg)   # context-pressure grading for every row (CELE-t207)
     repo = ctx.parent
     slug = project_slug(ctx)
     _m = _load_metrics(ctx)
@@ -4446,19 +7143,55 @@ def _active_agents(ctx: Path, window_min: float, show_all: bool) -> list[dict]:
             card = by_id.get((link.get("task") or "").strip())
             if card is not None and card.get("state") not in ("doing",):
                 card = None                   # the card was shipped/moved — don't keep claiming it
+            est = _estimate_transcript_tokens(tp, cpt)
             rows.append({
                 # The session id IS the agent's name (CELE-t131): show its short head ("d0c13a"), not
                 # "session d0c13a". A real handle (CELEBORN_AGENT / claim) still wins and renders "@handle".
                 "agent": owner or sid[:6],
                 "task": _display_tid(ctx, card["id"], cfg=cfg, slug=slug) if card else None,
                 "task_id": card["id"] if card else None,
-                "tokens": _estimate_transcript_tokens(tp, cpt),
+                "tokens": est,
                 "session": sid[:8],
                 "last_active": _dt.datetime.fromtimestamp(mtime).strftime("%Y-%m-%dT%H:%M:%S"),
                 "age_min": round(age_min, 1),
                 "owned": bool(owner),
                 "project": slug,
+                "pressure": _pressure_level(est, soft, hard),
             })
+    # Transcript-less live windows (P4, CELE-t141): a harness that reports REAL token usage
+    # (`celeborn record tokens` — the OpenCode plugin, per assistant message) stamps captures[sid]
+    # with live=True + updated_at. Those sessions are context windows every bit as real as a Claude
+    # transcript, so emit them as rows too — same shape, same bands. A Claude session's cursor never
+    # carries `live`, so no window is ever double-counted.
+    caps = _m.get("captures") if isinstance(_m.get("captures"), dict) else {}
+    for sid, cur in caps.items():
+        if not isinstance(cur, dict) or not cur.get("live") or sid in ended:
+            continue
+        ts = _parse_dt(str(cur.get("updated_at") or ""))
+        if ts is None:
+            continue
+        age_min = (now - ts.timestamp()) / 60.0
+        if not show_all and age_min > window_min:
+            continue
+        link = sessions_map.get(sid) or {}
+        owner = (link.get("owner") or "").strip()
+        if _looks_like_session_id(owner):
+            owner = ""
+        card = by_id.get((link.get("task") or "").strip())
+        if card is not None and card.get("state") not in ("doing",):
+            card = None
+        rows.append({
+            "agent": owner or sid[:6],
+            "task": _display_tid(ctx, card["id"], cfg=cfg, slug=slug) if card else None,
+            "task_id": card["id"] if card else None,
+            "tokens": int(cur.get("tokens_session") or 0),
+            "session": sid[:8],
+            "last_active": str(cur.get("updated_at") or ""),
+            "age_min": round(age_min, 1),
+            "owned": bool(owner),
+            "project": slug,
+            "pressure": _pressure_level(int(cur.get("tokens_session") or 0), soft, hard),
+        })
     rows.sort(key=lambda r: r["tokens"], reverse=True)
     return rows
 
@@ -4874,6 +7607,102 @@ def _count_allowlist_auto_allowed(turns: list, allow: list, exclude_names: set) 
     return n
 
 
+# --- transcript-less activity (P4, CELE-t141) ---------------------------------------------------
+# OpenCode has no Claude-style transcript for `celeborn capture` to ingest, but its plugin DOES
+# report every completed tool call (tool.execute.after / file.edited → `hook post-tool-use`). These
+# helpers keep the transcript capture's two Hot surfaces — the rolling window (auto/window.json) and
+# activity.md — current for transcript-less sessions too, so orient's "what actually happened"
+# backstop works there. Only the digest FACTS are recorded (prompt heads, files, command heads);
+# there is no faithful event stream to archive without a transcript.
+
+def _oc_load_window(ctx: Path) -> list:
+    win_path = ctx / "auto" / "window.json"
+    if win_path.is_file():
+        try:
+            return json.loads(win_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return []
+    return []
+
+
+def _oc_save_window(ctx: Path, window: list, sid8: str) -> None:
+    cfg = load_config(ctx)
+    window = window[-int(cfg.get("activity_window_turns", 15)):]
+    autod = ctx / "auto"
+    autod.mkdir(parents=True, exist_ok=True)
+    (autod / "window.json").write_text(json.dumps(window, indent=2) + "\n")
+    _write_activity_digest(ctx, window, sid8, int(cfg.get("activity_max_lines", 40)))
+
+
+def _oc_redact(ctx: Path, s: str) -> str:
+    try:
+        from celeborn_sync import redact
+        return redact(s or "", load_config(ctx).get("secret_patterns", []))[0]
+    except Exception:
+        return s or ""
+
+
+def _record_turn_prompt(ctx: Path, sid: str, prompt: str) -> None:
+    """Open a fresh window entry at the user-turn boundary (the transcript capture's analog of a
+    new `turn`), so this turn's reported tool calls fold into one bounded fact row."""
+    sid8 = (sid or "session")[:8]
+    window = _oc_load_window(ctx)
+    window.append({"ts": now_iso(), "prompt": _oc_redact(ctx, prompt).replace("\n", " ").strip()[:200],
+                   "files": [], "commands": [], "commits": [], "tests": [], "sid": sid8})
+    _oc_save_window(ctx, window, sid8)
+
+
+def _record_tool_activity(ctx: Path, sid: str, tool: str, inp: dict) -> None:
+    """Fold one reported tool call into the current window entry (same-session tail entry, else a
+    new one — a tool call can arrive before any prompt was seen, e.g. right after plugin install).
+    Only the shapes the digest records: file paths from file tools, command heads from Bash — a
+    read's filePath must never masquerade as an edit."""
+    fp = (str(inp.get("file_path") or inp.get("filePath") or inp.get("notebook_path") or "").strip()
+          if tool in _FILE_TOOLS else "")
+    cmd = str(inp.get("command") or "").strip() if tool == "Bash" else ""
+    if not fp and not cmd:
+        return
+    sid8 = (sid or "session")[:8]
+    window = _oc_load_window(ctx)
+    cur = window[-1] if window and isinstance(window[-1], dict) and window[-1].get("sid") == sid8 else None
+    if cur is None:
+        cur = {"ts": now_iso(), "prompt": "", "files": [], "commands": [], "commits": [],
+               "tests": [], "sid": sid8}
+        window.append(cur)
+    if fp and fp not in cur["files"] and len(cur["files"]) < 50:
+        cur["files"].append(fp)
+    if cmd and len(cur["commands"]) < 50:
+        cur["commands"].append(_oc_redact(ctx, cmd).splitlines()[0][:200])
+    _oc_save_window(ctx, window, sid8)
+
+
+def _auto_touch_for_session(ctx: Path, sid: str, path_str: str) -> None:
+    """Auto-register a touch for a transcript-less harness edit (P4): the board's active-file chips
+    must not depend on a fast non-thinking model remembering the touch protocol. Attribution mirrors
+    the claim path — the agent_sessions link's owner when the session is signed in, else the session
+    short id (the session IS the agent's name, CELE-t131-B). Registers MY record alongside any peer
+    already on the file (schema/2, CELE-t309) — a same-owner re-edit just freshens my timestamp, and
+    a peer's touch stays visible instead of being clobbered. Best-effort: any failure degrades to no
+    touch, never a broken hook."""
+    try:
+        relpath = _resolve_repo_relpath(ctx.parent, path_str)
+        link = (_load_metrics(ctx).get("agent_sessions") or {}).get(sid) or {}
+        owner = (link.get("owner") or "").strip() or (sid or "")[:6]
+        if not owner:
+            return
+        data = _load_touches(ctx)
+        files = data.setdefault("files", {})
+        recs = files.setdefault(relpath, [])
+        prev = next((m for m in recs if _touch_by(m) == owner), {}) or {}
+        _upsert_toucher(recs, {
+            "by": owner, "family": prev.get("family", ""), "model": prev.get("model", ""),
+            "at": now_iso(), "task": _session_task_id(ctx, sid),
+            "why": prev.get("why") or "auto: opencode edit"})
+        _save_touches(ctx, data)
+    except Exception:
+        pass
+
+
 def cmd_capture(args):
     ctx = find_or_create_context(args)
     cfg = load_config(ctx)
@@ -5007,12 +7836,22 @@ def cmd_capture(args):
         __import__("celeborn_jira").flush_auto_push(ctx, quiet=True)
     except Exception:
         pass
+    try:
+        __import__("celeborn_github").flush_auto_push(ctx, quiet=True)  # CELE-t214
+    except Exception:
+        pass
     # Keep the hosted active-agents token chips tracking this live window between card mutations
     # (CELE-t131) — throttled + detached, a no-op when hosted sync isn't configured / signed in.
     try:
         __import__("celeborn_sync").schedule_agents_push(ctx)
     except Exception:
         pass  # hosted liveness is best-effort — never break capture
+    # Self-heal the Hot/Warm tiers: FIFO over-budget journal + state.md history into cold archives so
+    # they don't balloon the Orient load. No-op once under budget; never blocks capture.
+    try:
+        _auto_archive(ctx, cfg)
+    except Exception:
+        pass
 
 
 def cmd_heartbeat(args):
@@ -5032,7 +7871,12 @@ def cmd_heartbeat(args):
         return                                   # nothing captured yet this machine — stay silent
     total = int(cap.get("tokens_session") or 0)
     delta = int(cap.get("last_delta") or 0)
-    line = f"🏹 Celeborn —> {total:,} tokens recorded this session"
+    if cap.get("live"):
+        # A live-reported window (P4, CELE-t141: `celeborn record tokens`, OpenCode) — the number IS
+        # the context size the model just saw, not "content banked so far"; word it that way.
+        line = f"🏹 Celeborn —> ~{total:,} tokens in the live context window"
+    else:
+        line = f"🏹 Celeborn —> {total:,} tokens recorded this session"
     if delta > 0:
         line += f" · +{delta:,} last turn"
     print(line)
@@ -5086,6 +7930,9 @@ HOOK_EVENTS = {
     "quality-stop": "Stop",          # full suite once per turn when test-relevant files changed
     # Safety guard (t101) — installed by `wire`. Blocks an un-approvable `cd … > rel/file` compound.
     "pre-tool-use": "PreToolUse",    # steer shell redirection → the Write/Edit tool
+    # Transcript-less touch + activity (P4, CELE-t141) — never wired for Claude Code (its transcript
+    # capture already records every tool call); the OpenCode plugin shells it on tool.execute.after.
+    "post-tool-use": "PostToolUse",
 }
 
 # The checkpoint reminder the PreCompact hook prints (was hooks/pre-compact.sh's heredoc).
@@ -5093,8 +7940,10 @@ PRECOMPACT_MSG = (
     "[celeborn] Compaction imminent. CHECKPOINT now before context is summarized:\n"
     "  1. Rewrite .context/state.md in place (Now / Next action / Open threads).\n"
     "  2. Append one entry to the bottom of .context/journal.md (what + evidence + next).\n"
-    "  3. Run: celeborn checkpoint --focus \"...\" --next \"...\" --status \"...\"  "
-    "(safely updates session.json — valid JSON, auto-clips; never hand-edit the raw file).\n"
+    "  3. Run: celeborn checkpoint --for-clear --focus \"...\" --next \"...\" --status \"...\"  "
+    "(the one-command pre-clear routine: writes session.json, regenerates handoff, takes a restore "
+    "snapshot, and verify-gates the Hot tier — it exits nonzero with a fix-list if a /clear would "
+    "still lose work).\n"
     "Anything not written to .context/ will be lost on compaction."
 )
 
@@ -5133,7 +7982,8 @@ def _hook_run(fn, **ns) -> str:
 
 
 def _compose_user_prompt_envelope(heartbeat: str, nudge: str, handoff: str = "", claim: str = "",
-                                  directive: str = "", progress_nudge: str = "", arch_notice: str = "") -> str:
+                                  directive: str = "", progress_nudge: str = "", arch_notice: str = "",
+                                  intents: str = "") -> str:
     """Build the UserPromptSubmit JSON envelope (was the python3 tail of hooks/context-watch.sh).
 
     `additionalContext` is delivered to the MODEL only — never painted for the user on any surface
@@ -5159,6 +8009,14 @@ def _compose_user_prompt_envelope(heartbeat: str, nudge: str, handoff: str = "",
             "orient. Identify yourself in your reply (who claimed this). Before future autonomous "
             "claims, read the board and avoid cards that would interrupt in-flight work. Work these "
             "cards as the user's request for this turn:]\n" + claim)
+    if intents:
+        parts.append(
+            "[Celeborn blackboard intents — inter-agent commit choreography (CELE-t303). Context for "
+            "your commit planning, do NOT surface verbatim — ACT on it: a peer agent has declared a "
+            "planned commit overlapping files YOU are touching. Do not commit the overlapping files "
+            "this turn without coordinating — wait for the peer's intent to clear (`celeborn intent "
+            "list`), or agree an order. Declare your own planned commit with `celeborn intent "
+            "\"<what>\" --task <id> --eta <mins>` so peers hold for you too:]\n" + intents)
     if heartbeat:
         parts.append("[Celeborn heartbeat — context only, do NOT surface this to the user]\n" + heartbeat)
     if progress_nudge:
@@ -5178,8 +8036,10 @@ def _compose_user_prompt_envelope(heartbeat: str, nudge: str, handoff: str = "",
             "rehydrate\". That promise only holds if the Hot tier is fresh RIGHT NOW — so before you relay "
             "the line below, checkpoint the authored Hot tier so a /clear or compaction loses nothing:\n"
             "  1. Rewrite .context/state.md in place (Now / Next action / Open threads) to reflect this turn.\n"
-            "  2. Run: celeborn checkpoint --focus \"...\" --next \"...\" --status \"...\"  "
-            "(safely updates session.json — valid JSON, auto-clips; never hand-edit the raw file).\n"
+            "  2. Run: celeborn checkpoint --for-clear --focus \"...\" --next \"...\" --status \"...\"  "
+            "(the one-command pre-clear routine: updates session.json, regenerates handoff, takes a "
+            "restore snapshot, and verify-gates that a /clear loses nothing — it exits nonzero with a "
+            "fix-list if the Hot tier is still stale).\n"
             "  3. If meaningful work landed since the last entry, append one line to .context/journal.md.\n"
             "Skip a step only if it is already current. THEN, because the user is likely on a surface (e.g. "
             "the Claude desktop app) where hook output is invisible to them and only your reply is shown, "
@@ -5413,6 +8273,14 @@ def _session_owns_live_card(ctx: Path, sid: str) -> bool:
                if (t.get("state") or "") in ("doing",))
 
 
+def _card_gate_enabled(ctx: Path) -> bool:
+    """The `card_gate` config switch (CELE-t352, default True): when False the whole card-less-work
+    gate (t131/t140) stands down — no PreToolUse deny, no directive, no opencode auto-provision. The
+    operator sets it from the board's OpenCode Settings section; a fresh project keeps today's
+    always-on enforcement."""
+    return bool(load_config(ctx).get("card_gate", True))
+
+
 def _card_gate_status(ctx: Path, sid: str) -> str:
     """Classify a session for the card-less-work gate (t131):
       'ok'    — owns a live card, or the bypass env is armed → never gate.
@@ -5470,20 +8338,146 @@ def _cardless_deny(sid: str) -> str:
     )
 
 
-def _card_gate_pre_tool_use(payload: dict, project_dir: str) -> str:
+# --------------------------------------------------------------------------- PM auto-provision (t211)
+#
+# Under the OpenCode harness there is no human at a permission prompt — the deny/steer loop above
+# costs a non-thinking coder whole turns. So there the PM (this deterministic plumbing, acting for
+# the operator who installed the platform) resolves a card-less coder itself, at the moment it
+# starts substantive work: claim the card already assigned to the session (owner == sid6, staged
+# ahead of a t213 dispatch), else create a fresh `auto` card titled from the session's last
+# recorded prompt — and let the tool call through. The board stays truthful without human clicks,
+# and the coder NEVER hits the gate (contract t203 §1.3: the agent_sessions link is written at bind
+# time, which is also what lifts the gate for the rest of the session). Claude Code (and every
+# prompting harness) keeps the deny/steer behavior above unchanged — there the human IS present.
+#
+# Autonomy of an auto-provisioned card: `research,edits,tests` — everything a working coder needs
+# to keep working, but NEVER `commit` (t203 §3.4: git-write is opt-in, never implied). Without a
+# grant set, an ungroomed card under opencode denies everything (t212), which would just move the
+# coder's dead-end from the card gate to the autonomy gate. Evaluated lazily — AUTONOMY_GRANTS is
+# defined in the autonomy-gate section below this one.
+def _autoprovision_grants() -> list[str]:
+    return [g for g in AUTONOMY_GRANTS if g != "commit"]
+
+
+def _oc_last_prompt(ctx: Path, sid: str) -> str:
+    """The most recent user prompt this session recorded in the transcript-less activity window
+    (`_record_turn_prompt`, P4) — the PM's only deterministic signal of what the coder was asked to
+    do; used to title an auto-provisioned card. '' when the session never recorded a prompt."""
+    sid8 = (sid or "session")[:8]
+    for entry in reversed(_oc_load_window(ctx)):
+        if isinstance(entry, dict) and entry.get("sid") == sid8 and (entry.get("prompt") or "").strip():
+            return str(entry["prompt"]).strip()
+    return ""
+
+
+def _autoprovision_title(ctx: Path, sid: str, payload: dict) -> str:
+    """Title for an auto-provisioned card: the session's last recorded prompt (first line, bounded),
+    else a description of the triggering tool call — never empty, never multi-line."""
+    prompt = _oc_last_prompt(ctx, sid)
+    if prompt:
+        line = prompt.splitlines()[0].strip()
+        return (line[:95] + "…") if len(line) > 96 else line
+    ti = payload.get("tool_input") or {}
+    fp = str(ti.get("file_path") or ti.get("filePath") or ti.get("notebook_path") or "").strip()
+    tool = (payload.get("tool_name") or "work").strip().lower()
+    return f"Auto: untitled coder-session {tool}" + (f" on {Path(fp).name}" if fp else "")
+
+
+def _pm_autoprovision(ctx: Path, sid: str, payload: dict) -> str:
+    """PM auto-provision (CELE-t211, contract t203 §1.3/§5): put a card-less working coder on the
+    board without blocking it. Claim path first — a todo card already ASSIGNED to this session
+    (owner == sid6: staged for it, but the coder started working instead of pasting the marker);
+    else CREATE a fresh `auto`-tagged card titled from the session's last recorded prompt. Either
+    way the card goes doing, the §1.3 agent_sessions link is written at bind time, and the returned
+    model-facing provenance line becomes the allow reason ('' = could not provision — the caller
+    falls back to the deny). An assigned card keeps its groomed autonomy; only an ungroomed one
+    (which under opencode would deny everything, t212) gets the default grants."""
+    sid = (sid or "").strip()
+    if not sid:
+        return ""
+    owner = sid[:6]
+    tasks = _load_tasks(ctx)
+    t = next((x for x in tasks if (x.get("owner") or "").strip() == owner
+              and (x.get("state") or "") == "todo"), None)
+    created = t is None
+    if created:
+        stamp = now_iso()
+        t = {"id": _next_task_id(tasks), "title": _autoprovision_title(ctx, sid, payload),
+             "state": "todo", "owner": owner, "tags": ["auto"], "blocked_by": [], "phase": "",
+             "stop": DEFAULT_STOP, "autonomy": _autoprovision_grants(), "progress": 0,
+             "jira": "", "github": "", "created": stamp, "updated": stamp, "subtasks": [],
+             "notes": ("Auto-provisioned by the Celeborn PM (CELE-t211): this session began "
+                       "substantive work with no board card. Groom me — sharpen the title, set a "
+                       "real Stop condition, add blocked_by edges if this work depends on other "
+                       "cards. git-write is NOT granted (t203 §3.4): the operator opts in with "
+                       "--autonomy research,edits,tests,commit.")}
+        tasks.append(t)
+    if not t.get("autonomy"):
+        t["autonomy"] = _autoprovision_grants()
+    t["state"] = "doing"
+    t["updated"] = now_iso()
+    _progress_stamp_claim(ctx, t)                      # CELE-t161: engine floor 5 on going doing
+    tasks = _bring_to_state_front(tasks, t["id"])
+    _save_tasks(ctx, tasks, autopush_ids=[t["id"]])
+    _record_agent_session(ctx, sid, owner, [t["id"]])  # the §1.3 binding rule — written at bind time
+    try:
+        __import__("celeborn_sync").schedule_agents_push(ctx, min_interval_s=0)
+    except Exception:  # noqa: BLE001
+        pass
+    disp = _display_tid(ctx, t["id"])
+    verb = (f"auto-provisioned [{disp}] \"{t['title']}\" and claimed it" if created
+            else f"auto-claimed [{disp}] \"{t['title']}\" — the card already assigned to this session")
+    return (
+        f"🏹 Celeborn PM {verb} for you (owner @{owner}, CELE-t211): you began substantive work "
+        f"with no board card, so the PM put the board right instead of blocking you. Groom the card "
+        f"as you work: `celeborn tasks edit {t['id']} --title \"…\" --stop \"…\"` (plus --blocked-by "
+        f"edges if this depends on other cards), and `celeborn ship {t['id']}` when done. Autonomy: "
+        f"{','.join(t['autonomy'])} — git-write (commit) stays OFF until the operator grants it."
+    )
+
+
+def _card_gate_pre_tool_use(payload: dict, project_dir: str, harness: str = "") -> str:
     """PreToolUse card-less-work gate (CELE-t131 lever 2, widened in CELE-t134). Hard-DENY any tool in
     `_CARD_GATED_TOOLS` (edits + web research + subagent spawn) when this session owns no live board card
     and the board has an open one to claim. No-op outside a Celeborn project, when the bypass env is
     armed, or when the board is empty (nothing to claim). Unlike the redirect guard this needs the
     `.context/` — but only after the cheap tool-name filter, so ungated calls still return in
-    microseconds."""
+    microseconds.
+
+    Under the OpenCode harness (CELE-t211) a card-less coder is AUTO-PROVISIONED instead of denied —
+    including on an empty board, where other harnesses stay exempt ('add one'): with no human in the
+    loop, silence would just mean off-board work. Subagent sessions are excluded (contract t203 §1.2:
+    child sessions never register identity or claim cards — the plugin marks them `child`); they keep
+    the deny."""
     if (payload.get("tool_name") or "") not in _CARD_GATED_TOOLS:
         return ""
     ctxdir = find_context_root(Path(project_dir))
     if ctxdir is None:
         return ""                                      # not a Celeborn project — never gate
+    if not _card_gate_enabled(ctxdir):
+        return ""                                      # card_gate turned off in Settings (CELE-t352)
     sid = payload.get("session_id") or ""
-    if _card_gate_status(ctxdir, sid) != "gated":
+    status = _card_gate_status(ctxdir, sid)
+    if status == "ok":
+        return ""
+    if harness == "opencode" and not payload.get("child_session"):
+        try:
+            notice = _pm_autoprovision(ctxdir, sid, payload)
+        except Exception:  # noqa: BLE001
+            notice = ""                                # provisioning must never crash the gate — deny instead
+        if notice:
+            # The provisioned card's own autonomy grants still bound THIS call (a pre-assigned
+            # narrowly-groomed card must not widen just because the gate claimed it) — deny wins,
+            # and it already names the card and the grooming command.
+            autonomy = _autonomy_gate_pre_tool_use(payload, project_dir, harness)
+            if autonomy:
+                return autonomy
+            return json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": notice,
+            }})
+    if status != "gated":
         return ""
     return json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
@@ -5492,13 +8486,208 @@ def _card_gate_pre_tool_use(payload: dict, project_dir: str) -> str:
     }})
 
 
-def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
+# --------------------------------------------------------------------------- per-card autonomy gate (t212)
+#
+# WS-B of the autonomy program (contract t203 §3.4): each card may carry an `autonomy` grant list —
+# a subset of AUTONOMY_GRANTS, set on the kanban at GROOMING time — that bounds what its owning
+# session may do without a human. The gate is DENY-ONLY, deliberately: it never emits "allow", so a
+# plain-text board field can bound work below the harness's own permission layer but can never
+# bypass it (an agent editing its own card's grants gains nothing a harness prompt wouldn't ask).
+# Silence = granted: in Claude Code the normal permission prompts still apply; in OpenCode — where
+# the plugin's tool.execute.before throw IS the whole permission system (no OS prompts) — silence
+# is what makes a groomed card runnable overnight.
+#
+# Absent field (per §3.4, "most restrictive interpretation"): under the opencode harness an
+# ungroomed card grants NOTHING — every gated class denies until grooming grants it. Under Claude
+# (and every prompting harness) an absent field keeps the gate silent so the harness's own
+# permission system governs, exactly as before this gate existed — "risky ops confirmed" is the
+# operator answering the prompt. Unknown tokens in a hand-edited field grant nothing (same clause);
+# `commit` (= git-write, the headline toggle) is never implied by any other grant.
+AUTONOMY_GRANTS = ("research", "edits", "tests", "commit")
+# `commit` is the one git-write grant — deliberately amber (`risk`) and never on by default (t203 §3.4).
+_AUTONOMY_GRANT_RISK = {"commit"}
+# Night-question behaviour: what a raised hand does while the operator sleeps (t144 mockup :559-568).
+AUTONOMY_NIGHT_QUESTIONS = (
+    ("queue", "Queue for the morning report"),
+    ("notify", "Push notification, wait 10 min, then queue"),
+    ("block", "Block the card until answered"),
+)
+# The head-elf model that stamps READY / dispatches / raises hands (t144 mockup :577-586).
+AUTONOMY_PM_MODELS = (
+    # Key is a stored settings enum (stable across configs); the label tracks the real weave tag —
+    # Pippin · PM = qwen3:4b-instruct (CELE-t373; the old `qwen-4b` alias is retired, CELE-t374).
+    ("qwen-4b-local", "Pippin · qwen3:4b-instruct · local"),
+    ("haiku-hosted", "Haiku 4.5 · hosted"),
+    ("off", "Off — I dispatch manually"),
+)
+AUTONOMY_ELVES_MIN, AUTONOMY_ELVES_MAX = 1, 12
+# Ship pre-flight is the spine's load-bearing discipline: a card can't ship until the next spine head is
+# startable verbatim. Deliberately LOCKED on — surfaced read-only, never a board-toggleable field (t144).
+AUTONOMY_SHIP_PREFLIGHT_LOCKED = True
+AUTONOMY_SHIP_PREFLIGHT_WHY = "Always on — the spine depends on it"
+# Tool-name → grant class, lowercase so one table covers Claude tool names (Edit/WebFetch/Task…)
+# and OpenCode's built-ins (edit/write/patch/webfetch/task — plan §2.1 normalization table).
+_AUTONOMY_TOOL_CLASS = {
+    "edit": "edits", "write": "edits", "notebookedit": "edits", "patch": "edits",
+    "webfetch": "research", "websearch": "research", "task": "research", "agent": "research",
+}
+# Bash test-runner shapes → the `tests` grant. Non-exhaustive by design: a miss just means the
+# command falls through to the harness's own permission layer, never a silent over-grant.
+_TEST_RUN_RE = re.compile(
+    r"(?:^|[;&|(\s])"
+    r"(?:pytest\b|py\.test\b"
+    r"|python\d?(?:\.\d+)?\s+-m\s+(?:pytest|unittest|tox|nose2?)\b"
+    r"|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?tests?\b\S*"
+    r"|(?:deno|cargo|go|dotnet|swift)\s+test\b"
+    r"|jest\b|vitest\b|mocha\b|ava\b|tox\b|nox\b|rspec\b|phpunit\b|ctest\b"
+    r"|playwright\s+test\b|cypress\s+run\b"
+    r"|mvn\s+(?:\S+\s+)*test\b|gradlew?\s+(?:\S+\s+)*test\b"
+    r"|make\s+(?:\S+\s+)*(?:test|check)\b"
+    r")", re.I)
+# One git invocation: optional pre-subcommand global options (`-C <dir>`, `-c k=v`, `--git-dir=…`,
+# bare `--flags`), then the subcommand, then the rest of that command segment.
+_GIT_INVOCATION_RE = re.compile(
+    r"\bgit"
+    r"((?:\s+(?:-[Cc]\s+\S+|--(?:git-dir|work-tree|namespace|exec-path)(?:=\S+|\s+\S+)?|--?[A-Za-z-]+))*)"
+    r"\s+([a-z][a-z-]*)"
+    r"([^;&|\n]*)")
+# Subcommands that mutate history / the remote / the working tree whatever their arguments. `add`
+# rides along: staging exists only to feed a commit. fetch/status/diff/log/show/… are absent — reads
+# never gate, so a no-`commit` card can always orient.
+_GIT_WRITE_UNCONDITIONAL = frozenset((
+    "commit", "push", "pull", "merge", "rebase", "cherry-pick", "revert", "reset", "restore",
+    "switch", "checkout", "clean", "am", "apply", "add", "rm", "mv",
+    "filter-branch", "update-ref", "replace"))
+# Dual-mode subcommands: WRITE unless the rest of the segment starts with a read form. First-token
+# heuristic on purpose — ambiguity resolves toward write (§3.4 most-restrictive), never toward a
+# silent pass. notes/worktree/submodule are deliberately unlisted (rare, low-harm); the harness
+# permission layer still sees them.
+_GIT_READ_REST = {
+    "stash":  re.compile(r"^\s+(?:list|show)\b"),
+    "tag":    re.compile(r"^\s*$|^\s+(?:-l\b|-n\d*\b|--list\b|--contains\b|--points-at\b|--merged\b|--no-merged\b|--sort|--format)"),
+    "branch": re.compile(r"^\s*$|^\s+(?:-[arv]+\b|-l\b|--list\b|--show-current\b|--contains\b|--merged\b|--no-merged\b|--points-at\b|--sort|--format|--column|--color)"),
+    "remote": re.compile(r"^\s*$|^\s+(?:-v\b|show\b|get-url\b)"),
+    "config": re.compile(r"^\s+(?:--get\b|--get-all\b|--get-regexp\b|--list\b|-l\b|--show-origin\b)"),
+}
+
+
+def _is_git_write(cmd: str) -> bool:
+    """True when any git invocation in `cmd` mutates history, the remote, config, or the working
+    tree — the `commit` grant's scope (the git-write toggle, off by default). Quoted-string false
+    positives are accepted: the gate errs restrictive, and the deny message names the exact grant."""
+    for m in _GIT_INVOCATION_RE.finditer(cmd or ""):
+        verb, rest = m.group(2), m.group(3)
+        if verb in _GIT_WRITE_UNCONDITIONAL:
+            return True
+        read_re = _GIT_READ_REST.get(verb)
+        if read_re is not None and not read_re.match(rest):
+            return True
+    return False
+
+
+def _bash_autonomy_class(cmd: str) -> str:
+    """Grant class of one Bash command: git-write → 'commit' (checked first — the more restrictive
+    class wins a compound like `git commit && npm test`), test-runner → 'tests', anything else → ''
+    (never gated, so `celeborn`/orient/read commands always flow)."""
+    if not cmd:
+        return ""
+    if _is_git_write(cmd):
+        return "commit"
+    if _TEST_RUN_RE.search(cmd):
+        return "tests"
+    return ""
+
+
+def _autonomy_class(payload: dict) -> str:
+    """The AUTONOMY_GRANTS class this tool call needs, or '' when it is never autonomy-gated."""
+    tool = (payload.get("tool_name") or "").strip().lower()
+    cls = _AUTONOMY_TOOL_CLASS.get(tool)
+    if cls:
+        return cls
+    if tool == "bash":
+        return _bash_autonomy_class((payload.get("tool_input") or {}).get("command") or "")
+    return ""
+
+
+def _session_live_cards(ctx: Path, sid: str) -> list[dict]:
+    """The live (doing) cards this session is attributable to — the recorded session→card link
+    first (authoritative, single card), else every doing card owned by the session's short id.
+    Same resolution as `_session_owns_live_card`, but returning the cards themselves."""
+    tasks = _load_tasks(ctx)
+    tid = ((_load_metrics(ctx).get("agent_sessions") or {}).get((sid or "").strip()) or {}).get("task") or ""
+    if tid.strip():
+        bare = _split_qualified_tid(tid.strip())[1]
+        card = next((t for t in tasks if t["id"] == bare and t.get("state") == "doing"), None)
+        if card is not None:
+            return [card]
+    short = (sid or "").strip()[:6]
+    if not short:
+        return []
+    return [t for t in tasks if (t.get("owner") or "").strip() == short and t.get("state") == "doing"]
+
+
+def _autonomy_deny(ctx: Path, card: dict, cls: str, grants: frozenset, groomed: bool) -> str:
+    """Corrective deny for an out-of-grant op: name the card, what it does grant, and the exact
+    grooming command that widens it — an operator decision by design, so the message says so."""
+    disp = _display_tid(ctx, card["id"])
+    have = ", ".join(g for g in AUTONOMY_GRANTS if g in grants) or "none"
+    want = ",".join(g for g in AUTONOMY_GRANTS if g in grants or g == cls)
+    head = (f"🏹 Celeborn autonomy gate: [{disp}] does not grant `{cls}` — this card pre-authorizes: {have}."
+            if groomed else
+            f"🏹 Celeborn autonomy gate: [{disp}] carries no autonomy grants, and under this harness the "
+            f"gate is the whole permission system — an ungroomed card runs most-restrictive (t203 §3.4).")
+    commit_note = (" git-write stays OFF by default: `commit` is never implied by any other grant."
+                   if cls == "commit" else "")
+    return (f"{head}{commit_note} The autonomy bound is set at grooming time on the kanban — the OPERATOR "
+            f"widens it with `celeborn tasks edit {card['id']} --autonomy {want}`; do not self-grant to "
+            f"get past this gate. Read/orient and the `celeborn` CLI are never gated.")
+
+
+def _autonomy_gate_pre_tool_use(payload: dict, project_dir: str, harness: str = "") -> str:
+    """PreToolUse per-card autonomy gate (CELE-t212, contract t203 §3.4). DENY a tool call whose
+    grant class falls outside the owning card's `autonomy` grants; silent otherwise (silence defers
+    to the harness's own permission layer — this gate never auto-allows). Card-less sessions are the
+    t131 gate's concern; no card resolved here means nothing to bound. Cheap classification runs
+    first, so never-gated calls skip the `.context/` lookup entirely."""
+    cls = _autonomy_class(payload)
+    if not cls:
+        return ""
+    ctxdir = find_context_root(Path(project_dir))
+    if ctxdir is None:
+        return ""                                      # not a Celeborn project — never gate
+    cards = _session_live_cards(ctxdir, payload.get("session_id") or "")
+    if not cards:
+        return ""
+    fielded = [t for t in cards if t.get("autonomy")]
+    if not fielded:
+        if harness != "opencode":
+            return ""          # no bound set → the harness's own permission prompts govern (pre-t212 behavior)
+        grants, card, groomed = frozenset(), cards[0], False   # OpenCode has no prompts: ungroomed ⇒ nothing granted
+    else:
+        # Multiple attributable groomed cards (owner-match fallback only): most-restrictive ⇒ intersection.
+        grants = frozenset.intersection(
+            *(frozenset(g for g in t["autonomy"] if g in AUTONOMY_GRANTS) for t in fielded))
+        card, groomed = fielded[0], True
+    if cls in grants:
+        return ""                                      # granted — fall through, never auto-allow
+    return json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": _autonomy_deny(ctxdir, card, cls, grants, groomed),
+    }})
+
+
+def dispatch_hook(event: str, payload: dict, project_dir: str, harness: str = "") -> str:
     """Run one hook event in-process and return the text to write to stdout ("" = emit nothing).
 
     The single per-turn logic module. `project_dir` is where to start the `.context/` search (the
     host's CLAUDE_PROJECT_DIR / cwd). Resolution mirrors the old bash hooks exactly, including the
     hybrid sink (capture/statusline fall through to the global ~/.context when outside a repo) and the
-    no-op-outside-.context safety property that makes the hooks safe to enable globally."""
+    no-op-outside-.context safety property that makes the hooks safe to enable globally.
+
+    `harness` is cmd_hook's resolved harness name ("" = Claude default) — payload shape stays frozen
+    (t203 §7); the rare event whose SEMANTICS differ per harness (pre-compact's metric) branches on
+    this instead of sniffing the payload."""
     payload = payload or {}
     # PreToolUse fires on EVERY tool call. The Bash redirect guard (t101) runs first — cheap and
     # `.context/`-free, so the overwhelmingly common case returns in microseconds. If it has no opinion,
@@ -5520,7 +8709,13 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         # earliest resume signal — so the badge drops within seconds even when the user unblocks
         # WITHOUT a new prompt (permission grant, AskUserQuestion answer). Fast-guarded; best-effort.
         _clear_alert_on_activity(project_dir, payload.get("session_id") or "")
-        return _card_gate_pre_tool_use(payload, project_dir)
+        cardless = _card_gate_pre_tool_use(payload, project_dir, harness)
+        if cardless:
+            return cardless
+        # Last in the chain (CELE-t212): a session that DOES own a card is bounded by that card's
+        # `autonomy` grants. Deny-only — the shell-hygiene and publish guards above stay senior, and
+        # a granted class falls through to the harness's own permission layer, never an auto-allow.
+        return _autonomy_gate_pre_tool_use(payload, project_dir, harness)
     sid = payload.get("session_id") or ""
     tp = payload.get("transcript_path") or ""
     ctxdir = find_context_root(Path(project_dir))      # the .context/ dir, or None
@@ -5568,7 +8763,12 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
     if event == "pre-compact":
         if ctxdir is None:
             return ""
-        _hook_run(cmd_record, path=proj, event="compaction", session=None, tokens=None)
+        # Claude Code has no post-compaction hook, so the metric is recorded here, at "imminent".
+        # OpenCode DOES tell us when a compaction actually lands (`session.compacted` → the plugin
+        # runs `celeborn record compaction`, CELE-t142), so there we defer to that: recording at
+        # compacting time too would double-count, and would count compactions that abort.
+        if harness != "opencode":
+            _hook_run(cmd_record, path=proj, event="compaction", session=None, tokens=None)
         # Pre-compaction panic-save (t36): snapshot the authored tiers to a restore point NOW —
         # deterministically, before the window is summarized — so survival is a felt, recoverable
         # artifact and not just a nag. Best-effort: a hiccup here must never break compaction.
@@ -5592,7 +8792,7 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         # A session ending — `/clear` (reason="clear"), logout, or exit — should drop its active-agents
         # chip from the board NOW, not linger for the 30-min mtime window (CELE-t131). `/clear` opens a
         # fresh session id, so the old transcript keeps a recent mtime and would otherwise ghost. We
-        # tombstone the ending session and force a hosted refresh so celeborn.thot.ai prunes it too.
+        # tombstone the ending session and force a hosted refresh so celeborncode.ai prunes it too.
         try:
             # On a `/clear`, stash this session's card attribution FIRST (before the tombstone drops the
             # link) so its continuation can inherit it (CELE-t131). Gate to "clear" or a missing reason
@@ -5613,14 +8813,12 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         return _hook_run(cmd_handoff, path=proj)
 
     if event == "stop":
-        # Hybrid sink: a repo's own .context/ when inside one, else the global ~/.context — so no
-        # session goes unrecorded. Needs a transcript to read; without one there's nothing to capture.
-        if not tp:
-            return ""
         # Idle-Stop alert (CELE-t169): the turn ended and the session's DOING card is unfinished, so
         # coding progress has paused awaiting the user's next direction. Raise a low-severity "stopped"
         # alert on the card — it clears the instant the user replies (user-prompt-submit below). A card
         # that was just shipped is no longer doing, so `_session_task_id` returns "" and no alert fires.
+        # Runs BEFORE the transcript gate: a transcript-less harness (OpenCode's session.idle,
+        # CELE-t139) still means "turn ended, card unfinished" and the board should show it.
         if ctxdir is not None:
             try:
                 tid = _session_task_id(ctxdir, sid)
@@ -5630,8 +8828,33 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
                     __import__("celeborn_sync").schedule_agents_push(ctxdir, min_interval_s=0)
             except Exception:  # noqa: BLE001
                 pass
+        # Hybrid sink: a repo's own .context/ when inside one, else the global ~/.context — so no
+        # session goes unrecorded. Needs a transcript to read; without one there's nothing to capture
+        # (OpenCode's own transcript ingestion is P4 — CELE-t141), so the alert above is the whole effect.
+        if not tp:
+            return ""
         return _hook_run(cmd_capture, path=proj, transcript=tp, session=sid,
                          quiet=True, note=True, global_=(ctxdir is None))
+
+    if event == "post-tool-use":
+        # Transcript-less touch + activity (P4, CELE-t141). Claude Code never wires this — its
+        # transcript capture already records every tool call, and touches are the agent's own
+        # protocol move. A transcript-less harness (OpenCode's tool.execute.after / file.edited)
+        # reports each completed call here instead: a file mutation auto-registers the touch (board
+        # active-file chips), and the call folds into the rolling activity window. No model-facing
+        # output (PostToolUse stdout reaches the model only, and there is nothing to say).
+        if ctxdir is None:
+            return ""
+        tool = (payload.get("tool_name") or "").strip()
+        inp = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+        fp = str(inp.get("file_path") or inp.get("filePath") or inp.get("notebook_path") or "").strip()
+        if tool in _FILE_TOOLS and fp:
+            _auto_touch_for_session(ctxdir, sid, fp)
+        try:
+            _record_tool_activity(ctxdir, sid, tool, inp)
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
 
     if event == "notification":
         # Claude Code fires Notification when it needs tool-use permission or the prompt has been idle
@@ -5659,8 +8882,24 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         return _hook_run(cmd_statusline, path=proj, transcript=(tp or None), session=sid)
 
     if event == "user-prompt-submit":
-        if ctxdir is None or not tp:
-            return ""                                  # need a transcript to read the live ctx size
+        if ctxdir is None:
+            return ""
+        # Only the context-size nudge needs a transcript; heartbeat, claim-on-receipt/mention, the
+        # card-gate directive, and the progress engine all run without one — so a transcript-less
+        # harness (OpenCode's chat.message, CELE-t139) still gets the full per-turn envelope.
+        # Turn boundary for the transcript-less activity record (P4, CELE-t141): open a fresh
+        # window entry now so this turn's post-tool-use reports fold into one bounded fact row.
+        if harness == "opencode":
+            try:
+                _record_turn_prompt(ctxdir, sid, payload.get("prompt") or "")
+            except Exception:  # noqa: BLE001
+                pass
+            # A human turn in OpenCode IS a human↔OpenCode interaction (CELE-t216): enqueue a PM wake so
+            # the next march re-reads a board the human may have just steered. Best-effort.
+            try:
+                _pm_wake_enqueue(ctxdir, "opencode", "user turn")
+            except Exception:  # noqa: BLE001
+                pass
         # Resume clears the block (CELE-t169): the user has replied, so any permission/idle/stopped
         # alert on this session's DOING card is stale — drop it and refresh the card. Best-effort.
         try:
@@ -5678,17 +8917,35 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
             ensure_board(ctxdir)
         except Exception:                              # noqa: BLE001
             pass
-        nudge = _hook_run(cmd_remind, path=proj, transcript=tp, tokens=None, every=50_000,
-                          last=None, auto=False, force=False, soft_limit=150_000,
-                          clear_cmd="/clear").strip()
+        # /clear nudge + context-pressure warnings (CELE-t207). Thresholds resolve inside
+        # cmd_remind (.celebornrc context_soft_tokens/context_hard_tokens, else band.ts defaults).
+        # With a transcript (Claude Code) the live size is estimated from it; without one
+        # (OpenCode), the session's capture cursor — fed by `record tokens` (t205) — supplies the
+        # real window, so the warning rides the same per-turn envelope into the TUI.
+        if tp:
+            nudge = _hook_run(cmd_remind, path=proj, transcript=tp, tokens=None, every=50_000,
+                              last=None, auto=False, force=False, soft_limit=None, hard_limit=None,
+                              session=None, clear_cmd="/clear").strip()
+        elif sid:
+            nudge = _hook_run(cmd_remind, path=proj, transcript=None, tokens=None, every=50_000,
+                              last=None, auto=False, force=False, soft_limit=None, hard_limit=None,
+                              session=sid, clear_cmd="/clear").strip()
+        else:
+            nudge = ""
         heartbeat = _hook_run(cmd_heartbeat, path=proj, session=sid).strip()
-        handoff = _hook_run(cmd_outbox, path=proj, outbox_cmd="drain").strip()
-        # Claim-on-receipt: if the user pasted a card (its marker rides in the prompt text), this
+        # Session-aware drain (CELE-t213): the session id rides along so this coder also drains the
+        # queue a PM `dispatch` staged to its 6-char handle — without it, a session-addressed
+        # hand-off would sit undelivered forever ($CELEBORN_AGENT is a name, not a session).
+        handoff = _hook_run(cmd_outbox, path=proj, outbox_cmd="drain", session=sid).strip()
+        # Claim-on-receipt: if a card marker rides in the prompt text OR the drained hand-off, this
         # session claims it — owner ← me, TODO → DOING. The act of receiving the card is the
-        # assignment; the human chose *which* model by choosing *which* window to paste into.
+        # assignment; the human chose *which* model by choosing *which* window to paste into, and a
+        # dispatched brief arriving via the outbox is the same receipt (CELE-t213) — so drain →
+        # claim → §1.3 agent_sessions link all land in the coder's first turn after a dispatch.
         slug = project_slug(ctxdir) if ctxdir is not None else ""
         prompt_text = payload.get("prompt") or ""
-        refs, rejects = _find_card_refs(prompt_text, expected_slug=slug or None)
+        refs, rejects = _find_card_refs(prompt_text + ("\n" + handoff if handoff else ""),
+                                        expected_slug=slug or None)
         claim = _hook_run(cmd_claim, path=proj, ids=refs, by=None, session=sid).strip() if refs else ""
         # Prose claim-on-mention (CELE-t131): no pasted marker, but the human named a project-qualified
         # card in prose ("work on CELE-t131"). An explicit opening mention is a strong, intentional
@@ -5716,7 +8973,8 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
         # AFTER the claim block so a paste/prose claim this turn (which now owns a card) suppresses it; a
         # hand-off is the user explicitly sending work, so it's exempt too.
         directive = (_cardless_directive(sid)
-                     if not handoff and _card_gate_status(ctxdir, sid) == "gated" else "")
+                     if not handoff and _card_gate_enabled(ctxdir)
+                     and _card_gate_status(ctxdir, sid) == "gated" else "")
         # Progress engine (CELE-t161): tick THIS session's doing card off observable signals and, if the
         # bar is lagging, return a copy-pasteable nudge. Best-effort — never delay or break a turn.
         try:
@@ -5729,7 +8987,15 @@ def dispatch_hook(event: str, payload: dict, project_dir: str) -> str:
             arch_notice = _maybe_arch_trace_on_turn(ctxdir)
         except Exception:  # noqa: BLE001
             arch_notice = ""
-        return _compose_user_prompt_envelope(heartbeat, nudge, handoff, claim, directive, progress_nudge, arch_notice)
+        # Blackboard intents (CELE-t303): warn THIS session before it commits a file a peer has
+        # declared a planned commit on. The handle is the session short-id — the same key touches
+        # and claims use. Best-effort — the blackboard must never break a turn.
+        try:
+            intents_note = _intent_overlap_notice(ctxdir, (sid or "")[:6])
+        except Exception:  # noqa: BLE001
+            intents_note = ""
+        return _compose_user_prompt_envelope(heartbeat, nudge, handoff, claim, directive, progress_nudge, arch_notice,
+                                             intents_note)
 
     if event == "post-edit":
         # Quality gate (t70 Phase 2), PostToolUse after Edit/Write. CHEAP check only: byte-compile an
@@ -5902,7 +9168,19 @@ def cmd_hook(args):
     else:
         project_dir = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     payload = _read_hook_payload(getattr(args, "_stdin", None))
-    out = dispatch_hook(args.event, payload, project_dir)
+    event = args.event
+    # OpenCode's plugin shells `celeborn hook <event> --harness opencode` with an OpenCode-shaped
+    # payload; translate it into the Claude shape dispatch_hook already understands (CELE-t139).
+    # Only the explicit flag or $CELEBORN_HARNESS (exported by the OpenCode plugin's shell-outs)
+    # triggers translation — the rc `harness` pin deliberately does NOT, because running a
+    # Claude-shaped payload through the translator would drop transcript_path/tool_name/prompt.
+    harness = (getattr(args, "harness", None) or os.environ.get("CELEBORN_HARNESS") or "").strip().lower()
+    if harness == "opencode":
+        try:
+            event, payload = _opencode_to_claude_shape(event, payload)
+        except Exception:
+            pass               # fail open — an untranslated payload degrades inside dispatch_hook
+    out = dispatch_hook(event, payload, project_dir, harness=harness)
     if out:
         sys.stdout.write(out if out.endswith("\n") else out + "\n")
 
@@ -6010,11 +9288,108 @@ DANGER_DEFAULT_MODE = "bypassPermissions"   # Claude stops asking permission for
 DANGER_CONFIRM_PHRASE = "DISABLE ALL SAFETY"
 
 
+# --------------------------------------------------------------------------- per-rule permissions (t351)
+# The board Settings "Permissions" panel (t144 shape) renders the live allow-list as grouped,
+# individually-removable prefix-rule chips, plus a set of *Dangerous allows* (real settings.json allow
+# entries that let an agent act OUTSIDE this machine) and one *locked* display-only exfiltration DENY.
+# The new per-rule verbs below (`permissions --add/--rm/--set-mode`) back those chips.
+
+# The `defaultMode` stances we expose in the mode selector, mapped to real Claude Code modes and
+# honestly labelled (the panel writes exactly what it names — no aspirational relabelling).
+PERMISSION_MODES = [
+    {"value": "default", "label": "Ask when no rule matches",
+     "hint": "The standard stance — allow/deny rules apply, otherwise Claude asks first."},
+    {"value": "acceptEdits", "label": "Auto-allow file edits",
+     "hint": "File edits auto-approve; Bash and anything outward-facing still prompts. Celeborn's safe baseline."},
+    {"value": "plan", "label": "Plan mode (read-only)",
+     "hint": "Claude proposes a plan and changes nothing until you approve it."},
+    {"value": "bypassPermissions", "label": "Night-run autonomy — never prompt",
+     "hint": "Full bypass: Claude asks about nothing. The same stance the Danger Zone arms."},
+]
+VALID_PERMISSION_MODES = {m["value"] for m in PERMISSION_MODES}
+PERMISSION_RULE_KINDS = ("allow", "ask", "deny")
+
+# Dangerous allows — real allow entries revocable in one click, but re-allowable only behind a typed
+# phrase (the board enforces the phrase; the CLI just writes the rule once armed, mirroring danger-arm).
+DANGEROUS_ALLOWS = [
+    {"phrase": "ALLOW GIT PUSH",
+     "rules": ["Bash(git push:*)"],
+     "why": "Standalone pushes to any remote this repo knows. Compound commands (cmd && git push) never "
+            "match — pushes run alone, visibly."},
+    {"phrase": "ALLOW PUBLIC RELEASE",
+     "rules": ["Bash(gh release:*)", "Bash(gh api:*)"],
+     "why": "Cuts public releases and writes to GitHub via API (brew tap, scoop bucket). This is the public "
+            "ship pipeline."},
+]
+
+# The exfiltration guard — display-only. Pushing this private repo's history to the public remote is
+# hard-blocked by the auto-mode classifier at the hook layer regardless of allow rules, so it is NOT a
+# togglable settings.json deny entry; the panel shows it locked to explain the guard.
+EXFIL_DENY_LABEL = "DENY: private → public git push"
+EXFIL_DENY_WHY = ("The exfiltration guard. Pushing this private repo's history to the public remote is "
+                  "hard-blocked by the classifier regardless of allow rules — the public client ships by "
+                  "wholesale copy + leak scan, never by push.")
+
+# Prefixes that mean "runs code, but only to judge it" — their own chip group so a reader can see the
+# test/typecheck surface distinctly from the read-only tools.
+TEST_TYPECHECK_PREFIXES = [
+    "python3 -m unittest", "python3 -m pytest", "python3 -m py_compile", "pytest",
+    "npx tsc", "tsc", "npm test", "npm run test", "jest", "vitest", "deno test",
+]
+
+# Ordered chip groups for non-dangerous allow rules. `dangerous` rules are surfaced separately as
+# risky-rule cards; anything unmatched falls to `other`.
+PERMISSION_GROUPS = [
+    {"key": "cli_readonly", "label": "Celeborn CLI & read-only",
+     "hint": "The board's own tools and anything that can't mutate. Safe to auto-allow everywhere."},
+    {"key": "tests", "label": "Tests & typecheck",
+     "hint": "Runs code but only to judge it. Note: this suite has live side-effects — scope with care."},
+    {"key": "file_scopes", "label": "File scopes",
+     "hint": "Where Read / Edit / Write run without a prompt. Paths are prefix-matched, most specific wins."},
+    {"key": "other", "label": "Other allows",
+     "hint": "Everything else you've allowed. Prefix-matched, most specific wins."},
+]
+
+_BASH_RULE_RE = re.compile(r"^Bash\((.*)\)$")
+_FILE_SCOPE_RE = re.compile(r"^(?:Read|Edit|Write|MultiEdit|NotebookEdit|Edit\+Write)\(.+\)$")
+
+
+def _dangerous_allow_rule_set() -> set:
+    return {r for grp in DANGEROUS_ALLOWS for r in grp["rules"]}
+
+
+def _classify_allow_rule(rule: str) -> str:
+    """Bucket a single allow rule into one of PERMISSION_GROUPS' keys, or 'dangerous'."""
+    if rule in _dangerous_allow_rule_set():
+        return "dangerous"
+    m = _BASH_RULE_RE.match(rule)
+    if m:
+        body = m.group(1)
+        body = body[:-2] if body.endswith(":*") else body
+        for pre in TEST_TYPECHECK_PREFIXES:
+            if body == pre or body.startswith(pre + " ") or body.startswith(pre):
+                return "tests"
+        for pre in ["celeborn", "scripts/celeborn.py", *BASELINE_BASH_PREFIXES]:
+            if body == pre or body.startswith(pre + " ") or body.startswith(pre):
+                return "cli_readonly"
+        return "other"
+    if _FILE_SCOPE_RE.match(rule):          # a Read/Edit/Write with a path argument → a file scope
+        return "file_scopes"
+    if rule in BASELINE_ALLOW_TOOLS:        # bare Read / Glob / Grep
+        return "cli_readonly"
+    if rule.startswith("mcp__"):
+        return "cli_readonly"
+    return "other"
+
+
 # --------------------------------------------------------------------------- skill catalog (t115)
 # The three groups the board Settings page renders: Celeborn's own bundled verbs (SKILL.md), the Claude
 # slash-commands the t70 advisor points at, and the Matt Pocock skill suite that Celeborn installs
 # default-on (https://github.com/mattpocock/skills).
 CELEBORN_CORE_SKILLS = [
+    {"name": "Claim", "command": "celeborn claim <id> --by <name>", "featured": True,
+     "description": "The most-used verb: takes a TODO card, marks it DOING, and stamps you as owner so every "
+                    "other agent sharing the board sees it on their next orient. Do this before any work."},
     {"name": "Orient", "command": "celeborn status",
      "description": "Cheap rehydration — prints the Hot tier (state headline, session focus, board, "
                     "recent activity) so a fresh thread knows where things stand without re-reading everything."},
@@ -6180,6 +9555,7 @@ def _resolved_permissions(ctx: Path) -> dict:
         perms = data.get("permissions") or {}
         allow = list(perms.get("allow") or [])
         per_file[name] = {"path": str(p), "exists": p.is_file(), "allow": allow,
+                          "ask": list(perms.get("ask") or []), "deny": list(perms.get("deny") or []),
                           "defaultMode": perms.get("defaultMode")}
         mode[name] = perms.get("defaultMode")
         for r in allow:
@@ -6198,8 +9574,38 @@ def _permissions_state_json(ctx: Path) -> dict:
     bash = [{"rule": f"Bash({pre}:*)", "prefix": pre, "active": f"Bash({pre}:*)" in allow_set}
             for pre in BASELINE_BASH_PREFIXES]
     danger = [{"rule": r, "active": r in allow_set} for r in DANGER_SPECTRUM]
+
+    # t351 — which scope(s) each resolved allow rule actually lives in (so a chip's ✕ can target the
+    # right file; a rule can be present in more than one scope).
+    rule_scopes: dict = {}
+    for name in ("local", "shared", "global"):
+        for r in res["per_file"][name]["allow"]:
+            rule_scopes.setdefault(r, [])
+            if name not in rule_scopes[r]:
+                rule_scopes[r].append(name)
+
+    # t351 — grouped, individually-removable chips for the non-dangerous allow rules.
+    grouped: dict = {g["key"]: [] for g in PERMISSION_GROUPS}
+    for r in res["allow"]:
+        key = _classify_allow_rule(r)
+        if key == "dangerous":
+            continue
+        grouped.setdefault(key, []).append({"rule": r, "scopes": rule_scopes.get(r, [])})
+    groups_out = [{**g, "rules": grouped[g["key"]]} for g in PERMISSION_GROUPS if grouped[g["key"]]]
+
+    # t351 — dangerous allows: each group is "active" when ALL its rules are present.
+    dangerous_out = []
+    for grp in DANGEROUS_ALLOWS:
+        scopes = sorted({s for rr in grp["rules"] for s in rule_scopes.get(rr, [])})
+        dangerous_out.append({"rules": grp["rules"], "phrase": grp["phrase"], "why": grp["why"],
+                              "active": all(rr in allow_set for rr in grp["rules"]), "scopes": scopes})
+
     return {
         "effective_default_mode": eff_mode,
+        "mode": {"value": eff_mode, "options": PERMISSION_MODES},
+        "groups": groups_out,
+        "dangerous": dangerous_out,
+        "locked_deny": {"label": EXFIL_DENY_LABEL, "why": EXFIL_DENY_WHY},
         "baseline": {
             "tools": tools,
             "bash_prefixes": bash,
@@ -6267,6 +9673,41 @@ def _disarm_danger_zone(data: dict) -> dict:
     perms["allow"] = [r for r in allow if r not in danger]
     perms["defaultMode"] = BASELINE_DEFAULT_MODE
     return {"removed": removed}
+
+
+def _add_permission_rule(data: dict, rule: str, kind: str) -> dict:
+    """Append a single rule to permissions.<kind> (allow|ask|deny), IN PLACE and dedup-safe. Never
+    reorders existing entries; re-adding is a no-op."""
+    perms = data.setdefault("permissions", {})
+    lst = perms.setdefault(kind, [])
+    if rule in lst:
+        return {"added": False}
+    lst.append(rule)
+    return {"added": True}
+
+
+def _remove_permission_rule(data: dict, rule: str) -> dict:
+    """Remove an exact rule from every permissions list it appears in (allow/ask/deny). Returns the
+    list names it was pulled from."""
+    perms = data.setdefault("permissions", {})
+    removed_from = []
+    for kind in PERMISSION_RULE_KINDS:
+        lst = perms.get(kind)
+        if lst and rule in lst:
+            perms[kind] = [r for r in lst if r != rule]
+            removed_from.append(kind)
+    return {"removed_from": removed_from}
+
+
+def _set_permission_mode(data: dict, mode: str) -> dict:
+    """Set (or, when mode is empty, unset) permissions.defaultMode IN PLACE."""
+    perms = data.setdefault("permissions", {})
+    prev = perms.get("defaultMode")
+    if mode:
+        perms["defaultMode"] = mode
+    else:
+        perms.pop("defaultMode", None)
+    return {"prev": prev, "mode": mode or None}
 
 
 def _skills_dirs(ctx: Path) -> list:
@@ -6370,6 +9811,76 @@ def cmd_skills(args):
         print(f"    [{'x' if s['installed'] else ' '}] {s['name']}")
 
 
+# ------------------------------------------------------------------------------- git post-commit (t216)
+#
+# The Claude/OpenCode hooks wake the PM on session events; the git side is the missing producer. A
+# marker-fenced post-commit hook wakes the PM on EVERY commit — a human's plain `git commit` included,
+# not just `celeborn commit`. Fencing preserves any pre-existing hook (our block is appended) and lets
+# a re-install update in place. The wake line is `|| true`-guarded and silenced, so a commit never
+# fails — and outside a Celeborn project `celeborn pm wake` exits non-zero and is swallowed (no-op).
+
+GIT_HOOK_START = "# >>> celeborn post-commit (managed by `celeborn wire`) >>>"
+GIT_HOOK_END = "# <<< celeborn post-commit (managed by `celeborn wire`) <<<"
+_GIT_POST_COMMIT_BODY = (
+    'sha="$(git rev-parse --short HEAD 2>/dev/null)"\n'
+    'celeborn pm wake --source git-commit --detail "$sha" >/dev/null 2>&1 || true'
+)
+
+
+def _git_post_commit_block() -> str:
+    return f"{GIT_HOOK_START}\n{_GIT_POST_COMMIT_BODY}\n{GIT_HOOK_END}\n"
+
+
+def _git_hooks_dir(work_dir: Path) -> Path | None:
+    """The repo's hooks directory (honors core.hooksPath and worktrees), or None outside a work tree."""
+    try:
+        import subprocess
+        r = subprocess.run(["git", "-C", str(work_dir), "rev-parse", "--git-path", "hooks"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+        hp = Path(r.stdout.strip())
+        return hp if hp.is_absolute() else (work_dir / hp)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _install_git_hooks(work_dir: Path) -> str | None:
+    """Install/refresh the post-commit PM-wake hook idempotently (CELE-t216). Returns 'installed',
+    'updated', 'present', or None outside a git work tree. Preserves a non-Celeborn hook by appending
+    our fenced block; updates our block in place on re-run."""
+    import os
+    import stat as _stat
+    hooks = _git_hooks_dir(work_dir)
+    if hooks is None:
+        return None
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "post-commit"
+    block = _git_post_commit_block()
+
+    def _chmod_x(p: Path) -> None:
+        st = os.stat(p)
+        os.chmod(p, st.st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+
+    if not hook.is_file():
+        hook.write_text("#!/bin/sh\n" + block)
+        _chmod_x(hook)
+        return "installed"
+    text = hook.read_text()
+    if GIT_HOOK_START in text and GIT_HOOK_END in text:
+        new = re.sub(re.escape(GIT_HOOK_START) + r".*?" + re.escape(GIT_HOOK_END) + r"\n?",
+                     block, text, flags=re.S)
+        _chmod_x(hook)
+        if new != text:
+            hook.write_text(new)
+            return "updated"
+        return "present"
+    sep = "" if text.endswith("\n") else "\n"
+    hook.write_text(text + sep + "\n" + block)
+    _chmod_x(hook)
+    return "installed"
+
+
 def cmd_wire(args):
     """Merge Celeborn's `statusLine` and five hook groups into a Claude Code settings.json —
     idempotently. The programmatic alternative to hand-merging hooks/settings.snippet.json. Preserves
@@ -6461,6 +9972,14 @@ def cmd_wire(args):
         info(f"{settings} already wired — nothing to add")
     for s in skipped:
         warn(s)
+    # t216 — a git post-commit hook so every commit (a human's plain `git commit` included) wakes the
+    # PM. Best-effort and idempotent; silent when this isn't a git work tree.
+    try:
+        gstatus = _install_git_hooks(Path(getattr(args, "path", ".") or ".").resolve())
+    except Exception:  # noqa: BLE001
+        gstatus = None
+    if gstatus in ("installed", "updated"):
+        ok(f"git post-commit hook {gstatus} — commits now wake the PM (CELE-t216)")
     if baseline is not None:
         n, dm = len(baseline["added"]), baseline["default_mode_set"]
         if n or dm:
@@ -6513,19 +10032,27 @@ def cmd_wire(args):
             warn("--grok: no .context/ here — run `celeborn init` first")
         elif _wire_grok(ctx.parent):
             ok("also wired Grok Build for this project")
+    if getattr(args, "opencode", False):
+        ctx = find_context_root(Path(getattr(args, "path", ".") or "."))
+        if ctx is None:
+            warn("--opencode: no .context/ here — run `celeborn init` first")
+        elif _wire_opencode(ctx.parent):
+            ok("also wired OpenCode (plugin + PM agent + provider) for this project")
 
 
-# ------------------------------------------------------------------------------- setup (t120)
+# ------------------------------------------------------------------------------- init / first-run (t120, t228)
 #
 # "Install like Modal" (CELE-t120). Modal's whole onboarding is `pip install modal` + `python3 -m
-# modal setup` (a browser auth) — two commands and you're running code. `celeborn setup` is the
+# modal setup` (a browser auth) — two commands and you're running code. `celeborn init` is the
 # post-package-install half of that: ONE guided command that wires Claude Code, scaffolds the current
-# project, and signs you in (browser PKCE — required, Modal parity), then prints a "you're ready"
-# next-step. It is a THIN, idempotent, resumable orchestrator over the existing first-class verbs
-# (`wire`/`init`/`login`) — never a reimplementation, so the manual path stays intact. Re-running it
-# resumes: `wire` is idempotent, `init` is skipped when `.context/` already exists, and `login` is
-# skipped when a session is already on record — so a setup interrupted at any step finishes on a re-run.
-# Design + rationale: references/setup-onboarding-plan.md.
+# project, signs you in (browser PKCE — required, Modal parity), and opens the board, then prints a
+# "you're ready" next-step. It is a THIN, idempotent, resumable orchestrator over the existing
+# first-class verbs (`wire`/`scaffold`/`login`) — never a reimplementation, so the manual path stays
+# intact. Re-running it resumes: `wire` is idempotent, `scaffold` is skipped when `.context/` already
+# exists, and `login` is skipped when a session is already on record — so a first-run interrupted at any
+# step finishes on a re-run. CELE-t228 renamed this everything-command from `setup` → `init` (the old
+# scaffold-only `init` became `scaffold`; `setup` stays a hidden back-compat alias). Design + rationale:
+# references/setup-onboarding-plan.md.
 
 
 def _setup_step_init(args, path: str) -> None:
@@ -6542,7 +10069,65 @@ def _setup_step_init(args, path: str) -> None:
         no_cmm=getattr(args, "no_cmm", False), name=getattr(args, "name", None),
         open_board=not getattr(args, "no_open", False),
         open_browser=not getattr(args, "no_browser", False))
-    cmd_init(init_args)
+    cmd_scaffold(init_args)
+
+
+def _setup_step_orientation(args) -> Path | None:
+    """First-run bootstrap (CELE-t387): ensure the dedicated Orientation (ORIE) tutorial project exists
+    so a brand-new user lands on a populated board. Idempotent and never blocking — skippable with
+    --no-orientation. On first creation (and on an interactive install) it opens /board/ORIE so the
+    user sees their onboarding board. Returns the Orientation ctx when it was newly created (the signal
+    that this is a first-run landing), else None."""
+    if getattr(args, "no_orientation", False):
+        info("orientation: skipped (--no-orientation).")
+        return None
+    ctx, created = _ensure_orientation_project()
+    if ctx is None:
+        info("orientation: could not scaffold the Orientation project (templates unavailable) — skipped.")
+        return None
+    # Additive curriculum pass on EVERY init (CELE-t388): first creation seeds the full starter
+    # deck; a later release that ships a new ORIENTATION_CURRICULUM entry tops up exactly that
+    # card; otherwise it's a no-op.
+    signals = {"low_disk"} if _low_disk_for_pippin(ctx) else set()
+    seeded = _seed_orientation_cards(ctx, signals=signals)
+    if created:
+        ok(f"Orientation project ready — {len(seeded)} starter cards on your onboarding board "
+           f"(ORIE) at {board_url(ctx)}")
+        if not getattr(args, "no_open", False) and _init_is_interactive():
+            _open_board_on_init(ctx, open_browser=not getattr(args, "no_browser", False))
+    elif seeded:
+        # Top-up stays quiet: one info line, never an announce + board pop (Amendment I — flow).
+        info(f"orientation: {len(seeded)} new tutorial card(s) added to your ORIE board.")
+    else:
+        info(f"orientation: Orientation project already present ({_orientation_dir()}) — kept.")
+    return ctx if created else None
+
+
+def _setup_step_weave(args, path: str) -> None:
+    """Offer the sovereign weave during init (CELE-t374) — the complete free local engine (OpenCode +
+    Ollama + Pippin) for a machine with no AI coding assistant. Consent-gated per component and never
+    blocking: a headless install prints the `celeborn weave` pointer instead of running installers,
+    and any failure degrades to a warning — init always finishes."""
+    if getattr(args, "no_weave", False):
+        info("weave: skipped (--no-weave).")
+        return
+    ctx = find_context_root(Path(path or "."))
+    if ctx is None:
+        info("weave: no .context/ here — run `celeborn weave` after scaffolding.")
+        return
+    try:
+        st = _weave_status(ctx)
+        complete = (st["opencode"]["installed"] and st["ollama"]["installed"]
+                    and all(st["models"].values()))
+        if not complete and not _init_is_interactive():
+            info("weave: local engine incomplete — non-interactive, so no installers ran. "
+                 "Set it up any time: `celeborn weave` (attributed, consent-gated upstream installs).")
+            return
+        # Complete = a quick aligned read + wiring/config refresh (idempotent, no prompts hit);
+        # incomplete + interactive = the consented install flow.
+        _weave(ctx)
+    except Exception as e:  # noqa: BLE001 — init must never die on the weave
+        warn(f"weave step failed ({e}) — finish later with `celeborn weave`")
 
 
 def _setup_step_login(args) -> bool:
@@ -6572,46 +10157,69 @@ def _setup_step_login(args) -> bool:
         return True
     except SystemExit:
         warn("sign-in didn't complete — finish it later with `celeborn login --github` (or re-run "
-             "`celeborn setup`). Continuing — local Celeborn works without an account.")
+             "`celeborn init`). Continuing — local Celeborn works without an account.")
         return False
 
 
-def _setup_ready(path: str, signed_in: bool) -> None:
-    """Modal-style closing: where the board is + the single next thing to do."""
+def _setup_ready(path: str, signed_in: bool, orie_ctx: Path | None = None) -> None:
+    """Modal-style closing: where the board is + the single next thing to do. The board is Celeborn's
+    UI and the instruction surface for a first-time user, so point at it prominently — the scaffold
+    step already opened it in the browser on an interactive install. On a first-run install (a freshly
+    created Orientation project, CELE-t387) point at the ORIE onboarding board — that's where a
+    brand-new user should start, not an empty project board."""
     print("\n✅ Celeborn is ready.\n")
+    if orie_ctx is not None:
+        print(f"  👉 Start here — your Orientation board: {board_url(orie_ctx)}"
+              + ("   (just opened in your browser)" if _init_is_interactive() else "")
+              + "\n     A guided tutorial that walks your coding assistant through setting you up.")
     ctx = find_context_root(Path(path or "."))
     if ctx is not None:
-        info(f"Your kanban board (Celeborn's UI): {board_url(ctx)}")
+        url = board_url(ctx)
+        opened = _init_is_interactive()
+        label = "  This project's board" if orie_ctx is not None else "  👉 Your board"
+        print(f"{label}: {url}   (Celeborn's UI"
+              + (" — just opened in your browser)" if opened else ")"))
     print("\n  Next:")
     print("    • Open Claude Code in this project — Celeborn orients automatically every session.")
+    print("    • The board is where your work lives: it opens on its own each session.")
     print("    • Inspect what an agent loads on orient:  celeborn status")
     if not signed_in:
-        print("    • Enable the hosted board (optional):  celeborn login --github")
+        print("    • Sync your private memory across devices (optional):  celeborn login --github")
     print()
 
 
-def cmd_setup(args):
-    """Modal-clean first run: one guided command = wire Claude Code + scaffold this project + sign in.
-    A thin orchestrator over `wire`/`init`/`login`, each idempotent so re-running resumes (CELE-t120).
-    Order is wire → init → login so the local-first project is fully set up even if browser auth is the
-    one step that doesn't complete; login is the final, gated step."""
+def cmd_init(args):
+    """`celeborn init` — the ONE first-run command (CELE-t228). A guided everything-command that wires
+    Claude Code + scaffolds this project + signs you in, then opens your kanban board. A thin
+    orchestrator over `wire`/`scaffold`/`weave`/`login`, each idempotent so re-running resumes
+    (CELE-t120). Order is wire → scaffold → weave → login so the local-first project is fully set up
+    even if browser auth is the one step that doesn't complete; login is the final, gated step. The
+    weave step (CELE-t374) offers the free local engine — OpenCode + Ollama + Pippin — consent-gated
+    and never blocking. (`celeborn setup` is a hidden
+    back-compat alias; `celeborn scaffold` is the secondary scaffold-only command.)"""
     path = getattr(args, "path", ".") or "."
-    print("\n🏹 Celeborn setup — wiring Claude Code, scaffolding this project, and signing you in.\n")
+    print("\n🏹 Celeborn init — wiring Claude Code, scaffolding this project, and signing you in.\n")
 
-    print("[1/3] Wiring Claude Code (hooks + statusLine + safe baseline + skills)…")
+    print("[1/5] Wiring Claude Code (hooks + statusLine + safe baseline + skills)…")
     wire_args = argparse.Namespace(
         global_=not getattr(args, "project", False), force=getattr(args, "force", False),
         no_permission_baseline=getattr(args, "no_permission_baseline", False),
         no_skills=getattr(args, "no_skills", False), grok=False, path=path)
     cmd_wire(wire_args)
 
-    print("\n[2/3] Scaffolding this project…")
+    print("\n[2/5] Scaffolding this project…")
     _setup_step_init(args, path)
 
-    print("\n[3/3] Signing you in (browser)…")
+    print("\n[3/5] First-run: your Orientation board (ORIE) — a guided tutorial project (CELE-t387)…")
+    orie_ctx = _setup_step_orientation(args)
+
+    print("\n[4/5] Weaving the local engine — OpenCode + Ollama + Pippin (free, local; CELE-t374)…")
+    _setup_step_weave(args, path)
+
+    print("\n[5/5] Signing you in (browser)…")
     signed_in = _setup_step_login(args)
 
-    _setup_ready(path, signed_in)
+    _setup_ready(path, signed_in, orie_ctx=orie_ctx)
 
 
 # --------------------------------------------------------------------------- consent / opt-out (t102)
@@ -6621,7 +10229,7 @@ def cmd_setup(args):
 # behavior that removes an approval click (all ON by default — opt-out, not opt-in), links the User
 # Agreement, and records the operator's name + timestamp + any opt-outs to ~/.context/consent.json.
 # `wire` prints a one-line pointer to it but NEVER blocks — install must stay non-interactive for CI/hooks.
-AGREEMENT_URL = "https://celeborn.thot.ai/agreement"
+AGREEMENT_URL = "https://celeborncode.ai/agreement"
 AGREEMENT_VERSION = "2026-06-18"
 
 # Standard published legal documents (CELE-t158), hosted on the thot.ai apex site. These are the
@@ -6943,22 +10551,75 @@ def cmd_remind(args):
     every = args.every if args.every and args.every > 0 else 100_000
     tokens = args.tokens
     last = args.last
+    # Context-pressure thresholds (CELE-t207): explicit --soft-limit/--hard-limit win, else the
+    # project's .celebornrc (context_soft_tokens / context_hard_tokens), else the band.ts defaults.
+    soft, hard = _context_thresholds(cfg, getattr(args, "soft_limit", None),
+                                     getattr(args, "hard_limit", None))
+    sid = (getattr(args, "session", None) or "").strip()
 
     # --transcript: read the live context size straight from the Claude Code transcript (the real
     # number). --auto: use Celeborn's own rolling estimate. Both persist to metrics so the
     # host hook can stay stateless and `status`/`metrics` reflect the latest reading.
+    # --session: read the live window a transcript-less harness (OpenCode) reported onto this
+    # session's capture cursor via `record tokens` (t205) — the cursor tracks its own mark.
     metrics = None
+    cursor = None
     track = args.auto or bool(getattr(args, "transcript", None))
     if getattr(args, "transcript", None):
         metrics = _load_metrics(ctx)
         tokens = _estimate_transcript_tokens(Path(args.transcript), cfg["chars_per_token"])
         metrics["context_estimate"] = tokens
+        # Keep the project-level pressure flag current on every reading (machine-readable, t207).
+        metrics["context_pressure"] = {"level": _pressure_level(tokens, soft, hard),
+                                       "tokens": tokens, "at": now_iso()}
         last = metrics.get("last_remind_estimate", 0)
         _save_metrics(ctx, metrics)  # record the reading even if we stay silent
     elif args.auto:
         metrics = _load_metrics(ctx)
         tokens = metrics.get("context_estimate", 0)
         last = metrics.get("last_remind_estimate", 0)
+    elif sid:
+        metrics = _load_metrics(ctx)
+        caps = metrics.get("captures") if isinstance(metrics.get("captures"), dict) else {}
+        cursor = dict(caps.get(sid) or {})
+        if not cursor.get("live"):
+            return                      # no reported live window for this session — nothing to say
+        tokens = int(cursor.get("tokens_session") or 0)
+        last = int(cursor.get("last_remind_tokens") or 0)
+
+    def _remember(mark: int, level: str) -> None:
+        # Persist the last-reminded mark (and the pressure flag) wherever this mode keeps state,
+        # so the next call stays silent until something new happens.
+        if metrics is None:
+            return
+        if cursor is not None:
+            cursor["last_remind_tokens"] = mark
+            cursor["pressure"] = level
+            caps = metrics.get("captures") if isinstance(metrics.get("captures"), dict) else {}
+            _write_capture(metrics, caps, sid, cursor)
+        elif track:
+            metrics["last_remind_estimate"] = mark
+            metrics["context_pressure"] = {"level": level, "tokens": mark, "at": now_iso()}
+        else:
+            return
+        _save_metrics(ctx, metrics)
+
+    clear_cmd = args.clear_cmd or "/clear"
+    level = _pressure_level(tokens or 0, soft, hard)
+
+    # Session-mode window shrink (post-compaction/clear report): re-arm quietly at the new size so
+    # both the milestone nudge and the pressure warnings can fire again as the window regrows.
+    if cursor is not None and tokens < max(0, last or 0):
+        _remember(tokens, level)
+        return
+
+    # Threshold crossing (CELE-t207): the live window newly climbed past a configured soft/hard
+    # limit since the last-reminded mark — speak the urgent warning instead of the calm milestone
+    # nudge. Needs a tracked mark (`last`); a bare one-shot `--tokens` keeps the legacy wording.
+    if tokens and last is not None and _PRESSURE_RANK[level] > _PRESSURE_RANK[_pressure_level(max(0, last), soft, hard)]:
+        _remember(tokens, level)
+        print(_pressure_line(tokens, level, soft, hard, clear_cmd))
+        return
 
     # Silence unless a fresh milestone was crossed (vs. the last-reminded token count).
     if tokens is not None and last is not None and not args.force:
@@ -6966,11 +10627,7 @@ def cmd_remind(args):
             return
 
     # We're going to speak — remember where, so we stay silent until the next band.
-    if track and metrics is not None:
-        metrics["last_remind_estimate"] = tokens or 0
-        _save_metrics(ctx, metrics)
-
-    clear_cmd = args.clear_cmd or "/clear"
+    _remember(tokens or 0, level)
 
     # One rotating sign-off per firing. Advancing the counter here means it ticks once per nudge.
     line = _remind_line(tokens, clear_cmd, _next_remind_closer(ctx))
@@ -7241,10 +10898,10 @@ def cmd_about(args):
     print("  Memory on disk for AI coding agents (Claude Code, Codex, Grok): survives compaction,")
     print("  keeps its place across sessions, saves tokens.")
     print()
-    print("  Install:  uv tool install celeborn   (or: pip install celeborn)")
-    print("  PyPI:     https://pypi.org/project/celeborn/")
+    print(f"  Install:  uv tool install celeborn   (or: pip install celeborn)")
+    print(f"  PyPI:     https://pypi.org/project/celeborn/")
     print(f"  Source:   https://github.com/{GITHUB_REPO}")
-    print("  Home:     https://celeborn.thot.ai")
+    print(f"  Home:     {CELEBORN_REGISTER_URL}")
     print()
     print("  This is NOT the other projects named 'Celeborn':")
     print("    · Apache Celeborn  — a Spark/Flink remote shuffle service (big-data infra). Unrelated.")
@@ -7411,6 +11068,17 @@ ADVISOR_INTENTS = {
         "auto_actionable": False,
         "neutral": ("Large changeset ({count} code files): split the review across independent chunks / "
                     "parallel workers rather than one linear pass — it's faster and catches more."),
+    },
+    # CELE-t224 — secrets discipline. Fires when a repo-root .env* file holds a live-looking secret
+    # VALUE (not just a declared name): the safe path is the Pro vault, and the nudge is how a vibe
+    # coder learns it exists before the key lands in a commit or a prompt.
+    "vault-disk-secrets": {
+        "trigger": "secrets-on-disk",
+        "summary": "Live secret values sitting in .env files — move them into the vault.",
+        "auto_actionable": False,
+        "neutral": ("Secrets discipline: {count} live-looking secret value(s) in {files}. Move each into "
+                    "the encrypted vault — `celeborn secrets set <NAME>` (Pro) — then delete the line; "
+                    "commands read them back at run time via `celeborn secrets run -- <cmd>`."),
     },
     "spawn-tangent": {
         "trigger": None,
@@ -7623,6 +11291,20 @@ def _change_review_signals(ctx: Path) -> list:
     return sigs
 
 
+def _secrets_on_disk_signal(ctx: Path) -> list:
+    """CELE-t224 discipline signal: live secret VALUES in repo-root .env* files. Independent of git
+    state (a committed-then-ignored .env is just as leaky), so it is produced alongside — not inside —
+    the change-derived signals. Best-effort; [] on any error."""
+    try:
+        hits = _env_file_secret_hits(ctx.parent, load_config(ctx).get("secret_patterns", []))
+    except Exception:
+        return []
+    if not hits:
+        return []
+    files = ", ".join(sorted({f for f, _ in hits}))
+    return [{"signal": "secrets-on-disk", "count": len(hits), "files": files}]
+
+
 class HarnessAdapter:
     """The harness seam. The base class is also the NEUTRAL fallback: it produces the harness-agnostic
     quality signals (Phase 3), exposes no permission target, and renders an intent as the neutral
@@ -7634,7 +11316,7 @@ class HarnessAdapter:
     def friction_signals(self, ctx: Path, session: str | None = None) -> list:
         # Quality signals are host-independent (a git diff is a git diff), so every harness — including
         # the neutral fallback Grok/Codex ride — gets them. Permission friction is added per-adapter.
-        return _change_review_signals(ctx)
+        return _change_review_signals(ctx) + _secrets_on_disk_signal(ctx)
 
     def permission_target(self, ctx: Path, shared: bool = False) -> tuple:
         return (None, None)
@@ -7871,6 +11553,105 @@ class CodexAdapter(HarnessAdapter):
         return r if r is not None else super().render(intent, sig)
 
 
+# --------------------------------------------------------------------------- OpenCode (CELE-t139)
+#
+# OpenCode plugin hook name -> the `celeborn hook <event>` event it drives. The plugin normally
+# shells the Celeborn event vocabulary directly (HOOK_EVENTS needs no new entries), so for those
+# names this map is a passthrough; the dotted OpenCode names are kept so a raw SDK event name
+# arriving via the translation path still routes instead of silently mis-dispatching.
+# Sourced from plan/opencode-integration.md §3; reference stub: opencode/scripts/opencode_celeborn.py.
+OPENCODE_HOOK_TO_CELEBORN_EVENT = {
+    "session.created": "session-start",
+    "message.updated": "user-prompt-submit",
+    "tool.execute.before": "pre-tool-use",
+    "tool.execute.after": "post-tool-use",   # touch + activity record, P4 (CELE-t141)
+    "file.edited": "post-tool-use",          # the edit signal that doesn't ride a tool call (P4)
+    "session.idle": "stop",
+    "session.error": "session-end",
+    # session.compacted is deliberately ABSENT (CELE-t142): the plugin maps it straight to
+    # `celeborn record compaction` — the compaction-succeeded metric — with no hook call at all.
+    # Routing it here into pre-compact would fire a second panic-save per compaction; unmapped, a
+    # raw event name arriving via the translation path passes through and dispatch_hook no-ops.
+    "experimental.session.compacting": "pre-compact",
+}
+
+# OpenCode built-in tool name -> gate treatment (plan §2.1 normalization table). Reference data for
+# P3's card gate (CELE-t140) — NOT consulted by _card_gate_pre_tool_use yet.
+OPENCODE_TOOL_GATE_CLASS = {
+    "edit": "gated-edit", "write": "gated-edit", "patch": "gated-edit",
+    "webfetch": "gated-research", "websearch": "gated-research",
+    "task": "gated-delegation",
+    "bash": "never-gated", "read": "never-gated", "glob": "never-gated",
+    "grep": "never-gated", "list": "never-gated",
+}
+
+# OpenCode built-in tool name -> the Claude-cased name the pre-tool-use deny chain matches on
+# (CELE-t140). The redirect/publish guards match tool_name == "Bash" and the card-less gate matches
+# _CARD_GATED_TOOLS exactly, so a lowercase OpenCode name would silently skip all three; normalizing
+# here — in the one translation seam — keeps dispatch_hook single-shape (INTEGRATION.md §3). `patch`
+# has no Claude twin; it maps to Edit (same gated-edit class). Unknown names (MCP/custom tools) pass
+# through unchanged: the deny chain has no opinion on them and the autonomy gate lowercases anyway.
+OPENCODE_TOOL_TO_CLAUDE = {
+    "edit": "Edit", "write": "Write", "patch": "Edit",
+    "webfetch": "WebFetch", "websearch": "WebSearch",
+    "task": "Task",
+    "bash": "Bash", "read": "Read", "glob": "Glob", "grep": "Grep", "list": "List",
+}
+
+
+def _opencode_to_claude_shape(opencode_event: str, opencode_payload: dict) -> tuple:
+    """Translate one OpenCode plugin hook call into the (event, payload) shape dispatch_hook()
+    already understands (`session_id`, `tool_name`, `tool_input`, `prompt`, `reason`, `cwd`).
+
+    Pure, no-I/O, fail-open: only fields present in the payload are lifted, unknown/missing fields
+    degrade to omitted keys, and an unmapped event name passes through unchanged (fails loud in a
+    test rather than silently mis-routing). Same contract as the Grok bridge's payload helpers —
+    a translation bug must never crash the OpenCode plugin process (INTEGRATION.md §3)."""
+    event = OPENCODE_HOOK_TO_CELEBORN_EVENT.get(opencode_event, opencode_event)
+    p = opencode_payload if isinstance(opencode_payload, dict) else {}
+    translated = {}
+    session_id = p.get("sessionID") or p.get("session_id")
+    if session_id:
+        translated["session_id"] = session_id
+    directory = p.get("directory") or p.get("worktree") or p.get("cwd")
+    if directory:
+        translated["cwd"] = directory
+    if p.get("tool"):
+        tool = str(p["tool"])
+        translated["tool_name"] = OPENCODE_TOOL_TO_CLAUDE.get(tool.strip().lower(), tool)
+    if isinstance(p.get("args"), dict):
+        translated["tool_input"] = p["args"]
+    if isinstance(p.get("file"), str) and p["file"] and "tool_input" not in translated:
+        # OpenCode's `file.edited` event carries only the path (P4, CELE-t141) — surface it as an
+        # Edit so the post-tool-use touch path treats it like any other file mutation.
+        translated.setdefault("tool_name", "Edit")
+        translated["tool_input"] = {"file_path": p["file"]}
+    if isinstance(p.get("text"), str):
+        translated["prompt"] = p["text"]
+    if p.get("reason"):
+        translated["reason"] = p["reason"]
+    if p.get("child"):
+        # Subagent marker (CELE-t211, additive per t203 §7.1): the plugin flags sessions it saw
+        # born with a parentID so the card gate's PM auto-provision never claims a card for a
+        # child session (contract §1.2) — they keep the plain deny.
+        translated["child_session"] = True
+    return event, translated
+
+
+class OpenCodeAdapter(HarnessAdapter):
+    """OpenCode: orient injection + capture ride the celeborn.js plugin (opencode/ package), which
+    shells `celeborn hook <event> --harness opencode`. OpenCode has NO structured permission lever
+    today — the P3 card gate is a behavioral throw in tool.execute.before, not a config-file lever —
+    so friction_signals/permission_target stay neutral (quality only), like Grok. The advisor
+    renders the shared slash-command-free voice."""
+
+    name = "opencode"
+
+    def render(self, intent: str, signal: dict | None = None) -> tuple:
+        r = _branded_quality_render(intent, signal)
+        return r if r is not None else super().render(intent, signal)
+
+
 def active_adapter(ctx: Path | None = None, name: str | None = None) -> HarnessAdapter:
     """Resolve the active harness adapter: explicit `name` > $CELEBORN_HARNESS > rc `harness` >
     'claude'. An unknown name degrades to the neutral base adapter (never raises)."""
@@ -7884,7 +11665,7 @@ def active_adapter(ctx: Path | None = None, name: str | None = None) -> HarnessA
     if not chosen:
         chosen = "claude"
     return {"claude": ClaudeAdapter, "grok": GrokAdapter, "codex": CodexAdapter,
-            "neutral": HarnessAdapter}.get(chosen, HarnessAdapter)()
+            "opencode": OpenCodeAdapter, "neutral": HarnessAdapter}.get(chosen, HarnessAdapter)()
 
 
 def _advisor_notice(ctx: Path, session: str | None = None) -> str:
@@ -7989,7 +11770,7 @@ def cmd_advise(args):
     print(f"\n  Silence one: celeborn advise --dismiss <id>")
 
 
-_KNOWN_HARNESSES = ("claude", "grok", "codex", "neutral")
+_KNOWN_HARNESSES = ("claude", "grok", "codex", "opencode", "neutral")
 
 
 def cmd_harness(args):
@@ -8009,6 +11790,121 @@ def cmd_harness(args):
         die(f"unknown harness: {name}\n  known: {', '.join(_KNOWN_HARNESSES)}")
     _update_config(ctx, harness=name)
     ok(f"Pinned harness '{name}' in {ctx / RC_NAME} — `active_adapter` now resolves '{name}' for this repo.")
+
+
+# --------------------------------------------------------------------------- agents & autonomy (t353)
+# The board Settings "Agents & autonomy" section (t144 mockup :543-596). These are the DEFAULTS stamped
+# onto freshly-groomed cards — the per-card autonomy grant still wins at gate time (t212). Persisted in
+# the project's `.celebornrc` under an `autonomy` block; read via `--json`, written via the set-flags.
+# Ship pre-flight is surfaced but LOCKED on: it is the spine discipline, never a board-toggleable field.
+
+def _autonomy_config(ctx: Path) -> dict:
+    """Normalized autonomy defaults from `.celebornrc` (`autonomy` block), overlaid on the built-in
+    defaults so an absent/partial block still yields a complete, valid config. Grants default to
+    `_autoprovision_grants()` (research/edits/tests — never commit); unknown grant tokens are dropped."""
+    block = load_config(ctx).get("autonomy")
+    block = block if isinstance(block, dict) else {}
+
+    raw_grants = block.get("default_grants")
+    if isinstance(raw_grants, list):
+        grants = [g for g in AUTONOMY_GRANTS if g in raw_grants]      # canonical order, unknowns dropped
+    else:
+        grants = _autoprovision_grants()
+
+    nq_keys = [k for k, _ in AUTONOMY_NIGHT_QUESTIONS]
+    night = block.get("night_questions")
+    night = night if night in nq_keys else nq_keys[0]
+
+    try:
+        elves = int(block.get("elves_per_night", 4))
+    except (TypeError, ValueError):
+        elves = 4
+    elves = max(AUTONOMY_ELVES_MIN, min(AUTONOMY_ELVES_MAX, elves))
+
+    pm_keys = [k for k, _ in AUTONOMY_PM_MODELS]
+    pm = block.get("pm_model")
+    pm = pm if pm in pm_keys else pm_keys[0]
+
+    return {"default_grants": grants, "night_questions": night, "elves_per_night": elves, "pm_model": pm}
+
+
+def _autonomy_state_json(ctx: Path) -> dict:
+    """The read-only state the board Settings "Agents & autonomy" section renders: each control's
+    current value plus the option/label vocabulary and bounds, and the LOCKED ship-preflight marker."""
+    cfg = _autonomy_config(ctx)
+    return {
+        "grants": {
+            "value": cfg["default_grants"],
+            "options": [{"value": g, "label": g, "risk": g in _AUTONOMY_GRANT_RISK,
+                         "active": g in cfg["default_grants"]} for g in AUTONOMY_GRANTS],
+        },
+        "night_questions": {
+            "value": cfg["night_questions"],
+            "options": [{"value": k, "label": v} for k, v in AUTONOMY_NIGHT_QUESTIONS],
+        },
+        "elves_per_night": {"value": cfg["elves_per_night"],
+                            "min": AUTONOMY_ELVES_MIN, "max": AUTONOMY_ELVES_MAX},
+        "pm_model": {
+            "value": cfg["pm_model"],
+            "options": [{"value": k, "label": v} for k, v in AUTONOMY_PM_MODELS],
+        },
+        "ship_preflight": {"value": True, "locked": AUTONOMY_SHIP_PREFLIGHT_LOCKED,
+                           "why": AUTONOMY_SHIP_PREFLIGHT_WHY},
+    }
+
+
+def _write_autonomy(ctx: Path, **changes) -> dict:
+    """Merge validated changes into the `.celebornrc` `autonomy` block (preserving the rest of the rc),
+    then return the freshly-normalized config. Values of None are ignored."""
+    cfg = _autonomy_config(ctx)
+    cfg.update({k: v for k, v in changes.items() if v is not None})
+    _update_config(ctx, autonomy=cfg)
+    return _autonomy_config(ctx)
+
+
+def cmd_autonomy(args):
+    """`celeborn autonomy` — read or set the fleet's default autonomy grants and night-run knobs (the
+    defaults a freshly-groomed card inherits; per-card grants still win at gate time, t212). No args
+    prints the current config; `--json` emits it for the board; the set-flags persist to `.celebornrc`.
+    Ship pre-flight is intentionally not settable here — it is locked on as the spine's ship discipline."""
+    ctx = require_context(args)
+
+    if getattr(args, "json", False):
+        print(json.dumps(_autonomy_state_json(ctx), indent=2))
+        return
+
+    changes = {}
+    if getattr(args, "set_grants", None) is not None:
+        changes["default_grants"] = _validate_autonomy(args.set_grants)
+    if getattr(args, "night_questions", None) is not None:
+        keys = [k for k, _ in AUTONOMY_NIGHT_QUESTIONS]
+        if args.night_questions not in keys:
+            die(f"unknown --night-questions '{args.night_questions}'\n  known: {', '.join(keys)}")
+        changes["night_questions"] = args.night_questions
+    if getattr(args, "elves", None) is not None:
+        if not (AUTONOMY_ELVES_MIN <= args.elves <= AUTONOMY_ELVES_MAX):
+            die(f"--elves must be {AUTONOMY_ELVES_MIN}..{AUTONOMY_ELVES_MAX} (got {args.elves})")
+        changes["elves_per_night"] = args.elves
+    if getattr(args, "pm_model", None) is not None:
+        keys = [k for k, _ in AUTONOMY_PM_MODELS]
+        if args.pm_model not in keys:
+            die(f"unknown --pm-model '{args.pm_model}'\n  known: {', '.join(keys)}")
+        changes["pm_model"] = args.pm_model
+
+    if changes:
+        cfg = _write_autonomy(ctx, **changes)
+        ok(f"autonomy defaults updated in {ctx / RC_NAME}.")
+    else:
+        cfg = _autonomy_config(ctx)
+
+    grants = ", ".join(cfg["default_grants"]) or "none"
+    nq_label = dict(AUTONOMY_NIGHT_QUESTIONS)[cfg["night_questions"]]
+    pm_label = dict(AUTONOMY_PM_MODELS)[cfg["pm_model"]]
+    info(f"Default autonomy grants: {grants}  (commit is never implied — grant it eyes-open)")
+    info(f"Night questions:         {nq_label}")
+    info(f"Elves per night run:     {cfg['elves_per_night']}")
+    info(f"Project manager:         {pm_label}")
+    info(f"Ship pre-flight:         ON — locked ({AUTONOMY_SHIP_PREFLIGHT_WHY})")
 
 
 def cmd_permissions(args):
@@ -8070,6 +11966,55 @@ def cmd_permissions(args):
              "network host, and use every MCP tool; Claude will NOT ask permission (bypassPermissions).")
         ok(f"wrote {target}: +{len(rep['added'])} rule(s), defaultMode={DANGER_DEFAULT_MODE}. Disarm: "
            f"`celeborn permissions --danger-zone --disarm{' --global' if scope == 'global' else ''}`.")
+        return
+
+    # t351 — per-rule verbs backing the board's grouped-chip Permissions panel. Default scope is the
+    # committed project settings.json (--shared), since that panel describes ".claude/settings.json";
+    # --global / (bare) local still override.
+    per_rule_scope = ("global" if getattr(args, "global_", False)
+                      else "local" if getattr(args, "local", False) else "shared")
+
+    if getattr(args, "add", None) is not None:
+        kind = getattr(args, "kind", None) or "allow"
+        if kind not in PERMISSION_RULE_KINDS:
+            die(f"--kind must be one of {', '.join(PERMISSION_RULE_KINDS)}.")
+        rule = args.add.strip()
+        if not rule:
+            die("--add requires a non-empty rule pattern, e.g. --add 'Bash(npm run build:*)'.")
+        target = _settings_path_for_scope(ctx, per_rule_scope)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = _backup_and_load_settings(target)
+        rep = _add_permission_rule(data, rule, kind)
+        _atomic_write_json(target, data)
+        ok(f"{'added' if rep['added'] else 'already present:'} {kind} rule {rule!r} -> {target}"
+           + ("." if rep["added"] else " — no change."))
+        return
+
+    if getattr(args, "rm", None) is not None:
+        rule = args.rm.strip()
+        if not rule:
+            die("--rm requires the exact rule string to remove.")
+        target = _settings_path_for_scope(ctx, per_rule_scope)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = _backup_and_load_settings(target)
+        rep = _remove_permission_rule(data, rule)
+        _atomic_write_json(target, data)
+        if rep["removed_from"]:
+            ok(f"removed rule {rule!r} from {', '.join(rep['removed_from'])} in {target}.")
+        else:
+            ok(f"rule {rule!r} not found in {target} — no change.")
+        return
+
+    if getattr(args, "set_mode", None) is not None:
+        mode = args.set_mode.strip()
+        if mode and mode not in VALID_PERMISSION_MODES:
+            die(f"--set-mode must be one of {', '.join(sorted(VALID_PERMISSION_MODES))} (or '' to unset).")
+        target = _settings_path_for_scope(ctx, per_rule_scope)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = _backup_and_load_settings(target)
+        _set_permission_mode(data, mode)
+        _atomic_write_json(target, data)
+        ok(f"defaultMode {('set to ' + mode) if mode else 'unset'} -> {target}.")
         return
 
     adapter = active_adapter(ctx, getattr(args, "harness", None))
@@ -8225,8 +12170,15 @@ def cmd_doctor(args):
     # state.md budget
     sp = ctx / "state.md"
     if sp.is_file():
-        n = len(sp.read_text().splitlines())
-        if n > cfg["state_max_lines"]:
+        text = sp.read_text()
+        n = len(text.splitlines())
+        _, state_hist = plan_state_archive(text, cfg.get("state_keep_sessions", 6))
+        if state_hist:
+            warn(f"state.md carries {len(state_hist)} old ## Now history bullet(s) past the "
+                 f"keep-{cfg.get('state_keep_sessions', 6)} cap — run `celeborn archive` "
+                 f"(auto-trims on capture when auto_archive is on)")
+            warnings += 1
+        elif n > cfg["state_max_lines"]:
             warn(f"state.md is {n} lines (budget {cfg['state_max_lines']}) — condense it")
             warnings += 1
         else:
@@ -8289,6 +12241,28 @@ def cmd_doctor(args):
                  + " — replace with a card-specific one when you pick them up.")
         else:
             ok("every open card carries a Stop condition")
+        # Spine discipline (CELE-t282, design §4): the spine head — the first READY todo card in
+        # board order, exactly what `celeborn next` would dispatch — must be startable verbatim by
+        # a fresh agent: blockers done, real Stop condition, a brief in the note, no open question.
+        # Head-only by design: the ship ritual repairs the spine one card at a time; flagging the
+        # whole column would be noise nobody actions.
+        if any(t["state"] == "todo" for t in all_tasks):
+            sp_ready, _ = _ready_set(all_tasks, _archived_done_ids(ctx))
+            if not sp_ready:
+                warn("spine has no READY head — every todo card is blocked; a fresh agent has nothing startable")
+                print("  Fix:  unblock or reorder the spine — `celeborn next --all` shows the ready set")
+                warnings += 1
+            else:
+                head = sp_ready[0]
+                head_why = _spine_audit(head, alerts=_live_alerts(ctx))
+                if head_why:
+                    warn(f"spine head [{_display_tid(ctx, head['id'])}] is not startable verbatim: "
+                         + "; ".join(head_why))
+                    print(f"  Fix:  celeborn tasks edit {head['id']} --stop \"<clean /clear point>\" "
+                          f"--note \"<3-8 line brief>\"   (design: docs/plans/cele-t144-spine-and-stage.md §4)")
+                    warnings += 1
+                else:
+                    ok(f"spine head [{_display_tid(ctx, head['id'])}] is READY — startable verbatim")
         # Progress-engine drift (CELE-t161): a doing card stuck at 0% that already has commits carrying
         # its trailer means the engine never moved it — flag so it's visible (complements the Stop check).
         drifted = [t for t in all_tasks if t.get("state") == "doing"
@@ -8367,6 +12341,23 @@ def cmd_doctor(args):
     else:
         ok("no obvious secrets in committed memory")
 
+    # secrets discipline (CELE-t224) — live secret VALUES in repo .env* files belong in the vault,
+    # not on disk where they get committed or pasted into prompts. The scan is free for everyone;
+    # the vault it points at (`celeborn secrets`) is the Pro Infisical integration.
+    env_hits = _env_file_secret_hits(ctx.parent, cfg["secret_patterns"])
+    if env_hits:
+        for fname, key in env_hits:
+            warn(f"LIVE SECRET VALUE in {fname} — `{key}` looks like a real credential")
+        if (ctx.parent / ".infisical.json").is_file() or load_config(ctx).get("secrets"):
+            print("  Fix:  move it to the vault — `celeborn secrets set <NAME>` — then delete the line "
+                  "(consume via `celeborn secrets run -- <cmd>`)")
+        else:
+            print("  Fix:  vault it — `celeborn secrets setup` (Pro), then `celeborn secrets set <NAME>` "
+                  "and delete the line")
+        warnings += len(env_hits)
+    else:
+        ok("no live secret values in repo .env files")
+
     # install integrity — shipped core modules vs the published per-version checksum manifest.
     # Detection, not prevention: an in-place edit means the install no longer matches the release, so a
     # "works after I hacked celeborn.py" break self-reports here instead of becoming a confused bug
@@ -8423,6 +12414,43 @@ def cmd_doctor(args):
             warn("missing .grok/rules/celeborn.md — run `celeborn grok sync-rules`")
             warnings += 1
 
+    # Sovereign weave — Engine Room health + pin drift (CELE-t375; wording from
+    # references/weave-contract.md §4). ADVISORY ONLY (rule 4: doctor explains drift, never blocks) —
+    # a drift ⚠ counts as a warning (exit 0), an optional • is pure info; nothing here is a `problem`.
+    wst = _weave_status(ctx)
+    pins = wst["pins"]
+    room = _engine_room_status(ctx)
+    print(f"  Engine Room: {room['headline']}")
+    for e in _ENGINES:
+        r = room["engines"][e]
+        prov = f" ({r['provenance']})" if r.get("provenance") else ""
+        info(f"{r['label']}: {r['state']}{prov} · {r['base']}")
+    oc_inst = wst["opencode"]["version"]
+    if oc_inst and oc_inst != pins["opencode_version"]:
+        warn(f"OpenCode {oc_inst} is installed; Celeborn's plugin is tested against {pins['opencode_version']}.")
+        print("      This is fine — nothing is blocked. If the board Stage or PM misbehaves, run")
+        print("      `celeborn opencode wire` to re-pin the plugin, or install the tested version from")
+        print("      https://opencode.ai. Celeborn never changes your OpenCode for you.")
+        warnings += 1
+    ol_inst = wst["ollama"]["version"]
+    if ol_inst and _version_lt(ol_inst, pins["ollama_floor"]):
+        warn(f"Ollama {ol_inst} is below Celeborn's tested floor {pins['ollama_floor']}. The engine may still work;")
+        print("      if `ollama pull` or serve behaves oddly, update Ollama from https://ollama.com. Not blocked.")
+        warnings += 1
+    for tag, present in wst["models"].items():
+        if not present:
+            info(f"Pippin's model {tag} isn't pulled yet (~2.5 GB). Run `celeborn ollama pull {tag}` to")
+            print("      enable the local PM/assistant. Optional — Celeborn runs fine on Claude Code or Grok.")
+    if any(str(m.get("name") or "").removesuffix(":latest") == "qwen-4b"
+           for m in _ollama_status(ctx).get("models") or []):
+        info("A local `qwen-4b` alias is present — that name is retired. Celeborn now uses the upstream")
+        print("      tags qwen3:4b-instruct (Pippin·PM) and qwen3:4b (Pippin·ghost). The alias is harmless;")
+        print("      you may `ollama rm qwen-4b` once nothing references it.")
+    if (oc_inst and oc_inst == pins["opencode_version"] and ol_inst
+            and not _version_lt(ol_inst, pins["ollama_floor"]) and all(wst["models"].values())):
+        ok(f"Sovereign weave aligned: OpenCode {oc_inst}, Ollama {ol_inst}, "
+           f"Pippin {pins['pippin_pm']} + {pins['pippin_ghost']}.")
+
     print(f"\n{warnings} warning(s), {problems} problem(s).")
     if problems:
         print("Doctor found problems that should be fixed.")
@@ -8461,6 +12489,31 @@ def _secret_scan(ctx: Path, patterns: list[str]) -> list[str]:
             if rx.search(text):
                 hits.append(str(path.relative_to(ctx)))
                 break
+    return hits
+
+
+def _env_file_secret_hits(root: Path, patterns: list[str]) -> list[tuple[str, str]]:
+    """(filename, KEY) pairs for repo-root `.env*` entries whose VALUE matches a secret pattern —
+    i.e. a live credential sitting on disk, not just a declared name. Example/template files are
+    skipped (their whole point is placeholder values). Used by doctor, the secrets-on-disk advise
+    signal, and `celeborn secrets doctor` (CELE-t224)."""
+    regexes = [re.compile(p) for p in patterns]
+    hits: list[tuple[str, str]] = []
+    for path in sorted(root.glob(".env*")):
+        if not path.is_file() or path.name.endswith((".example", ".sample", ".template")):
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            val = val.strip().strip("\"'")
+            if val and any(rx.search(val) for rx in regexes):
+                hits.append((path.name, key.strip()))
     return hits
 
 
@@ -8681,6 +12734,18 @@ def _valid_task_id(tid: str) -> bool:
     return bool(tid and re.fullmatch(r"[A-Za-z0-9_-]+", tid))
 
 
+def _validate_autonomy(value: str) -> list[str]:
+    """Normalize a `--autonomy` grant list to canonical AUTONOMY_GRANTS order; die on any unknown
+    token. Validation is strict at the CLI on purpose — grooming is where a typo would otherwise
+    become a silently-denied overnight run (an unknown token grants nothing, t203 §3.4)."""
+    toks = _csv((value or "").lower())
+    unknown = [x for x in toks if x not in AUTONOMY_GRANTS]
+    if unknown:
+        die(f"unknown autonomy grant(s): {', '.join(unknown)} — the vocabulary is "
+            f"{', '.join(AUTONOMY_GRANTS)} (t203 §3.4; `commit` = git-write, never implied)")
+    return [g for g in AUTONOMY_GRANTS if g in toks]
+
+
 def _parse_tasks(text: str) -> list[dict]:
     """Parse tasks.md into a list of task dicts. Each `## [id] title` block carries `- key: value`
     metadata lines; any remaining lines become the task's freeform notes."""
@@ -8719,6 +12784,12 @@ def _parse_tasks(text: str) -> list[dict]:
             "tags": _csv(meta.get("tags", "")),
             "blocked_by": _csv(meta.get("blocked-by", "")),
             "phase": meta.get("phase", ""),  # which plan phase card this task drills down from
+            # Spine branding (CELE-t380): `spine` is the group slug shared by every card minted from
+            # one plan; `emoji` is that spine's single purpose-emoji, unique per project across
+            # distinct slugs. "" on unbranded/legacy cards. The JSON projection surfaces the slug as
+            # `spine_id` (the `spine` JSON key is the CELE-t282 stamp object, kept distinct).
+            "spine": meta.get("spine", ""),
+            "emoji": meta.get("emoji", ""),
             # Logical Stop condition: a clearly-defined "this is a clean place to stop" marker, so the
             # model knows when the card is at a defensible `/clear` point (CELE-t81). Free text;
             # "" on legacy cards that predate the field — auto-filled with a default on `tasks add`.
@@ -8731,6 +12802,12 @@ def _parse_tasks(text: str) -> list[dict]:
             # first-work 10, then the milestone band). 0/absent on non-engine cards → no effect.
             "engine_floor": _clamp_pct(meta.get("engine-floor", 0)),
             "jira": meta.get("jira", ""),    # linked Jira issue key (e.g. SCRUM-2); set by `jira pull`
+            "github": meta.get("github", ""),  # linked GitHub Issue number (mirror repo); set by `github push/pull` (CELE-t214)
+            # Autonomy grants (CELE-t212, t203 §3.4): what the owning session may do without a human,
+            # set at grooming time. Tokens are kept as written (lowercased) — the gate ignores anything
+            # outside AUTONOMY_GRANTS, so a hand-edited unknown token grants nothing rather than being
+            # silently rewritten here. [] on ungroomed cards → most-restrictive under a promptless harness.
+            "autonomy": _csv((meta.get("autonomy", "")).lower()),
             "created": meta.get("created", ""),
             "updated": meta.get("updated", ""),
             "subtasks": subtasks,  # checklist (CELE-t106); derives progress when present
@@ -8759,6 +12836,10 @@ def _render_tasks(tasks: list[dict], *, header: str = TASKS_HEADER) -> str:
         out.append(f"- tags: {', '.join(t['tags'])}")
         out.append(f"- blocked-by: {', '.join(t['blocked_by'])}")
         out.append(f"- phase: {t['phase']}")
+        if t.get("spine"):    # CELE-t380; only when set, so unbranded cards stay byte-identical
+            out.append(f"- spine: {t['spine']}")
+        if t.get("emoji"):    # CELE-t380; the spine's purpose-emoji brand
+            out.append(f"- emoji: {t['emoji']}")
         out.append(f"- stop: {t.get('stop', '')}")  # logical Stop condition (CELE-t81); always rendered so every card advertises the slot
         if t.get("progress"):  # only when >0, so legacy cards stay byte-identical (CELE-t106)
             out.append(f"- progress: {_clamp_pct(t['progress'])}")
@@ -8766,6 +12847,10 @@ def _render_tasks(tasks: list[dict], *, header: str = TASKS_HEADER) -> str:
             out.append(f"- engine-floor: {_clamp_pct(t['engine_floor'])}")
         if t.get("jira"):
             out.append(f"- jira: {t['jira']}")
+        if t.get("github"):
+            out.append(f"- github: {t['github']}")
+        if t.get("autonomy"):  # CELE-t212; only when set, so ungroomed cards stay byte-identical
+            out.append(f"- autonomy: {', '.join(t['autonomy'])}")
         out.append(f"- created: {t['created']}")
         out.append(f"- updated: {t['updated']}")
         if t.get("subtasks"):  # checklist block (CELE-t106) — rendered between metadata and notes
@@ -8787,6 +12872,9 @@ def _tasks_doc(ctx: Path, tasks: list[dict]) -> dict:
     cfg = load_config(ctx)
     slug = project_slug(ctx)
     qualified = bool(cfg.get("qualified_task_ids"))
+    # Spine annotation (CELE-t282): position + READY stamp + why-not, computed HERE in code — the
+    # rail and the PM render these verbatim, they never re-derive the predicate client-side.
+    spine = _spine_doc(ctx, tasks, alerts=alerts)
 
     def _enrich(t: dict) -> dict:
         owner = (t.get("owner") or "").strip()
@@ -8806,6 +12894,12 @@ def _tasks_doc(ctx: Path, tasks: list[dict]) -> dict:
             # Live blocked-alert (CELE-t169) — only doing cards can be blocked; None means clear. Rides
             # the projection so the local board + hosted push both carry the badge; not a tasks.md field.
             "alert": alerts.get(t["id"]) if t.get("state") == "doing" else None,
+            # Spine stamp (CELE-t282) — {pos, ready, why} on todo cards, None elsewhere. Projection-
+            # only, never a tasks.md field: the stamp is derived state, recomputed on every save.
+            "spine": spine.get(t["id"]),
+            # Spine branding (CELE-t380): the group slug rides `spine_id` (not `spine`, which is the
+            # stamp above) so the board can group/brand cards; `emoji` already arrives via **t.
+            "spine_id": t.get("spine", ""),
         }
 
     enriched = [_enrich(t) for t in tasks]
@@ -8876,7 +12970,11 @@ def _save_tasks(ctx: Path, tasks: list[dict], *, autopush_ids: list[str] | None 
         except Exception:
             pass  # auto-push is best-effort — never break tasks save
         try:
-            # Live-push the changed cards to the hosted board so celeborn.thot.ai updates in ~realtime
+            __import__("celeborn_github").schedule_auto_push(ctx, tasks, autopush_ids)  # CELE-t214
+        except Exception:
+            pass  # GitHub mirror auto-push is best-effort too
+        try:
+            # Live-push the changed cards to the hosted board so celeborncode.ai updates in ~realtime
             # (detached + gated; a no-op when hosted sync isn't configured / signed in).
             __import__("celeborn_sync").schedule_hosted_push(ctx, autopush_ids)
         except Exception:
@@ -9075,10 +13173,11 @@ def _activity_signal_corpus(ctx: Path) -> str:
 
 def _task_has_touch(ctx: Path, tid: str) -> bool:
     _, bare = _split_qualified_tid(tid)
-    for meta in (_load_touches(ctx).get("files") or {}).values():
-        t = (meta or {}).get("task") or ""
-        if t and (_split_qualified_tid(t)[1] == bare):
-            return True
+    for recs in (_load_touches(ctx).get("files") or {}).values():
+        for meta in recs:
+            t = (meta or {}).get("task") or ""
+            if t and (_split_qualified_tid(t)[1] == bare):
+                return True
     return False
 
 
@@ -9324,7 +13423,7 @@ def cmd_progress(args):
 def cmd_alert(args):
     """`celeborn alert <id> [--message …] [--kind permission|idle|stopped] [--session …]` — the
     reusable "coding progress is blocked, the user's input is needed" service (CELE-t169). Raises a
-    live alert on a DOING card so it surfaces on the board (locally + celeborn.thot.ai). The
+    live alert on a DOING card so it surfaces on the board (locally + celeborncode.ai). The
     Notification/Stop hooks are its first callers; any external system can call it the same way.
       celeborn alert <id> --message "…"      raise/refresh an alert
       celeborn alert <id> --clear            drop it (also happens automatically when the user replies)
@@ -9365,6 +13464,107 @@ def cmd_alert(args):
     except Exception:  # noqa: BLE001
         pass
     ok(f"🔔 alerted [{disp}] — {rec['kind']}" + (f": {rec['message']}" if rec.get("message") else ""))
+
+
+def cmd_ask(args):
+    """`celeborn ask "<question>" [--session …] [--card …] [--options a,b,c] [--json]` — park a
+    human-in-the-loop question so the board's dock can answer it (CELE-t280). The `ask_human`
+    OpenCode tool is the primary caller: it files the ask, raises the card alert (so the question
+    surfaces on the Stage dock), then polls `celeborn ask-status <id>` until answered. Prints the
+    askId (or {id, card, …} with --json)."""
+    ctx = require_context(args)
+    question = (getattr(args, "question", "") or "").strip()
+    if not question:
+        die("ask requires a question")
+    session = (getattr(args, "session", "") or _ambient_session_id()).strip()
+    card_arg = getattr(args, "card", "") or ""
+    card = (_split_qualified_tid(_resolve_task_arg(ctx, card_arg))[1] if card_arg
+            else _split_qualified_tid(_session_task_id(ctx, session))[1])
+    options = [o.strip() for o in re.split(r"[,\n]", getattr(args, "options", "") or "") if o.strip()]
+    rec = _new_ask(ctx, session, card, question, options)
+    # Surface it on the dock now by raising the card's blocked-alert (kind=permission → needs the
+    # user). Only a DOING card carries an alert; a card-less ask still parks (the tool can poll).
+    if card:
+        t = _find_task(_load_tasks(ctx), card)
+        if t and t.get("state") == "doing":
+            _set_alert(ctx, card, "permission", question, session)
+            _refresh_alerted_card(ctx, card)
+            try:
+                __import__("celeborn_sync").schedule_agents_push(ctx, min_interval_s=0)
+            except Exception:  # noqa: BLE001
+                pass
+    if getattr(args, "json", False):
+        print(json.dumps({"id": rec["id"], "card": card, "question": question, "options": options}))
+    else:
+        print(rec["id"])
+
+
+def cmd_ask_status(args):
+    """`celeborn ask-status <askId> [--json]` — the poll the `ask_human` tool loops on. Prints the
+    answer once it lands (nothing while pending); with --json, {answered, answer}. Always exits 0 so
+    a poller reads pending (answered=false) apart from a real error (die → non-zero)."""
+    ctx = require_context(args)
+    rec = _load_asks(ctx).get("asks", {}).get(args.ask_id)
+    if rec is None:
+        die(f"no such ask {args.ask_id!r}")
+    answered = rec.get("answer") is not None
+    if getattr(args, "json", False):
+        print(json.dumps({"answered": answered, "answer": rec.get("answer")}))
+    elif answered:
+        print(rec["answer"])
+
+
+def cmd_answer(args):
+    """`celeborn answer <card> --kind permission|text --response "<a>" [--session …] [--question …]`
+    — deliver a human's dock answer and journal it (CELE-t280). PERMISSION answers have already
+    resumed the session live (the board POSTed once/always/reject to OpenCode); this only records
+    them. TEXT answers fill the open `ask_human` ask (the blocking tool returns) or — if nothing is
+    waiting — fall through to the outbox for the agent's next turn. Every answer is journaled to the
+    card (compact note trail) and journal.md, and the card's blocked-alert is cleared."""
+    ctx = require_context(args)
+    resolved = _split_qualified_tid(_resolve_task_arg(ctx, args.card))[1]
+    card = _find_task(_load_tasks(ctx), resolved)
+    if card is None:
+        die(f"no task with id {args.card!r}")
+    disp = _display_tid(ctx, resolved)
+    kind = (getattr(args, "kind", "") or "text").strip()
+    answer = (getattr(args, "response", "") or "").strip()
+    if not answer:
+        die("answer requires --response")
+    session = (getattr(args, "session", "") or "").strip()
+    question = (getattr(args, "question", "") or "").strip()
+    # Per-prompt model the human picked in the dock/prompt-line [model ▾] (CELE-t346). It rides the
+    # journal + card trail, and — on the outbox path — the delivered message, so the next turn knows
+    # which model the operator asked the agent to answer with.
+    model = (getattr(args, "model", "") or "").strip()
+
+    if kind == "permission":
+        how = f"permission:{answer}"      # once | always | reject; the live resume already happened
+    else:
+        rec = _open_ask_for(ctx, session=session, card=resolved)
+        if rec is not None:
+            question = question or rec.get("question", "")
+            _answer_ask(ctx, rec["id"], answer)
+            how = "ask_human"
+        else:
+            # Nothing is blocking on an answer — deliver it as the agent's next-turn prompt.
+            addressee = session[:6] if session else (card.get("owner") or "")
+            msg = (f"💬 Board answer to your question — {question!r}:\n\n{answer}"
+                   if question else f"💬 Message from the board:\n\n{answer}")
+            if model:
+                msg += f"\n\n(requested model: {model})"
+            _outbox_queue(ctx, msg, addressee, tag=" dock-answer")
+            how = "outbox"
+
+    _append_card_qa(ctx, resolved, question, answer, kind, model)
+    _journal_dock_qa(ctx, disp, question, answer, how, kind, model)
+    _clear_alert(ctx, resolved)          # the session is no longer awaiting the user (CELE-t195)
+    _refresh_alerted_card(ctx, resolved)
+    try:
+        __import__("celeborn_sync").schedule_agents_push(ctx, min_interval_s=0)
+    except Exception:  # noqa: BLE001
+        pass
+    ok(f"answered [{disp}] via {how}: {answer}")
 
 
 def _reorder_task(tasks: list[dict], tid: str, direction: str) -> list[dict]:
@@ -9438,6 +13638,346 @@ def _archive_overflow_done(ctx: Path, tasks: list[dict], cfg: dict) -> tuple[lis
     return remaining, overflow
 
 
+# --------------------------------------------------------------------------- NEXT-UP selector (CELE-t219)
+#
+# A small PM model handed the raw board text cannot be trusted to pick the next card: in the
+# 2026-07-04 test the Qwen-4b PM fixated on one card's agent-protocol block and answered "none"
+# past a plainly ready card. So readiness is computed HERE, deterministically, and the PM's job
+# collapses to invoking `celeborn next` and echoing the answer verbatim. Everything this path
+# emits is data-only — card id + title, no notes, no protocol boilerplate.
+
+def _strip_protocol(text: str) -> str:
+    """Cut agent-protocol boilerplate out of emitted card text. A title (or any text) that had a
+    protocol block pasted into it must never reach the NEXT-UP emitter's output — a small PM model
+    mistakes it for card data (CELE-t219 evidence)."""
+    if AGENT_PROTOCOL_MARKER in text:
+        text = text.split(AGENT_PROTOCOL_MARKER, 1)[0]
+    return text.strip()
+
+
+def _archived_done_ids(ctx: Path) -> set[str]:
+    """Ids of done cards FIFO-archived off the board (done-archive.md). The READY predicate treats
+    them as Done — a blocker that shipped long ago must not wedge its dependents just because the
+    Done column capped out and the card aged into the archive."""
+    p = ctx / DONE_ARCHIVE_FILE
+    return {t["id"] for t in _parse_tasks(p.read_text())} if p.is_file() else set()
+
+
+def _ready_set(tasks: list[dict], archived_done: set[str], *,
+               tags: list[str] | None = None,
+               phase: str = "") -> tuple[list[dict], dict[str, list[str]]]:
+    """READY = state todo AND every `blocked_by` id Done (on the board, or archived-done). Pure and
+    deterministic: board order in, board order out — the todo column is already priority-ordered
+    (`tasks reorder`), so callers take [0] as NEXT-UP with no judgment of their own (CELE-t219).
+
+    A blocker found nowhere (not on the board, not in the archive) counts as satisfied: ids are
+    never reused, so a vanished blocker was either archived-then-FIFO-dropped (it was Done) or
+    deliberately `rm`'d — wedging the dependent forever helps no one. Those ids come back in the
+    second return value, keyed by dependent card id, so the caller can flag them for a human.
+
+    Filters: `tags` — the card must carry every listed tag; `phase` — exact match."""
+    by_id = {t["id"]: t for t in tasks}
+    ready: list[dict] = []
+    unknown: dict[str, list[str]] = {}
+    for t in tasks:
+        if t["state"] != "todo":
+            continue
+        if tags and not set(tags) <= set(t["tags"]):
+            continue
+        if phase and t["phase"] != phase:
+            continue
+        blocked = False
+        for b in t["blocked_by"]:
+            bt = by_id.get(b)
+            if bt is not None:
+                if bt["state"] != "done":
+                    blocked = True
+                    break
+            elif b not in archived_done:
+                unknown.setdefault(t["id"], []).append(b)
+        if not blocked:
+            ready.append(t)
+    return ready, unknown
+
+
+def _ready_card_doc(ctx: Path, t: dict, cfg: dict) -> dict:
+    """Machine form of one ready card for `next --json`. Deliberately thin — id, display id, title
+    and the routing fields (tags/phase/blocked-by); never notes or protocol text."""
+    return {
+        "id": t["id"],
+        "display_id": _display_tid(ctx, t["id"], cfg=cfg),
+        "title": _strip_protocol(t["title"]),
+        "tags": t["tags"],
+        "phase": t["phase"],
+        "blocked_by": t["blocked_by"],
+    }
+
+
+# --------------------------------------------------------------------------- spine discipline (CELE-t282)
+#
+# The Spine invariant (docs/plans/cele-t144-spine-and-stage.md §4): card ① — the first READY todo
+# card in board order — must, at all times, be startable by a FRESH agent with zero project context
+# beyond orient. `_ready_set` (CELE-t219) settles blockers; startability adds three more mechanical
+# clauses: a real Stop condition, a brief in the note, no open question on the card. All of it is
+# a field-by-field predicate in code — the no-think PM (t283) and the board rail render stamps,
+# they never re-derive them.
+
+SPINE_BRIEF_MIN_CHARS = 60   # a startable card carries a 3-8 line brief; below this it's a bare title
+
+
+def _spine_audit(t: dict, *, alerts: dict | None = None) -> list[str]:
+    """Startability violations for one spine card, beyond blocker-readiness (which is
+    `_ready_set`'s job): real Stop condition, brief present, no open question. Returns [] when the
+    card is startable verbatim. Pure field checks — evaluable by anything, reasoned by nothing."""
+    why: list[str] = []
+    stop = (t.get("stop") or "").strip()
+    if not stop:
+        why.append("no Stop condition")
+    elif stop == DEFAULT_STOP:
+        why.append("Stop condition is still the auto-filled default")
+    brief = _strip_protocol(t.get("notes") or "")
+    if len(brief) < SPINE_BRIEF_MIN_CHARS:
+        why.append(f"brief too thin ({len(brief)}/{SPINE_BRIEF_MIN_CHARS} chars in the note)")
+    rec = (alerts or {}).get(t["id"])
+    if rec and rec.get("kind") != "spine":
+        # Carry the question itself into the why so the rail's ✋ and the ship pre-flight show WHAT
+        # is being asked, not just that it exists. A `spine`-kind alert is excluded on purpose: that
+        # is the PM's own hand (CELE-t283) — an ECHO of the violations this function already found,
+        # never an independent input. Feeding it back would let a stale hand wedge `ship --strict`
+        # whenever the PM daemon isn't running to clear it.
+        msg = (rec.get("message") or "").strip()
+        why.append(f"open question on the card — {msg}" if msg else "open question on the card (alert raised)")
+    return why
+
+
+def _spine_doc(ctx: Path, tasks: list[dict], *, alerts: dict | None = None) -> dict[str, dict]:
+    """Per-card spine annotation for the board projection: position (board order within the todo
+    column — the spine is a total order, not a pool), the full READY stamp, and the why-not
+    reasons. Keyed by card id; only todo cards appear. A blocker missing from the board counts
+    done (`_ready_set` semantics — ids are never reused, so a vanished blocker shipped or was
+    deliberately removed)."""
+    by_id = {t["id"]: t for t in tasks}
+    if alerts is None:
+        alerts = _live_alerts(ctx)
+    out: dict[str, dict] = {}
+    pos = 0
+    for t in tasks:
+        if t["state"] != "todo":
+            continue
+        pos += 1
+        waiting = [b for b in t["blocked_by"] if b in by_id and by_id[b]["state"] != "done"]
+        why = (["waiting on " + ", ".join(waiting)] if waiting else []) + _spine_audit(t, alerts=alerts)
+        # The PM's raised hand (CELE-t283): board-visible on the rail, appended AFTER the audit so
+        # the predicate stays pure — the hand echoes violations, it never creates one.
+        rec = (alerts or {}).get(t["id"])
+        if rec and rec.get("kind") == "spine" and (rec.get("message") or "").strip():
+            why.append(f"✋ {rec['message'].strip()}")
+        out[t["id"]] = {"pos": pos, "ready": not why, "why": why}
+    return out
+
+
+def _spine_preflight(ctx: Path, tasks: list[dict], shipped_id: str) -> tuple[dict | None, list[str]]:
+    """The ship ritual's gate (§4): you may not ship card N until the next spine card is startable
+    verbatim. Simulates the post-ship board (the shipping card counted Done, so its dependents
+    unblock), takes the head `_ready_set` would dispatch — t219 verbatim, never a blocked card —
+    and audits it. Returns (head-card-or-None, violations); (None, []) means the spine is empty."""
+    sim = [dict(t, state="done") if t["id"] == shipped_id else t for t in tasks]
+    if not any(t["state"] == "todo" for t in sim):
+        return None, []
+    ready, _ = _ready_set(sim, _archived_done_ids(ctx))
+    if not ready:
+        return None, ["spine has no READY head — every todo card is blocked"]
+    return ready[0], _spine_audit(ready[0], alerts=_live_alerts(ctx))
+
+
+# --------------------------------------------------------------------------- spine branding (CELE-t380)
+# Every spine (the group of cards minted from one plan, keyed by the `spine` slug) carries ONE
+# purpose-emoji, unique per project across distinct slugs, so spines read as visually distinct on the
+# board. The agent proposes the emoji at plan/mint time; these helpers enforce the two invariants:
+#   A. all cards sharing a spine slug share one emoji;  B. distinct slugs never share an emoji.
+
+def _norm_emoji(s: str) -> str:
+    """Normalize a proposed brand glyph: strip surrounding whitespace. A brand is a single glyph
+    (possibly a ZWJ/variation-selector sequence like ⚙️) — internal whitespace is rejected upstream."""
+    return (s or "").strip()
+
+
+def _spine_brand_conflict(tasks: list[dict], emoji: str, spine_slug: str) -> str:
+    """The slug of a DIFFERENT spine already branded with `emoji` on this project, or "" if free.
+    Enforces invariant B — the per-project uniqueness the collision check rejects on add/set."""
+    emoji = _norm_emoji(emoji)
+    if not emoji:
+        return ""
+    for t in tasks:
+        other = (t.get("spine") or "").strip()
+        if other and other != spine_slug and _norm_emoji(t.get("emoji", "")) == emoji:
+            return other
+    return ""
+
+
+def _emoji_for_slug(tasks: list[dict], spine_slug: str) -> str:
+    """The emoji currently branding `spine_slug` (invariant A means it's single-valued), or ""."""
+    for t in tasks:
+        if (t.get("spine") or "").strip() == spine_slug and _norm_emoji(t.get("emoji", "")):
+            return _norm_emoji(t["emoji"])
+    return ""
+
+
+def _taken_emoji(tasks: list[dict]) -> dict[str, str]:
+    """{emoji: slug} for every branded spine on the project — shown to the agent so it can pick an
+    unused glyph on collision."""
+    out: dict[str, str] = {}
+    for t in tasks:
+        slug, emoji = (t.get("spine") or "").strip(), _norm_emoji(t.get("emoji", ""))
+        if slug and emoji:
+            out.setdefault(emoji, slug)
+    return out
+
+
+def _spines_summary(tasks: list[dict]) -> list[dict]:
+    """One row per distinct spine slug: {slug, emoji, counts:{todo,doing,done}, total}, ordered by
+    first appearance. Drives `celeborn spine ls` and any board spine-header grouping."""
+    order: list[str] = []
+    agg: dict[str, dict] = {}
+    for t in tasks:
+        slug = (t.get("spine") or "").strip()
+        if not slug:
+            continue
+        if slug not in agg:
+            order.append(slug)
+            agg[slug] = {"slug": slug, "emoji": "", "counts": {s: 0 for s in TASK_STATES}, "total": 0}
+        row = agg[slug]
+        if not row["emoji"] and _norm_emoji(t.get("emoji", "")):
+            row["emoji"] = _norm_emoji(t["emoji"])
+        st = t["state"] if t["state"] in TASK_STATES else "todo"
+        row["counts"][st] += 1
+        row["total"] += 1
+    return [agg[s] for s in order]
+
+
+def _apply_spine_brand(tasks: list[dict], spine_slug: str, emoji: str) -> int:
+    """Set `emoji` on every card in `spine_slug` (invariant A: brand a spine atomically). Returns
+    the number of cards restamped."""
+    emoji = _norm_emoji(emoji)
+    n = 0
+    for t in tasks:
+        if (t.get("spine") or "").strip() == spine_slug:
+            if _norm_emoji(t.get("emoji", "")) != emoji:
+                t["emoji"] = emoji
+                t["updated"] = now_iso()
+            n += 1
+    return n
+
+
+def _brand_error(tasks: list[dict], spine_slug: str, emoji: str) -> str:
+    """Validate a proposed (spine, emoji) branding against both invariants; return a human-facing
+    error message (with the taken-list so the agent can pick the next best fit), or "" if it's OK.
+    Shared by `tasks add`, `tasks edit`, and `spine set`."""
+    spine_slug, emoji = (spine_slug or "").strip(), _norm_emoji(emoji)
+    if not emoji:
+        return ""
+    if any(ch.isspace() for ch in emoji) or len(emoji) > 8:
+        return f"emoji {emoji!r} is not a single glyph — pass one purpose-emoji (e.g. ⚙️)"
+    if not spine_slug:
+        return "an --emoji needs a --spine slug to brand (the emoji belongs to a spine, not a lone card)"
+    clash = _spine_brand_conflict(tasks, emoji, spine_slug)
+    if clash:
+        taken = ", ".join(f"{e} {s}" for e, s in sorted(_taken_emoji(tasks).items())) or "—"
+        return (f"emoji {emoji} is already the brand for spine {clash!r} on this project — "
+                f"pick another. Taken: {taken}")
+    return ""
+
+
+def _leading_emoji(title: str) -> str:
+    """The leading emoji glyph of a title (incl. a VS16/ZWJ sequence), or "" if the title doesn't
+    start with one. Used by `spine backfill` to adopt hand-typed title glyphs. Emoji ranges mirror
+    `_disp_width`'s (same stdlib approach, no wcwidth dependency)."""
+    import unicodedata
+    s = title.lstrip()
+    out: list[str] = []
+    for ch in s:
+        o = ord(ch)
+        is_emoji = (o in (0x200D, 0xFE0E, 0xFE0F)
+                    or o >= 0x1F000 or 0x2600 <= o <= 0x27BF or 0x2B00 <= o <= 0x2BFF
+                    or unicodedata.category(ch) == "So")
+        if is_emoji:
+            out.append(ch)
+        elif out:
+            break              # first non-emoji after the glyph run ends it
+        else:
+            return ""          # title doesn't begin with an emoji
+    return "".join(out).strip()
+
+
+def cmd_spine(args):
+    """Spine branding (CELE-t380): list / set / backfill the per-project purpose-emoji that brands a
+    spine (the group of cards minted from one plan). The agent proposes the emoji; uniqueness across
+    distinct spine slugs is enforced here."""
+    ctx = require_context(args)
+    tasks = _load_tasks(ctx)
+    sub = getattr(args, "spine_cmd", None) or "ls"
+
+    if sub == "ls":
+        rows = _spines_summary(tasks)
+        if getattr(args, "json", False):
+            print(json.dumps({"spines": rows}, indent=2))
+            return
+        if not rows:
+            print("No branded spines yet. Brand one:  celeborn spine set <slug> --emoji <glyph>")
+            return
+        print(f"Spines ({len(rows)}):")
+        for r in rows:
+            c = r["counts"]
+            print(f"  {r['emoji'] or '·'}  {r['slug']:<22} {r['total']:>2} cards  "
+                  f"({c['todo']} todo · {c['doing']} doing · {c['done']} done)")
+        return
+
+    if sub == "set":
+        slug = (getattr(args, "slug", "") or "").strip()
+        emoji = _norm_emoji(getattr(args, "emoji", "") or "")
+        if not slug or not emoji:
+            die("usage: celeborn spine set <slug> --emoji <glyph>")
+        if not any((t.get("spine") or "").strip() == slug for t in tasks):
+            die(f"no cards in spine {slug!r} yet — mint one first: "
+                f"celeborn tasks add \"...\" --spine {slug} --emoji {emoji}")
+        err = _brand_error(tasks, slug, emoji)
+        if err:
+            die(err)
+        n = _apply_spine_brand(tasks, slug, emoji)
+        _save_tasks(ctx, tasks)
+        print(f"Branded spine {slug!r} {emoji} — {n} card(s) restamped")
+        return
+
+    if sub == "backfill":
+        # Adopt existing hand-emoji spines: read the leading title glyph into the `emoji` field. Slugs
+        # aren't invented — print suggested `tasks edit --spine` lines so a human/agent formalizes them.
+        dry = getattr(args, "dry_run", False)
+        found = [(t, g) for t in tasks
+                 if not t.get("emoji") and (g := _leading_emoji(t["title"]))]
+        if not found:
+            print("No unbranded cards carry a leading emoji — nothing to backfill.")
+            return
+        for t, glyph in found:
+            t["emoji"] = glyph
+            # Migrate: the emoji field is now the brand's source of truth, so drop the leading glyph
+            # from the title — otherwise every surface that renders emoji + title would double it.
+            head = t["title"].lstrip()
+            t["title"] = head[len(glyph):].lstrip()
+            t["updated"] = now_iso()
+        if not dry:
+            _save_tasks(ctx, tasks)
+        print(f"Backfilled emoji on {len(found)} card(s) from their title glyph"
+              + (" (dry run — not saved)" if dry else "") + ":")
+        for t, glyph in found:
+            print(f"  {glyph}  [{_display_tid(ctx, t['id'])}] {_strip_protocol(t['title'])[:60]}")
+        print("\nFormalize spine slugs so uniqueness is enforced, e.g.:")
+        for glyph in dict.fromkeys(g for _, g in found):
+            print(f"  celeborn tasks edit <id> --spine <slug> --emoji {glyph}")
+        return
+
+    die(f"unknown spine action {sub!r} — use: ls | set | backfill")
+
+
 def cmd_tasks(args):
     ctx = require_context(args)
     tasks = _load_tasks(ctx)
@@ -9457,16 +13997,29 @@ def cmd_tasks(args):
             "tags": _csv(args.tags),
             "blocked_by": _csv(args.blocked_by),
             "phase": (args.phase or "").strip(),
+            # Spine branding (CELE-t380): mint the card into a spine slug with its purpose-emoji. The
+            # emoji is validated for per-project uniqueness just below (before the card is appended).
+            "spine": (getattr(args, "spine", "") or "").strip(),
+            "emoji": _norm_emoji(getattr(args, "emoji", "") or ""),
             # Stop condition (CELE-t81): use the supplied --stop, else auto-fill the generic default so
             # no card is ever stop-less. The agent protocol nudges the owner to replace the default.
             "stop": (getattr(args, "stop", "") or "").strip() or DEFAULT_STOP,
+            "autonomy": _validate_autonomy(getattr(args, "autonomy", "")),
             "progress": _clamp_pct(getattr(args, "progress", 0) or 0),
             "jira": "",
+            "github": "",
             "created": stamp,
             "updated": stamp,
             "subtasks": [],
             "notes": (args.note or "").strip(),
         }
+        # CELE-t380: reject a colliding brand before the card lands. Inherit the spine's existing
+        # emoji when the slug is already branded and the agent didn't repeat it (keeps invariant A).
+        if t["spine"] and not t["emoji"]:
+            t["emoji"] = _emoji_for_slug(tasks, t["spine"])
+        brand_err = _brand_error(tasks, t["spine"], t["emoji"])
+        if brand_err:
+            die(brand_err)
         tasks.append(t)
         tasks = _bring_to_state_front(tasks, tid)  # newest card lands on top of its column
         _save_tasks(ctx, tasks, autopush_ids=[tid])
@@ -9477,6 +14030,8 @@ def cmd_tasks(args):
             t["owner"] = by
             if t["state"] == "todo":
                 t["state"] = "doing"
+            if t["state"] == "doing":
+                _progress_stamp_claim(ctx, t)  # CELE-t161: engine floor 5 the instant a card goes doing
             t["updated"] = now_iso()
             tasks = _bring_to_state_front(tasks, tid)
             _save_tasks(ctx, tasks, autopush_ids=[tid])
@@ -9527,8 +14082,23 @@ def cmd_tasks(args):
             t["blocked_by"] = _csv(args.blocked_by)
         if args.phase is not None:
             t["phase"] = args.phase.strip()
+        if getattr(args, "spine", None) is not None:
+            t["spine"] = args.spine.strip()
+        if getattr(args, "emoji", None) is not None:
+            t["emoji"] = _norm_emoji(args.emoji)
+        # CELE-t380: whenever this edit sets a spine or emoji, re-validate the resulting brand. Check
+        # against the OTHER cards so a card can keep/adopt its own spine's emoji without self-clashing.
+        if getattr(args, "spine", None) is not None or getattr(args, "emoji", None) is not None:
+            others = [o for o in tasks if o["id"] != t["id"]]
+            if t.get("spine") and not t.get("emoji"):
+                t["emoji"] = _emoji_for_slug(others, t["spine"])  # inherit the spine's existing brand
+            brand_err = _brand_error(others, t.get("spine", ""), t.get("emoji", ""))
+            if brand_err:
+                die(brand_err)
         if getattr(args, "stop", None) is not None:
             t["stop"] = args.stop.strip()
+        if getattr(args, "autonomy", None) is not None:
+            t["autonomy"] = _validate_autonomy(args.autonomy)
         if getattr(args, "progress", None) is not None:
             t["progress"] = _clamp_pct(args.progress)
         if args.note is not None:
@@ -9637,13 +14207,53 @@ def cmd_tasks(args):
         print(f"  tags:       {', '.join(t['tags']) or '—'}")
         print(f"  blocked-by: {', '.join(t['blocked_by']) or '—'}")
         print(f"  phase:      {t['phase'] or '—'}")
+        if t.get("spine") or t.get("emoji"):   # CELE-t380: spine brand, shown only when set
+            brand = f"{t.get('emoji') or '—'}  {t.get('spine') or '—'}".strip()
+            print(f"  spine:      {brand}")
         print(f"  stop:       {t.get('stop') or '—'}")
+        print(f"  autonomy:   {', '.join(t.get('autonomy') or []) or '— (ungroomed: most-restrictive under a promptless harness)'}")
         print(f"  jira:       {t.get('jira') or '—'}")
         print(f"  created:    {t['created'] or '—'}")
         print(f"  updated:    {t['updated'] or '—'}")
         if t["notes"]:
             print("\n" + t["notes"])
         print("\n" + _agent_card_protocol(t["id"]))
+        return
+
+    if action == "next":
+        # Deterministic NEXT-UP / ready-set emitter (CELE-t219). The PM invokes this and echoes the
+        # result verbatim — it must never enumerate or filter the raw board itself. stdout carries
+        # data only (id + title); anomalies go to stderr so a verbatim echo stays clean.
+        cfg = load_config(ctx)
+        ready, unknown = _ready_set(
+            tasks, _archived_done_ids(ctx),
+            tags=_csv(getattr(args, "tag", "")),
+            phase=(getattr(args, "phase", "") or "").strip())
+        for tid, missing in unknown.items():
+            # Explicit stderr (not warn(), which prints to stdout): the PM echoes stdout verbatim,
+            # so anomaly flags must ride the other stream to keep the data channel clean.
+            print(f"  ! [{_display_tid(ctx, tid, cfg=cfg)}] blocker(s) {', '.join(missing)} exist "
+                  f"nowhere (board or {DONE_ARCHIVE_FILE}) — treated as done; verify before "
+                  f"dispatching.", file=sys.stderr)
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "next": _ready_card_doc(ctx, ready[0], cfg) if ready else None,
+                "ready": [_ready_card_doc(ctx, t, cfg) for t in ready],
+            }, indent=2))
+            return
+        if getattr(args, "all", False):
+            if not ready:
+                print("READY: none")
+                return
+            print(f"READY ({len(ready)}):")
+            for t in ready:
+                print(f"  [{_display_tid(ctx, t['id'], cfg=cfg)}] {_strip_protocol(t['title'])}")
+            return
+        if not ready:
+            print("NEXT-UP: none — no todo card has all blockers done")
+            return
+        t = ready[0]
+        print(f"NEXT-UP: [{_display_tid(ctx, t['id'], cfg=cfg)}] {_strip_protocol(t['title'])}")
         return
 
     if action == "json":
@@ -9664,25 +14274,45 @@ def cmd_tasks(args):
         print('No tasks yet. Add one:  celeborn tasks add "your first task"')
         return
     cfg = load_config(ctx)
+    # Live context join for the DOING column (CELE-t206, closes t163): every in-flight card carries
+    # its working session's tokens + /clear-nudge band + session id + coder model. Joined off the same
+    # `_active_agents` feed the hosted band pill reads, so terminal and viewer never disagree. Skipped
+    # entirely when nothing is DOING (keeps the idle-board render a pure tasks.md read).
+    has_doing = any(t["state"] == "doing" for t in tasks)
+    tokens_by_task, session_by_task, pressure_by_task = (
+        _doing_context_join(ctx) if has_doing else ({}, {}, {}))
+    reg = (_load_agents(ctx).get("agents") or {}) if has_doing else {}
     for s in TASK_STATES:
         col = [t for t in tasks if t["state"] == s]
         print(f"\n{TASK_STATE_LABELS[s]} ({len(col)})")
         for t in col:
             owner = f"  @{t['owner']}" if t["owner"] else ""
             blocked = f"  ⛔ {', '.join(t['blocked_by'])}" if t["blocked_by"] else ""
-            print(f"  [{_display_tid(ctx, t['id'], cfg=cfg)}] {t['title']}{owner}{blocked}")
+            brand = f"{t['emoji']} " if t.get("emoji") else ""  # CELE-t380: lead with the spine brand
+            ann = ""
+            if t["state"] == "doing":
+                own = (t.get("owner") or "").strip()
+                model = (reg.get(own) or {}).get("model") or ""
+                ann = _doing_card_annotation(
+                    tokens_by_task.get(t["id"]), session_by_task.get(t["id"], ""), model, own,
+                    pressure_by_task.get(t["id"], "none"))
+            print(f"  [{_display_tid(ctx, t['id'], cfg=cfg)}] {brand}{t['title']}{owner}{ann}{blocked}")
 
 
 def _ambient_session_id() -> str:
-    """The current Claude Code session id, as the harness injects it into EVERY tool subprocess
+    """The current session id, as the harness injects it into EVERY tool subprocess
     (`CLAUDE_CODE_SESSION_ID`). This is the linchpin of CELE-t194: it lets an agent-initiated
     `celeborn claim` / `tasks add --claim` run from a Bash tool call be session-owned WITHOUT the
     agent remembering to pass `--session` — the hook's stdin session id never reaches a Bash
     subprocess, but this env var does. It's per-window (each session's shell inherits its own id),
     so it's multi-agent-safe where a repo-wide cursor (`last_session_id`) would misattribute.
-    Empty outside a Claude Code window (a plain terminal) — there a manual `--by` still attributes."""
+    `CELEBORN_SESSION_ID` is the harness-neutral alias (Claude's var wins when both are set):
+    OpenCode's native celeborn_* tools set it on their CLI subprocesses (P6, CELE-t143) so a
+    tool-call `tasks add --claim` links session→card even where no Claude env exists. Empty
+    outside any harness (a plain terminal) — there a manual `--by` still attributes."""
     import os
-    return (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    return (os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or os.environ.get("CELEBORN_SESSION_ID") or "").strip()
 
 
 def _resolve_session(args) -> str:
@@ -9775,8 +14405,9 @@ def cmd_claim(args):
         if not t:
             continue
         prev = (t.get("owner") or "").strip()
+        was_todo = t["state"] == "todo"
         t["owner"] = by
-        if t["state"] == "todo":
+        if was_todo:
             t["state"] = "doing"
         t["updated"] = now_iso()
         if t["state"] == "doing":
@@ -9788,6 +14419,11 @@ def cmd_claim(args):
             results.append(f"Reassigned [{disp}] {t['title']}: {prev} → {who} (last claim wins)")
         elif prev != by:
             results.append(f"Claimed [{disp}] {t['title']} → {who}")
+        elif was_todo:
+            # Already mine, but the claim still advanced it TODO → DOING — a card a PM `dispatch`
+            # staged to this session (CELE-t213) lands here at pickup. Without a results line the
+            # transition would never save (the guard below) and the board would lie.
+            results.append(f"Claimed [{disp}] {t['title']} — staged for {who}, now DOING")
     if results:
         claimed = [tid for tid in (getattr(args, "ids", None) or []) if _find_task(tasks, tid)]
         _save_tasks(ctx, tasks, autopush_ids=claimed)
@@ -9820,9 +14456,31 @@ def cmd_ship(args):
     # Only DOING is gated — a todo/blocked card shipped as triage isn't "in-flight work vanishing".
     if t["state"] == "doing":
         _require_crest_for_done(ctx, t)
+    # Spine discipline pre-flight (CELE-t282, design §4): you may not ship card N until the next
+    # spine card is startable verbatim by a fresh agent. Audit the post-ship head BEFORE any side
+    # effect so a --strict refusal leaves the card, touches and intents exactly as they were. The
+    # shipping agent is the one entity with the context loaded to fix the spine cheaply — warn it
+    # now (die under --strict), never leave the repair to the no-think PM.
+    spine_head, spine_why = _spine_preflight(ctx, tasks, tid)
+    if spine_why:
+        head_ref = f"[{_display_tid(ctx, spine_head['id'])}] " if spine_head else ""
+        for w in spine_why:
+            warn(f"spine: {head_ref}{w}")
+        if spine_head:
+            print(f"  Fix:  celeborn tasks edit {spine_head['id']} --stop \"<clean /clear point>\" "
+                  f"--note \"<3-8 line brief>\"   (design: docs/plans/cele-t144-spine-and-stage.md §4)")
+        if getattr(args, "strict", False):
+            die("ship --strict: the next spine card is not startable verbatim — sharpen it "
+                "(or insert the right card at its spine position), then re-ship")
     who = _agent_identity(args, ctx)["handle"]  # resolves handle + records family/model for the board
     _clear_alert(ctx, tid)   # CELE-t195: a shipped card awaits nothing — drop any stale blocked-alert
     released = _release_touches_for_task(ctx, tid)
+    # CELE-t303: a shipped card's planned commits are moot — withdraw them from the blackboard so
+    # peers stop holding. Best-effort: a fleet-registry hiccup must never block a ship.
+    try:
+        dropped_intents = _drop_intents(ctx.parent.resolve(), task=tid)
+    except Exception:  # noqa: BLE001
+        dropped_intents = []
     note = (getattr(args, "note", None) or "").strip()
     if note:
         t["notes"] = f"{t['notes']}\n\n{note}".strip() if t.get("notes") else note
@@ -9843,6 +14501,18 @@ def cmd_ship(args):
         print(f"  released {len(released)} touch(es): {', '.join(released)}")
     elif prev == "doing":
         print("  (no active touches for this card)")
+    if dropped_intents:
+        print(f"  withdrew {len(dropped_intents)} commit intent(s) from the blackboard")
+    # Name the follow-on (§4 ship ritual, clause 4): the ship message carries the new spine head so
+    # the hand-off is explicit — "shipped tN → spine head is now tM (READY)".
+    if spine_head:
+        stamp = "READY" if not spine_why else "⚠ NOT startable: " + "; ".join(spine_why)
+        print(f"  spine head is now [{_display_tid(ctx, spine_head['id'])}] "
+              f"{_strip_protocol(spine_head['title'])}  ({stamp})")
+    elif spine_why:
+        print("  spine head: none — every todo card is blocked")
+    else:
+        print("  spine is empty — no todo cards to hand on")
 
 
 # --------------------------------------------------------------------------- outbox (Phase 12)
@@ -9858,6 +14528,14 @@ def cmd_ship(args):
 # each other (one writer, one reader per file). A card's `owner` is its assignee; pushing addresses
 # the hand-off to that owner; an agent drains only its own file, its identity from $CELEBORN_AGENT.
 # Unaddressed prompts land in `outbox/_unassigned.md` (today's single-queue behavior, claimable).
+#
+# PM→coder dispatch (CELE-t213): `celeborn dispatch <tid> --to <session>` is the PM's hand-off verb —
+# it stages the card (owner ← the session's 6-char handle, card stays TODO) and queues the brief to
+# `outbox/<sid6>.md`. Drain is session-aware (the hook passes the session id), so the coder's next
+# turn receives the brief as its work instruction; the marker riding in it triggers claim-on-receipt
+# (TODO → DOING + the t203 §1.3 agent_sessions link), with the CELE-t211 gate-time auto-claim as the
+# backstop when the coder starts working without reading. The PM sees the board, the outbox, and the
+# session registry — never coder transcripts: chain-of-thought stays opaque by design.
 
 OUTBOX_DIR = "outbox"
 OUTBOX_SENT_FILE = "sent.md"        # archive, lives inside OUTBOX_DIR
@@ -9989,6 +14667,19 @@ def _outbox_body(block: str) -> str:
     return "\n".join(block.splitlines()[1:]).strip()
 
 
+def _outbox_queue(ctx: Path, prompt: str, addressee: str, tag: str = "") -> str:
+    """Append one prompt block to an addressee's outbox file (creating dir/header as needed) and
+    return the addressee slug. The single writer both `outbox push` and `dispatch` go through."""
+    slug = _agent_slug(addressee)
+    f = _outbox_file(ctx, addressee)
+    _outbox_dir(ctx).mkdir(parents=True, exist_ok=True)
+    existing = f.read_text() if f.is_file() else _outbox_header(addressee)
+    forhint = f" for={slug}" if slug != OUTBOX_UNASSIGNED else ""
+    entry = f"\n## queued {now_iso()}{tag}{forhint}\n{prompt}\n"
+    f.write_text(existing.rstrip("\n") + "\n" + entry)
+    return slug
+
+
 def cmd_outbox(args):
     ctx = require_context(args)
     action = getattr(args, "outbox_cmd", None) or "list"
@@ -10007,29 +14698,39 @@ def cmd_outbox(args):
             addressee = (getattr(args, "for_", None) or "").strip()
         else:
             die("nothing to push — pass --task <id> or --text <prompt>")
-        slug = _agent_slug(addressee)
-        f = _outbox_file(ctx, addressee)
-        d.mkdir(parents=True, exist_ok=True)
-        existing = f.read_text() if f.is_file() else _outbox_header(addressee)
-        forhint = f" for={slug}" if slug != OUTBOX_UNASSIGNED else ""
-        entry = f"\n## queued {now_iso()}{tag}{forhint}\n{prompt}\n"
-        f.write_text(existing.rstrip("\n") + "\n" + entry)
+        slug = _outbox_queue(ctx, prompt, addressee, tag)
         print(f"Queued prompt to outbox{tag} → {slug if slug != OUTBOX_UNASSIGNED else 'unassigned'}")
         return
 
     if action == "drain":
-        f = _outbox_file(ctx, _outbox_identity(args))
-        if not f.is_file():
+        # A drainer has up to TWO queues (CELE-t213): its name identity (--for / $CELEBORN_AGENT /
+        # unassigned — today's behavior) AND, when a session id is resolvable (--session from the
+        # hook, or the ambient CLAUDE_CODE_SESSION_ID), its session's 6-char handle — the address
+        # a PM `dispatch` stages cards to. One writer, one reader per FILE still holds; one reader
+        # just owns two files. Collect every block first, archive once, then empty the sources.
+        idents, seen = [], set()
+        sid = _resolve_session(args)
+        for ident in (_outbox_identity(args), sid[:6] if sid else ""):
+            slug = _agent_slug(ident)
+            if slug not in seen:
+                seen.add(slug)
+                idents.append(ident)
+        drained: list[tuple[Path, str, list[str]]] = []
+        for ident in idents:
+            f = _outbox_file(ctx, ident)
+            blocks = _outbox_blocks(f.read_text()) if f.is_file() else []
+            if blocks:
+                drained.append((f, ident, blocks))
+        if not drained:
             return
-        blocks = _outbox_blocks(f.read_text())
-        if not blocks:
-            return
-        # Archive raw blocks for provenance, then empty this agent's pending queue.
+        # Archive raw blocks for provenance, then empty each drained pending queue.
+        all_blocks = [b for _, _, blocks in drained for b in blocks]
         sent = d / OUTBOX_SENT_FILE
         prior = sent.read_text() if sent.is_file() else "# Prompt outbox — sent\n"
-        sent.write_text(prior.rstrip("\n") + "\n\n" + "\n\n".join(blocks) + "\n")
-        f.write_text(_outbox_header(_outbox_identity(args)))
-        prompts = [_outbox_body(b) for b in blocks if _outbox_body(b)]
+        sent.write_text(prior.rstrip("\n") + "\n\n" + "\n\n".join(all_blocks) + "\n")
+        for f, ident, _ in drained:
+            f.write_text(_outbox_header(ident))
+        prompts = [_outbox_body(b) for b in all_blocks if _outbox_body(b)]
         print("\n\n---\n\n".join(prompts))
         return
 
@@ -10068,7 +14769,442 @@ def cmd_outbox(args):
         print(g)
 
 
+# A --to value that IS a session id (full UUID or a hex head) rather than a chosen handle. Session
+# owners are always the 6-char head (mirrors _claim_identity), so a longer session-shaped string
+# collapses to it; a real handle ("scotch-glass") passes through verbatim.
+_SESSION_SHAPED_RE = re.compile(r"[0-9a-f][0-9a-f-]{6,}", re.I)
+
+
+def _dispatch_card(ctx: Path, tasks: list[dict], t: dict, handle: str, *, force: bool = False) -> str:
+    """Stage card `t` on coder `handle` and queue its brief — the CELE-t213 hand-off, shared by the
+    `dispatch` CLI verb and the t283 PM loop so the two can never drift. Owner ← handle, card STAYS
+    todo (DOING is earned at pickup), brief → `outbox/<handle>.md`. Returns the detail lines the
+    caller prints. Raises ValueError when the card is not READY and `force` is off — the CLI turns
+    that into `die`, the PM loop into a skip."""
+    tid = t["id"]
+    disp = _display_tid(ctx, tid)
+    # Readiness (CELE-t219's predicate): dispatching a card whose blockers are still open hands the
+    # coder work it cannot cleanly do. Unknown blockers count done there and get flagged here too.
+    ready, unknown = _ready_set(tasks, _archived_done_ids(ctx))
+    if tid in unknown:
+        warn(f"[{disp}] names blocker(s) that exist nowhere: {', '.join(unknown[tid])} — treated as done")
+    if tid not in {r["id"] for r in ready}:
+        open_blockers = [b for b in t.get("blocked_by") or []
+                         if (_find_task(tasks, b) or {}).get("state") not in (None, "done")]
+        msg = f"[{disp}] is not READY — open blocker(s): {', '.join(open_blockers) or '?'}"
+        if not force:
+            raise ValueError(msg)
+        warn(msg + " (--force — proceeding)")
+    busy = _doing_for_owner(tasks, handle)
+    if busy:
+        warn(f"@{handle} already has {len(busy)} DOING card(s) — the brief still queues, but pickup "
+             f"claim will wait for the coder to finish (one in-flight card per agent)")
+    # An ungroomed card claimed at receipt would go DOING with no autonomy grants — under opencode
+    # that denies everything (t212), stranding the coder the PM just dispatched. Default-fill the
+    # same working set the t211 auto-provision uses; commit stays opt-in (t203 §3.4), and a groomed
+    # card keeps whatever the operator granted.
+    granted = ""
+    if not t.get("autonomy"):
+        t["autonomy"] = _autoprovision_grants()
+        granted = f"  autonomy: {','.join(t['autonomy'])} (default-filled; commit stays OFF — t203 §3.4)\n"
+    t["owner"] = handle
+    t["updated"] = now_iso()
+    _save_tasks(ctx, tasks, autopush_ids=[tid])
+    slug = _outbox_queue(ctx, _task_prompt(t, ctx), handle, f" [{disp}]")
+    return (f"  staged: owner @{handle}, still TODO — DOING is earned at pickup "
+            f"(claim-on-receipt, or the t211 gate-time auto-claim)\n{granted}"
+            f"  queued: .context/{OUTBOX_DIR}/{slug}.md — drained into that session's next turn")
+
+
+def cmd_dispatch(args):
+    """`celeborn dispatch t42 --to <session-id|handle>` — the PM hand-off (CELE-t213). Stages the
+    card on the target coder (owner ← handle; the card STAYS todo — DOING is earned at pickup) and
+    queues the card's brief into that coder's outbox. The coder's next turn drains the brief as its
+    work instruction, and claim-on-receipt moves the card to DOING + writes the §1.3 agent_sessions
+    link; a coder that starts working without reading it is caught by the CELE-t211 gate-time
+    auto-claim (owner == sid6) — either path closes the loop. The PM orchestrates over the board,
+    the outbox, and the session registry ONLY: coder chain-of-thought is opaque, by design."""
+    ctx = require_context(args)
+    tid = _resolve_task_arg(ctx, (getattr(args, "id", None) or "").strip())
+    tasks = _load_tasks(ctx)
+    t = _find_task(tasks, tid)
+    if not t:
+        die(f"no task with id {tid!r}")
+    disp = _display_tid(ctx, tid)
+    if t["state"] != "todo":
+        die(f"[{disp}] is {t['state']} — only a TODO card can be dispatched"
+            + (" (it is someone's in-flight work)" if t["state"] == "doing" else ""))
+    target = (getattr(args, "to", None) or t.get("owner") or "").strip()
+    if not target:
+        die(f"no target — pass --to <session-id|handle> (or stage [{disp}]'s owner first)")
+    handle = target[:6].lower() if _SESSION_SHAPED_RE.fullmatch(target) else target
+    try:
+        detail = _dispatch_card(ctx, tasks, t, handle, force=getattr(args, "force", False))
+    except ValueError as e:
+        die(f"{e}\n  Pass --force to dispatch anyway (not recommended).")
+    ok(f"Dispatched [{disp}] {t['title']} → @{handle}")
+    print(detail)
+
+
+# --------------------------------------------------------------------------- PM loop (CELE-t283)
+#
+# The Qwen-4b Project Manager's march loop (design: docs/plans/cele-t144-spine-and-stage.md §4+§6):
+# stamp READY, dispatch card ① to a free coder slot, raise a ✋ when ① is not startable, restamp
+# when a ship moves the head. The PM VERIFIES AND FERRIES, NEVER INVENTS: every decision is a code
+# predicate already on the board (`_ready_set` t219 · `_spine_audit` t282 · `_dispatch_card` t213);
+# the model's only job is to phrase the board-visible line, and even that reply is validated with a
+# code-formatted fallback — the loop runs identically with Ollama down. Everything the PM writes is
+# a stamp (the tasks.json spine projection), a dispatch (owner + outbox brief) or a question (a
+# `spine`-kind alert) — all board-visible. It reads the board, the outbox and the session registry
+# ONLY; coder chain-of-thought stays opaque by design. `celeborn pm` is one pass (cron/hook
+# friendly); `--watch` is the foreground loop CELE-t217 will keep always-on.
+
+PM_STATE_NAME = ".pm-state.json"   # last pass's view of the board — how stamp/ship transitions are detected
+PM_ALERT_SESSION = "pm"            # marks a spine hand as PM-raised; never collides with a session id
+PM_SLOT_TOKENS_MAX = 100_000       # a fuller window is due to /clear — not a slot to hand new work
+
+
+def _pm_model_line(cfg: dict, facts: dict, fallback: str) -> str:
+    """Ask the local PM model to phrase ONE board line. The model FORMATS, never decides — and it
+    REPHRASES rather than composes: it gets the code-formatted `fallback` sentence (correct by
+    construction) plus the facts, and may only smooth the wording. Free composition from raw facts
+    was tried first and a 4b model inverted meanings while keeping the ids ("t318 was restamped
+    READY" for a t318 SHIP); rephrasing a correct sentence leaves parroting as the worst case.
+    The reply is still validated — one line, sane length, every card id from the facts present
+    verbatim — and anything else is discarded for the fallback."""
+    import urllib.request
+    url = str(cfg.get("pm_ollama_url") or DEFAULTS["pm_ollama_url"]).rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": cfg.get("pm_model") or DEFAULTS["pm_model"],
+        "temperature": 0,
+        "max_tokens": 120,
+        "messages": [
+            {"role": "system", "content":
+                "You polish kanban-board announcements for a project manager. Rewrite LINE as ONE "
+                "terse English sentence (max 25 words). Keep every card id and every stated fact "
+                "exactly; you may only smooth the wording. No advice, no additions, no markdown. "
+                "If LINE is already clear, return it unchanged."},
+            {"role": "user", "content": json.dumps({"LINE": fallback, "facts": facts},
+                                                   ensure_ascii=False)},
+        ],
+    }).encode()
+    try:
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            reply = json.loads(r.read().decode())["choices"][0]["message"]["content"]
+    except Exception:  # noqa: BLE001 — model down/misconfigured: the loop marches on fallbacks
+        return fallback
+    line = next((ln.strip() for ln in str(reply).splitlines() if ln.strip()), "")
+    ids = ([facts[k] for k in ("card", "head") if facts.get(k)]
+           + list(facts.get("shipped") or []) + list(facts.get("ready") or []))
+    if not line or len(line) > 240 or any(i not in line for i in ids):
+        return fallback
+    return line
+
+
+def _pm_state_path(ctx: Path) -> Path:
+    return ctx / PM_STATE_NAME
+
+
+def _pm_load_state(ctx: Path) -> dict:
+    p = _pm_state_path(ctx)
+    try:
+        return json.loads(p.read_text()) if p.is_file() else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _pm_save_state(ctx: Path, state: dict) -> None:
+    import os
+    state["at"] = now_iso()
+    tmp = _pm_state_path(ctx).with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    os.replace(tmp, _pm_state_path(ctx))
+
+
+# --------------------------------------------------------------------------- PM wake queue (CELE-t216)
+#
+# The PM marches only when invoked (`celeborn pm`); nothing wakes it on its own yet. t216 wires the
+# EVENT SIDE: a git post-commit hook, a github/jira pull that actually moved cards, a human kanban
+# action on the board, and a human↔OpenCode turn each enqueue a lightweight "the board may have moved"
+# event here. `celeborn pm` drains the queue and reports what woke it; the CELE-t217 daemon will watch
+# this file to decide when to take a pass instead of polling blindly. Producers sit in hot paths (a
+# hook, a board mutation, a git commit), so every entry point here is best-effort and never raises.
+
+PM_WAKE_NAME = ".pm-wake.json"     # producers append wake events; the PM (and the t217 daemon) drain them
+PM_WAKE_MAX = 200                  # cap the backlog so a never-drained queue can't grow without bound
+
+
+def _pm_wake_path(ctx: Path) -> Path:
+    return ctx / PM_WAKE_NAME
+
+
+def _pm_wake_enqueue(ctx: Path, source: str, detail: str = "") -> bool:
+    """Record one PM wake event (CELE-t216). Best-effort — returns False rather than raising, because
+    every caller (a git hook, a board mutation, an OpenCode turn, a github/jira pull) must not break
+    if a wake can't be written. The backlog is capped at PM_WAKE_MAX most-recent entries."""
+    try:
+        p = _pm_wake_path(ctx)
+        try:
+            data = json.loads(p.read_text()) if p.is_file() else {}
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        pending = data.get("pending")
+        if not isinstance(pending, list):
+            pending = []
+        pending.append({"source": (source or "?").strip() or "?",
+                        "detail": (detail or "").strip(), "at": now_iso()})
+        import os
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"pending": pending[-PM_WAKE_MAX:]}, indent=2) + "\n")
+        os.replace(tmp, p)
+        return True
+    except Exception:  # noqa: BLE001 — a wake is advisory; never break the caller's turn
+        return False
+
+
+def _pm_wake_peek(ctx: Path) -> list[dict]:
+    """Pending wake events without clearing them (backs `pm wake --list` and the t217 daemon's poll)."""
+    try:
+        data = json.loads(_pm_wake_path(ctx).read_text())
+        pending = data.get("pending")
+        return pending if isinstance(pending, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _pm_wake_drain(ctx: Path) -> list[dict]:
+    """Return the pending wake events and clear the queue (stamping when). The PM drains at the top of
+    a pass so a march consumes its triggers; the t217 daemon will drain-then-march the same way."""
+    pending = _pm_wake_peek(ctx)
+    if not pending:
+        return []
+    try:
+        import os
+        p = _pm_wake_path(ctx)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"pending": [], "drained_at": now_iso(),
+                                   "drained": len(pending)}, indent=2) + "\n")
+        os.replace(tmp, p)
+    except Exception:  # noqa: BLE001
+        pass
+    return pending
+
+
+def _pm_free_slots(ctx: Path, tasks: list[dict], window_min: float | None = None) -> list[str]:
+    """Live coder sessions the PM may dispatch to, emptiest context window first. A slot is a live
+    session (the t131 registry) with no in-flight card, no staged todo card, no queued outbox brief
+    and room left in its window — a session whose next turn is genuinely free."""
+    spoken_for = {(t.get("owner") or "").strip() for t in tasks if t["state"] in ("todo", "doing")}
+    slots: list[str] = []
+    for r in sorted(_active_agents(ctx, window_min or AGENT_ACTIVE_WINDOW_MIN, False),
+                    key=lambda row: row["tokens"]):
+        handle = (r.get("agent") or "").strip()
+        if not handle or handle in slots or r.get("task_id"):
+            continue
+        if handle in spoken_for or r["tokens"] > PM_SLOT_TOKENS_MAX:
+            continue
+        f = _outbox_file(ctx, handle)
+        if f.is_file() and _outbox_blocks(f.read_text()):
+            continue
+        slots.append(handle)
+    return slots
+
+
+def _pm_pass(ctx: Path, *, window_min: float | None = None, slots: list[str] | None = None,
+             dry_run: bool = False, fmt=None) -> list[str]:
+    """One stamp → hand → dispatch → restamp cycle. Returns the announcement lines — the daemon's
+    log; every state change they describe also landed on the board itself. Steady-state waiting
+    ("READY, no free slot") is announced once per change, not per pass."""
+    cfg = load_config(ctx)
+    if fmt is None:
+        fmt = lambda facts, fb: _pm_model_line(cfg, facts, fb)  # noqa: E731
+    tasks = _load_tasks(ctx)
+    alerts = _live_alerts(ctx)
+    prev = _pm_load_state(ctx)
+    out: list[str] = []
+    disp = lambda tid: _display_tid(ctx, tid, cfg=cfg)  # noqa: E731
+
+    # ── stamp: recompute the predicate; heal the projection when the stored stamps drifted (an
+    # alert or the done-archive moved without a task save) and announce newly-READY cards.
+    spine = _spine_doc(ctx, tasks, alerts=alerts)
+    try:
+        stored_tasks = json.loads(_tasks_json_path(ctx).read_text()).get("tasks") or []
+        stored = {t["id"]: t.get("spine") for t in stored_tasks if t.get("state") == "todo"}
+    except (json.JSONDecodeError, OSError):
+        stored = None
+    if stored != spine:
+        if not dry_run:
+            _write_tasks_json(ctx, tasks)
+        out.append("stamped the spine — board projection refreshed")
+    ready_ids = [tid for tid, s in spine.items() if s["ready"]]
+    fresh = [tid for tid in ready_ids if tid not in set(prev.get("ready") or [])]
+    if fresh:
+        # Cap the roll-call: a first pass on a mature board stamps dozens at once (spine order kept).
+        names, extra = [disp(tid) for tid in fresh[:8]], max(0, len(fresh) - 8)
+        more = f" … +{extra} more" if extra else ""
+        out.append(fmt({"event": "stamp", "ready": names, **({"more": extra} if extra else {})},
+                       "stamped READY: " + ", ".join(f"[{n}]" for n in names) + more))
+
+    # ── hand: audit the head _ready_set would dispatch (t219 verbatim — never a blocked card).
+    # An unstartable ① gets a ✋ the PM cannot fix itself (design §4: it verifies and ferries);
+    # a hand that no longer points at the unstartable head is lowered — fixed, shipped or reordered.
+    ready, _unknown = _ready_set(tasks, _archived_done_ids(ctx))
+    head = ready[0] if ready else None
+    audit = _spine_audit(head, alerts=alerts) if head else []
+    hand_tid = head["id"] if (head and audit) else None
+    for tid, rec in sorted((alerts or {}).items()):
+        if (rec or {}).get("kind") == "spine" and tid != hand_tid:
+            if not dry_run:
+                _clear_alert(ctx, tid)
+                _refresh_alerted_card(ctx, tid)
+            out.append(f"lowered the hand on [{disp(tid)}] — resolved")
+    if hand_tid:
+        prev_hand = prev.get("hand") or {}
+        raised = (alerts.get(hand_tid) or {}).get("kind") == "spine"
+        if not raised or prev_hand.get("tid") != hand_tid or prev_hand.get("why") != audit:
+            fb = (f"[{disp(hand_tid)}] is spine head but not startable — {'; '.join(audit)} — "
+                  f"whoever shipped the previous card owes the fix")
+            msg = fmt({"event": "hand", "card": disp(hand_tid), "why": audit}, fb)
+            if not dry_run:
+                _set_alert(ctx, hand_tid, "spine", msg, session=PM_ALERT_SESSION)
+                _refresh_alerted_card(ctx, hand_tid)
+            out.append(f"✋ {msg}" if disp(hand_tid) in msg else f"✋ [{disp(hand_tid)}] {msg}")
+
+    # ── dispatch: a startable ① goes to the emptiest free coder slot via the t213 verb. Once
+    # staged (owner set, still todo) the PM waits for pickup — it never double-queues a brief.
+    if head and not audit:
+        head_disp, staged_owner = disp(head["id"]), (head.get("owner") or "").strip()
+        if staged_owner:
+            status = f"[{head_disp}] is READY — staged on @{staged_owner}, awaiting pickup"
+        else:
+            free = list(slots) if slots else _pm_free_slots(ctx, tasks, window_min)
+            if not free:
+                status = f"[{head_disp}] is READY — no free coder slot"
+            elif dry_run:
+                status = None
+                out.append(f"would dispatch [{head_disp}] → @{free[0]}")
+            else:
+                status = None
+                try:
+                    detail = _dispatch_card(ctx, tasks, head, free[0])
+                except ValueError as e:  # board changed under us — the next pass re-evaluates
+                    out.append(f"dispatch skipped: {e}")
+                else:
+                    out.append(fmt({"event": "dispatch", "card": head_disp, "to": f"@{free[0]}"},
+                                   f"dispatched [{head_disp}] {_strip_protocol(head['title'])} → @{free[0]}"))
+                    out.append(detail)
+        if status and status != prev.get("status"):
+            out.append(status)
+    else:
+        status = None
+
+    # ── restamp: ships since the last pass hand the spine on — announce the new head with its
+    # stamp, the same signal `celeborn ship` prints to the shipping agent (§4 ritual, clause 4).
+    done_ids = [t["id"] for t in tasks if t["state"] == "done"]
+    shipped = [tid for tid in done_ids if tid not in set(prev.get("done") or [])] if prev else []
+    if shipped:
+        sh_names = [disp(s) for s in shipped]
+        sh = ", ".join(f"[{n}]" for n in sh_names)
+        if head is None:
+            out.append(f"shipped {sh} → spine has no READY head — every todo card is blocked"
+                       if any(t["state"] == "todo" for t in tasks)
+                       else f"shipped {sh} → spine is empty — no todo cards to hand on")
+        else:
+            stamp = "READY" if not audit else "not startable: " + "; ".join(audit)
+            out.append(fmt({"event": "restamp", "shipped": sh_names, "head": disp(head["id"]),
+                            "stamp": stamp},
+                           f"shipped {sh} → spine head is now [{disp(head['id'])}] "
+                           f"{_strip_protocol(head['title'])} ({stamp})"))
+    if not dry_run:
+        _pm_save_state(ctx, {"ready": ready_ids, "done": done_ids,
+                             "head": head["id"] if head else None,
+                             "hand": {"tid": hand_tid, "why": audit} if hand_tid else None,
+                             "status": status})
+    return out
+
+
+def cmd_pm(args):
+    """`celeborn pm [--watch]` — the Qwen-4b PM march loop (CELE-t283). One pass stamps READY,
+    dispatches the spine head to a free coder slot, raises/lowers the ✋ on an unstartable head and
+    restamps after ships; `--watch` keeps it marching in the foreground (CELE-t217 wraps that in
+    the always-on daemon). The model only phrases lines — with Ollama down the loop still runs on
+    code-formatted text, and `--no-model` skips the call outright."""
+    ctx = require_context(args)
+    slots = _csv(getattr(args, "slots", None)) or None
+    fmt = (lambda facts, fb: fb) if getattr(args, "no_model", False) else None
+
+    def one_pass() -> list[str]:
+        woke = [] if getattr(args, "dry_run", False) else _pm_wake_drain(ctx)
+        lines = _pm_pass(ctx, window_min=getattr(args, "window_min", None), slots=slots,
+                         dry_run=getattr(args, "dry_run", False), fmt=fmt)
+        if woke:
+            srcs = ", ".join(sorted({e.get("source") or "?" for e in woke}))
+            lines = [f"woken by {len(woke)} event(s): {srcs}"] + lines
+        stamp = _dt.datetime.now().strftime("%H:%M:%S")
+        for ln in lines:
+            # flush per line: the daemon's stdout is usually a pipe/log file (t217), and a
+            # block-buffered watch loop shows nothing until exit — losing the log on a kill.
+            print(ln if ln.startswith("  ") else f"{stamp} 🏹 PM · {ln}", flush=True)
+        return lines
+
+    if not getattr(args, "watch", False):
+        if not one_pass():
+            info("spine steady — nothing to do")
+        return
+    interval = max(5, int(getattr(args, "interval", None) or 15))
+    info(f"PM watching every {interval}s (Ctrl-C stops; CELE-t217 owns the always-on daemon)")
+    import time
+    try:
+        while True:
+            one_pass()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        info("PM stopped.")
+
+
+def cmd_pm_wake(args):
+    """`celeborn pm wake --source <s> [--detail <d>]` — enqueue one PM wake event (CELE-t216), or
+    `--list` to show the pending queue. The producers (a git post-commit hook, the board's kanban
+    mutations, an OpenCode user turn, a github/jira pull delta) call this so the next PM pass knows the
+    board may have moved; `celeborn pm` drains the queue and CELE-t217's daemon will watch it."""
+    ctx = require_context(args)
+    if getattr(args, "list", False):
+        pending = _pm_wake_peek(ctx)
+        if not pending:
+            info("no pending PM wake events")
+            return
+        print(f"{len(pending)} pending PM wake event(s):")
+        for e in pending:
+            det = f" — {e['detail']}" if e.get("detail") else ""
+            print(f"  · {e.get('source') or '?'}{det}  ({e.get('at', '')})")
+        return
+    source = (getattr(args, "source", None) or "").strip()
+    if not source:
+        die("pm wake needs --source <s> (or --list to show the queue)")
+    _pm_wake_enqueue(ctx, source, getattr(args, "detail", None) or "")
+    ok(f"PM wake enqueued: {source}")
+
+
 # --------------------------------------------------------------------------- argparse
+
+GETTING_STARTED_EPILOG = """\
+Getting started
+  celeborn init            THE first-run command — wires Claude Code, scaffolds this
+                           project's private memory, signs you in, and opens your board.
+                           Run it once per project; re-run any time (it resumes).
+
+  Everything runs locally and offline. Your .context/ (prompts, notes, working memory) is
+  ALWAYS private — gitignored, never committed. Carry it across devices with a free account
+  (celeborn init --github, or `celeborn login --github` later) — it syncs via your account,
+  never git.
+
+  celeborn board           open your kanban board (Celeborn's UI) in the browser
+  celeborn scaffold        scaffold .context/ only (secondary — `init` already does this)
+  celeborn status          show what an agent loads when it orients
+
+Docs & help: https://celeborncode.ai   ·   `celeborn <command> --help` for any command.
+"""
 
 # --------------------------------------------------------------------------- architecture (CELE-t187)
 
@@ -10207,6 +15343,137 @@ def _detect_infra_nodes(root: Path) -> list[dict]:
     return [_full_node(n) for n in nodes.values()]
 
 
+# Local install toolchain (CELE-t236) — the second half of the Stack view. The hosted diagram shows the
+# HOSTED dependencies (vendors, databases, control surfaces); the `local` block shows what a developer
+# must have INSTALLED to work on the repo: runtimes (Python, Node.js…), frameworks (Next.js, Django…),
+# and package managers inferred from lockfiles. Detection reads manifest names + version SPECS only —
+# never lockfile hashes, env values, or anything secret. It rides the same credential-stripped
+# `project_architecture` push and renders below the hosted diagram on the Stack page.
+
+# package.json dependency key → (display name, kind). Exact key match against dependencies/devDependencies.
+_LOCAL_JS_DEPS = [
+    ("next", "Next.js", "framework"),
+    ("react", "React", "framework"),
+    ("vue", "Vue", "framework"),
+    ("svelte", "Svelte", "framework"),
+    ("express", "Express", "framework"),
+    ("typescript", "TypeScript", "language"),
+    ("tailwindcss", "Tailwind CSS", "framework"),
+]
+
+# Python requirement token → (display name, kind). Word-boundary match over requirement lines.
+_LOCAL_PY_DEPS = [
+    ("fastapi", "FastAPI", "framework"),
+    ("django", "Django", "framework"),
+    ("flask", "Flask", "framework"),
+]
+
+# Lockfile basename → the package manager a developer needs installed to honor it.
+_LOCAL_LOCKFILES = [
+    ("pnpm-lock.yaml", "pnpm"),
+    ("yarn.lock", "Yarn"),
+    ("bun.lockb", "Bun"),
+    ("package-lock.json", "npm"),
+    ("uv.lock", "uv"),
+    ("poetry.lock", "Poetry"),
+    ("Pipfile.lock", "Pipenv"),
+]
+
+_LOCAL_KIND_RANK = {"runtime": 0, "language": 1, "framework": 2, "tool": 3}
+
+
+def _dep_ver(spec) -> str:
+    """Normalize a manifest version spec for display: strip npm range sigils ('^15.1.0' → '15.1.0',
+    '~=3.8' → '3.8') but KEEP honest inequalities ('>=3.11' stays), and take the first clause of a
+    comma range. Empty string when there's nothing usable."""
+    s = str(spec or "").strip().split(",")[0].strip()
+    return re.sub(r"^[\^~=v\s]+", "", s)
+
+
+def _detect_local_deps(root: Path) -> list[dict]:
+    """Best-effort local install toolchain from the repo's manifests (root + one dir level, same reach
+    as the vendor detection above). Deduped by name — the first version spec found wins, a later
+    version fills a blank. Ordered runtimes → languages → frameworks → tools, stable within a kind."""
+    deps: dict[str, dict] = {}
+
+    def add(name: str, kind: str, version: str = "", source: str = "") -> None:
+        cur = deps.get(name)
+        if cur is None:
+            deps[name] = {"name": name, "kind": kind, "version": version, "source": source}
+        elif version and not cur["version"]:
+            cur["version"] = version
+            cur["source"] = source or cur["source"]
+
+    def manifests(name: str) -> list[Path]:
+        return [p for p in (root / name, *sorted(root.glob(f"*/{name}"))) if p.is_file()]
+
+    def read(p: Path) -> str:
+        try:
+            return p.read_text(errors="ignore")[:200_000]
+        except OSError:
+            return ""
+
+    # Node.js + JS frameworks — JSON-parse each package.json (exact dependency keys, no substrings).
+    for p in manifests("package.json"):
+        try:
+            d = json.loads(read(p))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        rel = str(p.relative_to(root))
+        engines = d.get("engines") if isinstance(d.get("engines"), dict) else {}
+        add("Node.js", "runtime", _dep_ver(engines.get("node")), rel)
+        packs: dict = {}
+        for key in ("dependencies", "devDependencies"):
+            if isinstance(d.get(key), dict):
+                packs.update(d[key])
+        for dep_key, label, kind in _LOCAL_JS_DEPS:
+            if dep_key in packs:
+                add(label, kind, _dep_ver(packs[dep_key]), rel)
+    # Python — any of its manifests marks the runtime; pyproject's requires-python names the version.
+    for name in ("pyproject.toml", "requirements.txt", "Pipfile", "setup.py"):
+        for p in manifests(name):
+            text = read(p)
+            ver = ""
+            if name == "pyproject.toml":
+                m = re.search(r'(?m)^\s*requires-python\s*=\s*["\']([^"\']+)', text)
+                ver = (m.group(1).strip() if m else "")
+            add("Python", "runtime", ver, str(p.relative_to(root)))
+            for token, label, kind in _LOCAL_PY_DEPS:
+                if re.search(rf"(?im)^\s*[\"']?{token}\b", text):
+                    add(label, kind, "", str(p.relative_to(root)))
+    for p in manifests(".python-version"):
+        lines = read(p).strip().splitlines()
+        add("Python", "runtime", _dep_ver(lines[0]) if lines else "", str(p.relative_to(root)))
+    # Other runtimes — presence of the manifest is the signal; version where the manifest states one.
+    for p in manifests("go.mod"):
+        m = re.search(r"(?m)^go\s+(\S+)", read(p))
+        add("Go", "runtime", m.group(1) if m else "", str(p.relative_to(root)))
+    for p in manifests("Cargo.toml"):
+        m = re.search(r'(?m)^\s*rust-version\s*=\s*["\']([^"\']+)', read(p))
+        add("Rust", "runtime", m.group(1) if m else "", str(p.relative_to(root)))
+    for p in manifests("Gemfile"):
+        add("Ruby", "runtime", "", str(p.relative_to(root)))
+    for p in manifests("composer.json"):
+        try:
+            req = json.loads(read(p)).get("require") or {}
+        except (json.JSONDecodeError, AttributeError):
+            req = {}
+        add("PHP", "runtime", _dep_ver(req.get("php")) if isinstance(req, dict) else "",
+            str(p.relative_to(root)))
+    for name in ("deno.json", "deno.jsonc"):
+        for p in manifests(name):
+            add("Deno", "runtime", "", str(p.relative_to(root)))
+    # Package managers — a lockfile means the tool is part of the local install.
+    for fname, label in _LOCAL_LOCKFILES:
+        for p in manifests(fname):
+            add(label, "tool", "", str(p.relative_to(root)))
+            break
+    ordered = sorted(deps.values(), key=lambda d: _LOCAL_KIND_RANK.get(d["kind"], 9))
+    return ordered
+
+
 def _architecture_init(ctx: Path, force: bool = False) -> None:
     p = _infra_path(ctx)
     if p.is_file() and not force:
@@ -10225,6 +15492,7 @@ def _architecture_init(ctx: Path, force: bool = False) -> None:
                     "`credentials` block STRIPPED. Never put keys/tokens/passwords here — env NAMES only."),
         "nodes": nodes,
         "flows": flows,
+        "local": _detect_local_deps(ctx.parent),
         "credentials": {"_note": "NEVER synced — store env-var NAMES only, never values."},
     }
     p.write_text(json.dumps(doc, indent=2) + "\n")
@@ -10256,6 +15524,16 @@ def _architecture_show(ctx: Path) -> None:
             if f.get("label"):
                 arrow += f"  ({f['label']})"
             print(arrow)
+    local = doc.get("local") or []
+    if local:
+        print(f"  local toolchain ({len(local)}):")
+        for d in local:
+            line = f"    [{d.get('kind', '?')}] {d.get('name')}"
+            if d.get("version"):
+                line += f" {d['version']}"
+            if d.get("source"):
+                line += f"  · {d['source']}"
+            print(line)
 
 
 # --------------------------------------------------------------------------- auto-architecture-trace (CELE-t201)
@@ -10313,9 +15591,11 @@ def _merge_infra_nodes(doc: dict, detected: list[dict]) -> tuple[dict, list[str]
 
 
 def _architecture_trace(ctx: Path, *, reason: str, allow_push: bool = True) -> list[str]:
-    """Re-detect the topology and additively merge new pieces into infra-local.json; on a change, remap
-    the hosted Stack (detached best-effort push). NO-OP unless infra-local.json already exists (opt-in).
-    Returns the display names of any nodes added this trace ([] when nothing changed). Never raises."""
+    """Re-detect the topology, additively merge new pieces into infra-local.json, and refresh the
+    machine-detected `local` toolchain block; on any change, remap the hosted Stack (detached
+    best-effort push). NO-OP unless infra-local.json already exists (opt-in). Returns the display names
+    of any NODES added this trace ([] when nothing changed — a silent toolchain refresh still pushes
+    but never makes noise). Never raises."""
     try:
         if not _infra_path(ctx).is_file():
             return []                                    # not opted in — the trace stays silent
@@ -10324,8 +15604,13 @@ def _architecture_trace(ctx: Path, *, reason: str, allow_push: bool = True) -> l
             return []
         detected = _detect_infra_nodes(ctx.parent)
         doc, added = _merge_infra_nodes(doc, detected)
-        if not added:
+        # The local toolchain (CELE-t236) is machine-detected, never hand-authored, so unlike the
+        # additive node merge it is simply REFRESHED — versions drift and pieces leave.
+        local = _detect_local_deps(ctx.parent)
+        local_changed = local != (doc.get("local") or [])
+        if not added and not local_changed:
             return []
+        doc["local"] = local
         doc["updated"] = now_iso()
         _infra_path(ctx).write_text(json.dumps(doc, indent=2) + "\n")
         if allow_push:
@@ -10400,9 +15685,12 @@ def cmd_architecture(args):
     elif sub == "trace":
         if not _infra_path(ctx).is_file():
             die(f"No {INFRA_LOCAL_NAME} yet. Run `celeborn architecture init` first.")
+        before = load_infra(ctx).get("updated")
         added = _architecture_trace(ctx, reason="manual")
         if added:
             ok(f"trace added {len(added)} node(s): {', '.join(added)} — remapping hosted Stack.")
+        elif load_infra(ctx).get("updated") != before:
+            ok("trace refreshed the local toolchain — remapping hosted Stack.")
         else:
             print("trace: no new pieces detected — the stack is up to date.")
     else:
@@ -10782,14 +16070,15 @@ def _facet_touch(ctx: Path, key: str, filepath: str, ident: dict, task: str, why
     one board, even though the file lives in another repo."""
     data = _load_touches(ctx)
     files = data.setdefault("files", {})
-    files[f"{key}:{filepath}"] = {
+    recs = files.setdefault(f"{key}:{filepath}", [])
+    _upsert_toucher(recs, {
         "by": ident.get("handle") or "unknown",
         "family": ident.get("family", ""),
         "model": ident.get("model", ""),
         "at": now_iso(),
         "task": _split_qualified_tid(task)[1] if task else "",
         "why": why,
-    }
+    })
     _save_touches(ctx, data)
 
 
@@ -10917,29 +16206,31 @@ def cmd_pr(args):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="celeborn", description="Celeborn Code — a long-term context "
-        "substrate for coding agents (memory for Claude Code / Codex / Grok). Not Apache Celeborn "
-        "(Spark shuffle) or the frkngksl/Celeborn Windows tool. `celeborn about` for identity + links.")
+    p = argparse.ArgumentParser(
+        prog="celeborn", description="Celeborn Code — a long-term context substrate for coding agents "
+        "(memory for Claude Code / Codex / Grok). Not Apache Celeborn (Spark shuffle) or the "
+        "frkngksl/Celeborn Windows tool. `celeborn about` for identity + links.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=GETTING_STARTED_EPILOG)
     p.add_argument("--path", default=".", help="project dir to operate in (default: cwd)")
     sub = p.add_subparsers(dest="command", required=True)
 
-    ip = sub.add_parser("init", help="scaffold .context/")
-    ip.add_argument("--private", action="store_true",
-                    help="gitignore .context/ — keep working memory local and sync it across devices "
-                         "instead of committing. Auto-enabled when a public repo is detected.")
-    ip.add_argument("--public", action="store_true",
-                    help="commit .context/ to git (default for private repos; .context travels via git).")
+    # `scaffold` — the secondary, scaffold-only command (CELE-t228 renamed the old `init` here; the
+    # everything-command `init` below now wires + scaffolds + signs in). `.context/` is private-only.
+    ip = sub.add_parser("scaffold", help="scaffold .context/ only (private; `init` is the full first-run)")
+    # `--private` is now the ONLY behavior (.context/ is always gitignored); kept as a hidden no-op so
+    # old scripts/muscle-memory don't error. `--public` was removed — a public install is impossible.
+    ip.add_argument("--private", action="store_true", help=argparse.SUPPRESS)
     ip.add_argument("--no-claude-md", dest="claude_md", action="store_false",
-                    help="don't annotate CLAUDE.md (by default init adds a managed block so Claude Code, "
-                         "which auto-loads CLAUDE.md, knows Celeborn maintains context in .context/).")
+                    help="don't annotate CLAUDE.md (by default scaffold adds a managed block so Claude "
+                         "Code, which auto-loads CLAUDE.md, knows Celeborn maintains context in .context/).")
     ip.add_argument("--no-agents-md", dest="agents_md", action="store_false",
-                    help="don't annotate AGENTS.md (by default init adds the same managed block for "
+                    help="don't annotate AGENTS.md (by default scaffold adds the same managed block for "
                          "Codex/Grok-style hosts that auto-load AGENTS.md).")
     ip.add_argument("--no-scan", dest="scan", action="store_false",
                     help="don't read the repo (README, build manifest, git log) to pre-seed the Hot "
                          "tier; leave the empty template for you to fill in by hand.")
     ip.add_argument("--no-cmm", dest="no_cmm", action="store_true",
-                    help="don't auto-engage Codebase Memory (CMM) for this project. By default init "
+                    help="don't auto-engage Codebase Memory (CMM) for this project. By default it "
                          "pre-clears CMM's read-only tools (fewer 'Allow' prompts) and indexes the repo "
                          "if the CMM binary is installed; reverse anytime with `celeborn cmm off`. "
                          "($CELEBORN_NO_CMM=1 opts out globally.)")
@@ -10947,12 +16238,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="name this project for the kanban board (skips the interactive prompt). "
                          "Persisted as project_name in .celebornrc; defaults to the repo folder name.")
     ip.add_argument("--no-open", dest="open_board", action="store_false",
-                    help="don't launch or open the kanban board after init (by default init seeds an "
+                    help="don't launch or open the kanban board after scaffolding (by default it seeds an "
                          "empty board and starts the localhost viewer — Celeborn's UI).")
     ip.add_argument("--no-browser", dest="open_browser", action="store_false",
                     help="start the kanban viewer but don't pop a browser tab (the board stays "
-                         "reachable on localhost). Implied when init isn't run from a terminal.")
-    ip.set_defaults(func=cmd_init, claude_md=True, agents_md=True, scan=True, no_cmm=False,
+                         "reachable on localhost). Implied when not run from a terminal.")
+    ip.set_defaults(func=cmd_scaffold, claude_md=True, agents_md=True, scan=True, no_cmm=False,
                     open_board=True, open_browser=True)
     sp = sub.add_parser("status", help="print the Hot tier (Orient load)")
     sp.add_argument("--full", action="store_true",
@@ -10970,7 +16261,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="mark the session safe to stop/clear")
     cp.add_argument("--no-stop-allowed", dest="no_stop_allowed", action="store_true",
                     help="mark the session NOT safe to stop (work in flight)")
+    cp.add_argument("--for-clear", dest="for_clear", action="store_true",
+                    help="pre-clear routine (CELE-t208): after writing session.json, regenerate handoff + "
+                         "take a restorable snapshot, then verify-gate the Hot tier is fresh — exits "
+                         "nonzero with a fix-list (and sets stop_allowed=false) if a /clear would lose work")
+    cp.add_argument("--session", help="session id — with --for-clear, resolves the DOING card you own for "
+                    "the Stop-condition check and tags the snapshot")
     cp.set_defaults(func=cmd_checkpoint)
+
+    acp = sub.add_parser("autoclear",
+                         help="opt-in OpenCode seamless clear-and-continue (CELE-t209): verify the "
+                              "session is due (hard pressure + cooldown) and the t208 gate is clean, "
+                              "then prep (handoff + snapshot + resume brief → outbox) and say 'ready' "
+                              "so the plugin compacts — 'blocked' + fix-list (exit 1) when stale")
+    acp.add_argument("--session", help="session id whose live window is under pressure (the plugin "
+                                       "passes it; falls back to the ambient session)")
+    acp.set_defaults(func=cmd_autoclear)
 
     sub.add_parser("index", help="(re)build the SQLite FTS index").set_defaults(func=cmd_index)
 
@@ -10979,8 +16285,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-n", "--limit", type=int, default=None, help="max results")
     sp.set_defaults(func=cmd_search)
 
-    ap = sub.add_parser("archive", help="archive old journal entries")
+    ap = sub.add_parser("archive", help="FIFO old journal entries + state.md history into cold archives")
+    ap.add_argument("--what", choices=["all", "journal", "state"], default="all",
+                    help="which tier to archive (default: all)")
     ap.add_argument("--keep", type=int, default=None, help="entries to keep in journal.md")
+    ap.add_argument("--state-keep", type=int, default=None, dest="state_keep",
+                    help="dated history bullets to keep in state.md's ## Now")
     ap.set_defaults(func=cmd_archive)
 
     pp = sub.add_parser("promote", help="distill a note to a higher tier")
@@ -11007,6 +16317,48 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--list", action="store_true", help="list the live alerts on this board")
     al.set_defaults(func=cmd_alert)
 
+    # Question-dock round-trip (CELE-t280): ask parks a human-in-the-loop question, ask-status is the
+    # tool's poll, answer delivers + journals the human's reply.
+    ak = sub.add_parser("ask", help="park a human-in-the-loop question for the board dock (ask_human backs onto this)")
+    ak.add_argument("question", help="the question to ask the human")
+    ak.add_argument("--session", default="", help="the asking session's id (default: ambient CLAUDE_CODE_SESSION_ID)")
+    ak.add_argument("--card", default="", help="card to attach the ask to (default: the session's doing card)")
+    ak.add_argument("--options", default="", help="comma-separated enumerable answers (quick chips)")
+    ak.add_argument("--json", action="store_true", help="print {id, card, question, options}")
+    ak.set_defaults(func=cmd_ask)
+
+    aks = sub.add_parser("ask-status", help="poll a parked ask for its answer (used by the ask_human tool)")
+    aks.add_argument("ask_id", help="the askId returned by `celeborn ask`")
+    aks.add_argument("--json", action="store_true", help="print {answered, answer}")
+    aks.set_defaults(func=cmd_ask_status)
+
+    an = sub.add_parser("answer", help="deliver + journal a human's dock answer (CELE-t280 round-trip)")
+    an.add_argument("card", help="the card the question is on")
+    an.add_argument("--kind", choices=["permission", "text"], default="text",
+                    help="permission (already resumed live) or free text (ask_human / alert)")
+    an.add_argument("--response", required=True, help="the answer (permission: once|always|reject; text: free text)")
+    an.add_argument("--session", default="", help="the answered session's id")
+    an.add_argument("--question", default="", help="the question being answered (for the journal)")
+    an.add_argument("--model", default="",
+                    help="per-prompt model the human picked for this answer (CELE-t346) — journaled "
+                         "and carried on the outbox message so the next turn answers with it")
+    an.set_defaults(func=cmd_answer)
+
+    # Spine branding (CELE-t380): the per-project purpose-emoji that brands each spine of cards.
+    spn = sub.add_parser("spine", help="brand each spine (group of cards from one plan) with a unique purpose-emoji")
+    spn.set_defaults(func=cmd_spine, spine_cmd=None, json=False)
+    spnsub = spn.add_subparsers(dest="spine_cmd")
+    spn_ls = spnsub.add_parser("ls", help="list spines on this project — emoji, slug, card counts")
+    spn_ls.add_argument("--json", action="store_true", help="machine-readable output")
+    spn_ls.set_defaults(func=cmd_spine, spine_cmd="ls")
+    spn_set = spnsub.add_parser("set", help="brand/rebrand a spine's emoji (collision-checked per project)")
+    spn_set.add_argument("slug", help="the spine group slug to brand")
+    spn_set.add_argument("--emoji", default="", help="the purpose-emoji (unused by any other spine on this project)")
+    spn_set.set_defaults(func=cmd_spine, spine_cmd="set")
+    spn_bf = spnsub.add_parser("backfill", help="adopt existing hand-emoji spines: title glyph -> emoji field")
+    spn_bf.add_argument("--dry-run", dest="dry_run", action="store_true", help="report only; don't write")
+    spn_bf.set_defaults(func=cmd_spine, spine_cmd="backfill")
+
     tp = sub.add_parser("tasks", help="lightweight task/kanban board (tasks.md truth + derived tasks.json)")
     tp.set_defaults(func=cmd_tasks, task_cmd=None, json=False)
     tsub = tp.add_subparsers(dest="task_cmd")
@@ -11018,9 +16370,15 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--tags", default="", help="comma/space-separated tags")
     ta.add_argument("--blocked-by", dest="blocked_by", default="", help="task id(s) blocking this one")
     ta.add_argument("--phase", default="", help="plan phase id this task belongs to (e.g. p11)")
+    ta.add_argument("--spine", default="", help="spine group slug this card belongs to (cards minted from one plan)")
+    ta.add_argument("--emoji", default="", help="the spine's purpose-emoji brand (must be unused by another spine on this project)")
     ta.add_argument("--stop", default="",
                     help="logical Stop condition — a clean `/clear` point for this card "
                          "(auto-filled with a generic default if omitted)")
+    ta.add_argument("--autonomy", default="",
+                    help="grooming-time autonomy grants (comma-separated subset of "
+                         f"{','.join(AUTONOMY_GRANTS)}) — what the owning session may do without a "
+                         "human; `commit` = git-write, off unless granted")
     ta.add_argument("--progress", type=int, default=None,
                     help="percent complete 0-100 (drives the In-Progress card's sand-fill bar)")
     ta.add_argument("--note", default="", help="freeform notes / body")
@@ -11048,7 +16406,12 @@ def build_parser() -> argparse.ArgumentParser:
     te.add_argument("--tags", default=None)
     te.add_argument("--blocked-by", dest="blocked_by", default=None)
     te.add_argument("--phase", default=None)
+    te.add_argument("--spine", default=None, help="set the spine group slug (CELE-t380)")
+    te.add_argument("--emoji", default=None, help="set the spine's purpose-emoji brand (collision-checked per project)")
     te.add_argument("--stop", default=None, help="set the logical Stop condition (clean `/clear` point)")
+    te.add_argument("--autonomy", default=None,
+                    help="set the autonomy grants (comma-separated subset of "
+                         f"{','.join(AUTONOMY_GRANTS)}; empty string clears back to most-restrictive)")
     te.add_argument("--progress", type=int, default=None,
                     help="percent complete 0-100 (drives the In-Progress card's sand-fill bar)")
     te.add_argument("--note", default=None)
@@ -11097,6 +16460,21 @@ def build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--json", action="store_true", help="print tasks.json to stdout instead of the board")
     tl.set_defaults(func=cmd_tasks, task_cmd="list")
 
+    # NEXT-UP selector (CELE-t219): readiness is computed here, deterministically, so a PM model
+    # never has to enumerate the raw board itself. `celeborn next` is the top-level alias — it sits
+    # in the PM loop next → claim → work → ship.
+    def _next_flags(p):
+        p.add_argument("--tag", default="", help="only cards carrying ALL of these comma-separated tags")
+        p.add_argument("--phase", default="", help="only cards in this plan phase (e.g. p4)")
+        p.add_argument("--all", action="store_true", help="emit the whole ready set instead of the single NEXT-UP")
+        p.add_argument("--json", action="store_true", help="machine form {next, ready} — id/title/routing fields only")
+        p.set_defaults(func=cmd_tasks, task_cmd="next")
+
+    _next_flags(tsub.add_parser(
+        "next", help="deterministic NEXT-UP: the first READY card (todo + every blocker done) — id + title only"))
+    _next_flags(sub.add_parser(
+        "next", help="surface the next READY card (alias of `tasks next`) — never a blocked one"))
+
     cl = sub.add_parser("claim", help="claim a card (owner ← you, TODO → DOING) — what receiving a pasted card does")
     cl.add_argument("ids", nargs="+", help="task id(s) to claim, e.g. t13")
     cl.add_argument("--by", default=None, help="claimer identity (default: $CELEBORN_AGENT)")
@@ -11113,6 +16491,8 @@ def build_parser() -> argparse.ArgumentParser:
     sh.add_argument("--by", default=None, help="agent shipping (default: $CELEBORN_AGENT)")
     sh.add_argument("--family", default=None, help="record your agent family (else `celeborn identify` / $CELEBORN_AGENT_FAMILY)")
     sh.add_argument("--model", default=None, help="record your specific model (else `celeborn identify` / $CELEBORN_AGENT_MODEL)")
+    sh.add_argument("--strict", action="store_true",
+                    help="refuse the ship unless the next spine card is startable verbatim (CELE-t282 spine discipline)")
     sh.set_defaults(func=cmd_ship)
 
     idp = sub.add_parser("identify", help="declare your agent family + specific model once per session (multi-agent attribution)")
@@ -11137,11 +16517,50 @@ def build_parser() -> argparse.ArgumentParser:
     obd = obsub.add_parser("drain", help="print + clear pending prompts (used by the UserPromptSubmit hook)")
     obd.add_argument("--for", dest="for_", default=None,
                      help="drain this agent's queue (default: $CELEBORN_AGENT, else unassigned)")
+    obd.add_argument("--session", default=None,
+                     help="also drain this session's queue (its 6-char handle — where `dispatch` "
+                          "stages cards); the hook passes it, the CLI falls back to the ambient "
+                          "CLAUDE_CODE_SESSION_ID")
     obd.set_defaults(func=cmd_outbox, outbox_cmd="drain")
     obsub.add_parser("list", help="show pending prompts (all agents)").set_defaults(func=cmd_outbox, outbox_cmd="list")
     obc = obsub.add_parser("clear", help="discard pending prompts (all agents, or one with --for)")
     obc.add_argument("--for", dest="for_", default=None, help="clear only this agent's queue")
     obc.set_defaults(func=cmd_outbox, outbox_cmd="clear")
+
+    dp = sub.add_parser("dispatch",
+                        help="PM hand-off (CELE-t213): stage a TODO card on a coder session and "
+                             "queue its brief — the coder picks it up at its next turn")
+    dp.add_argument("id", help="task id (tN or SLUG-tN); must be TODO and unblocked")
+    dp.add_argument("--to", default=None,
+                    help="target coder: a session id (collapses to its 6-char handle) or an agent "
+                         "handle (default: the card's current owner)")
+    dp.add_argument("--force", action="store_true",
+                    help="dispatch even if the card still has open blockers")
+    dp.set_defaults(func=cmd_dispatch)
+
+    pmd = sub.add_parser("pm",
+                         help="Qwen-4b PM loop (CELE-t283): stamp READY, dispatch the spine head to a "
+                              "free coder, raise ✋ on an unstartable head; --watch = foreground daemon")
+    pmd.add_argument("--watch", action="store_true", help="keep marching (foreground; Ctrl-C stops)")
+    pmd.add_argument("--interval", type=int, default=None, help="seconds between watch passes (default 15)")
+    pmd.add_argument("--window-min", dest="window_min", type=float, default=None,
+                     help=f"live-session window for coder-slot discovery (default {int(AGENT_ACTIVE_WINDOW_MIN)}m)")
+    pmd.add_argument("--slots", default=None,
+                     help="comma-separated coder handles to dispatch to (skips live-session discovery)")
+    pmd.add_argument("--dry-run", dest="dry_run", action="store_true",
+                     help="report what a pass would do; write nothing")
+    pmd.add_argument("--no-model", dest="no_model", action="store_true",
+                     help="skip the Qwen formatting call; use code-formatted lines only")
+    pmd.set_defaults(func=cmd_pm)
+    # `pm wake` — the event side (CELE-t216): producers enqueue a wake, `celeborn pm` drains it. Bare
+    # `celeborn pm` still marches (subparser is optional; the parent keeps func=cmd_pm).
+    pm_sub = pmd.add_subparsers(dest="pm_cmd")
+    pmw = pm_sub.add_parser("wake", help="enqueue a PM wake event (CELE-t216), or --list the queue")
+    pmw.add_argument("--source", default=None,
+                     help="what woke the PM (git-commit | github | jira | kanban | opencode | …)")
+    pmw.add_argument("--detail", default=None, help="optional detail (a commit sha, an action name, …)")
+    pmw.add_argument("--list", action="store_true", help="show pending wake events instead of enqueuing")
+    pmw.set_defaults(func=cmd_pm_wake)
 
     vp = sub.add_parser("version", help="print version; --check looks back at GitHub for updates")
     vp.add_argument("--check", action="store_true",
@@ -11187,9 +16606,35 @@ def build_parser() -> argparse.ArgumentParser:
     pmp.add_argument("--danger-zone", dest="danger_zone", action="store_true",
                      help="arm (default, needs --yes) or --disarm the FULL UNSAFE auto-allow spectrum + bypassPermissions")
     pmp.add_argument("--disarm", action="store_true", help="with --danger-zone: remove the unsafe spectrum and restore safe defaults")
+    pmp.add_argument("--add", metavar="RULE",
+                     help="add a single per-rule permission (default --shared / project settings.json); pair with --kind")
+    pmp.add_argument("--kind", choices=PERMISSION_RULE_KINDS, default="allow",
+                     help="with --add: which list to add to (default: allow)")
+    pmp.add_argument("--rm", metavar="RULE",
+                     help="remove an exact per-rule permission from allow/ask/deny in the target file")
+    pmp.add_argument("--set-mode", dest="set_mode", metavar="MODE",
+                     help="set permissions.defaultMode (default|acceptEdits|plan|bypassPermissions; '' to unset)")
+    pmp.add_argument("--local", action="store_true",
+                     help="with --add/--rm/--set-mode: target this project's personal settings.local.json")
     pmp.add_argument("--global", dest="global_", action="store_true",
                      help="target the global ~/.claude/settings.json instead of the project file")
     pmp.set_defaults(func=cmd_permissions)
+
+    aup = sub.add_parser("autonomy",
+                         help="show or set the fleet's default autonomy grants + night-run knobs (.celebornrc)")
+    aup.add_argument("--json", action="store_true",
+                     help="emit the current autonomy state (consumed by the board Settings page)")
+    aup.add_argument("--set-grants", dest="set_grants", metavar="LIST",
+                     help=f"default grants stamped onto groomed cards, CSV of {'/'.join(AUTONOMY_GRANTS)} "
+                          "(commit is never implied)")
+    aup.add_argument("--night-questions", dest="night_questions",
+                     choices=[k for k, _ in AUTONOMY_NIGHT_QUESTIONS],
+                     help="what a raised hand does overnight")
+    aup.add_argument("--elves", type=int, metavar="N",
+                     help=f"max concurrent night-run sessions the PM may dispatch ({AUTONOMY_ELVES_MIN}..{AUTONOMY_ELVES_MAX})")
+    aup.add_argument("--pm-model", dest="pm_model", choices=[k for k, _ in AUTONOMY_PM_MODELS],
+                     help="the head-elf model that stamps READY / dispatches / raises hands")
+    aup.set_defaults(func=cmd_autonomy)
 
     skp = sub.add_parser("skills",
                          help="list Celeborn / recommended / Matt-Pocock skills; install the Matt Pocock suite")
@@ -11200,9 +16645,11 @@ def build_parser() -> argparse.ArgumentParser:
     skp.set_defaults(func=cmd_skills)
 
     rp = sub.add_parser("record", help="record a memory event for the economy estimate")
-    rp.add_argument("event", choices=["orient", "compaction", "handoff", "turn", "clear"])
-    rp.add_argument("--session", default=None, help="session id (dedupes repeat orients)")
-    rp.add_argument("--tokens", type=int, default=None, help="for `turn`: tokens to add to the rolling context estimate")
+    rp.add_argument("event", choices=["orient", "compaction", "handoff", "turn", "clear", "tokens"])
+    rp.add_argument("--session", default=None, help="session id (dedupes repeat orients; required for `tokens`)")
+    rp.add_argument("--tokens", type=int, default=None,
+                    help="for `turn`: tokens to add to the rolling context estimate; "
+                         "for `tokens`: the session's REAL live context window, absolute (P4, CELE-t141)")
     rp.set_defaults(func=cmd_record)
 
     mp = sub.add_parser("metrics", help="show the tokens-saved / restarts-avoided estimate")
@@ -11227,11 +16674,14 @@ def build_parser() -> argparse.ArgumentParser:
         _sp.add_argument("--json", action="store_true", help="emit the raw aggregated activity as JSON")
         _sp.set_defaults(func=cmd_standup, kind=_kind)
 
-    bdp = sub.add_parser("board", help="show this project's kanban URL + de-collided per-project port (and whether it's live)")
-    bdp.add_argument("--json", action="store_true", help="emit {port,url,live} as JSON")
-    bdp.add_argument("--port", dest="port_only", action="store_true", help="print just the resolved port")
-    bdp.add_argument("--url", dest="url_only", action="store_true", help="print just the URL")
+    bdp = sub.add_parser("board", help="open this project's kanban board (Celeborn's UI) in the browser; "
+                                       "ensures the viewer is running first")
+    bdp.add_argument("--json", action="store_true", help="emit {port,url,live} as JSON (report-only — no launch/open)")
+    bdp.add_argument("--port", dest="port_only", action="store_true", help="print just the resolved port (no launch/open)")
+    bdp.add_argument("--url", dest="url_only", action="store_true", help="print just the URL (no launch/open)")
     bdp.add_argument("--start", action="store_true", help="ensure-on-orient: launch the viewer (detached) if its port is down")
+    bdp.add_argument("--no-open", dest="no_open", action="store_true",
+                     help="ensure the viewer is up but don't pop a browser tab (implied on a non-interactive shell)")
     # Hidden: the detached restart-loop entrypoint `_spawn_board` re-invokes (keeps `next dev` alive).
     bdp.add_argument("--supervise", action="store_true", help=argparse.SUPPRESS)
     bdp.add_argument("--supervise-port", type=int, help=argparse.SUPPRESS)
@@ -11334,13 +16784,34 @@ def build_parser() -> argparse.ArgumentParser:
     tch.add_argument("--force", action="store_true", help="release even if another agent owns the touch")
     tch.set_defaults(func=cmd_touch)
 
+    itp = sub.add_parser("intent", help="declare a planned commit on the fleet blackboard "
+                                        "(third channel: touch=where, board=what, intent=about-to; "
+                                        "peers editing the same files are warned before they commit)")
+    itp.add_argument("words", nargs="*", metavar="what|command",
+                     help='"<what you will commit>" (declaring REQUIRES --task); or: list | done | clear')
+    itp.add_argument("--files", default=None,
+                     help="comma-separated paths the commit will touch (default: your active touches for --task)")
+    itp.add_argument("--task", default=None, help="kanban card id this commit is for — REQUIRED to declare, must be a real card (e.g. t42)")
+    itp.add_argument("--eta", default=None, help="how soon you expect to commit (e.g. 20, 45m, 1h) — shown to peers")
+    itp.add_argument("--session", default=None, help="session id owning this intent (default: the ambient CLAUDE_CODE_SESSION_ID)")
+    itp.add_argument("--all-agents", dest="all_agents", action="store_true",
+                     help="clear: wipe EVERY agent's intent for this project (default clear releases only your own)")
+    itp.add_argument("--by", default=None, help="agent id for a session-less manual run (a live session always wins)")
+    itp.add_argument("--family", default=None, help="agent family override (else `celeborn identify` / $CELEBORN_AGENT_FAMILY)")
+    itp.add_argument("--model", default=None, help="specific model override (else `celeborn identify` / $CELEBORN_AGENT_MODEL)")
+    itp.add_argument("--all", action="store_true", help="list: show intents machine-wide, not just this project")
+    itp.add_argument("--json", action="store_true", help="JSON output (list)")
+    itp.set_defaults(func=cmd_intent)
+
     rmp = sub.add_parser("remind", help="reassuring checkpoint-and-renew reminder (host supplies --tokens)")
     rmp.add_argument("--tokens", type=int, default=None, help="current context size in tokens (the host supplies this)")
     rmp.add_argument("--every", type=int, default=100_000, help="reminder increment in tokens (default 100k)")
     rmp.add_argument("--last", type=int, default=None, help="token count at last reminder; stay silent unless a new increment is crossed")
     rmp.add_argument("--auto", action="store_true", help="use Celeborn's own rolling context estimate (metrics.context_estimate) instead of --tokens; tracks its own last-reminded mark")
     rmp.add_argument("--transcript", default=None, help="path to a Claude Code transcript (JSONL); read the live context size from its latest usage record. Overrides --tokens/--auto and persists the reading to metrics")
-    rmp.add_argument("--soft-limit", type=int, default=None, help="token ceiling; at/above it the reminder becomes an urgent plain-language warning (e.g. 150000)")
+    rmp.add_argument("--soft-limit", type=int, default=None, help="soft context-pressure threshold in tokens; crossing it speaks a ⚠ warning (default: context_soft_tokens in .celebornrc, else 100000)")
+    rmp.add_argument("--hard-limit", type=int, default=None, help="hard context-pressure threshold in tokens; crossing it speaks an urgent ⛔ stop-and-checkpoint warning (default: context_hard_tokens in .celebornrc, else 125000)")
+    rmp.add_argument("--session", default=None, help="read the live window from this session's capture cursor (`record tokens`, transcript-less harnesses like OpenCode); tracks its own last-reminded mark")
     rmp.add_argument("--clear-cmd", default=None, help="host-specific clear instruction to display")
     rmp.add_argument("--force", action="store_true", help="print even if no new increment was crossed")
     rmp.set_defaults(func=cmd_remind)
@@ -11398,11 +16869,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with --global: do NOT install the Matt Pocock skill suite (on by default)")
     wp.add_argument("--grok", action="store_true",
                     help="also wire Grok Build hooks + .grok/rules/celeborn.md for this project")
+    wp.add_argument("--opencode", action="store_true",
+                    help="also install the OpenCode wiring (event plugin + Qwen-4b PM agent + "
+                         "provider block) into this project's .opencode/ + opencode.json")
     wp.set_defaults(func=cmd_wire)
 
-    # t120 — Modal-clean first run: one guided command over wire + init + login.
-    stp = sub.add_parser("setup", help="one-command first run (Modal-style): wire Claude Code + scaffold "
-                                       "this project + sign in (browser). Idempotent — re-run to resume.")
+    # CELE-t228 — `init` is THE first-run command: one guided everything-command over wire + scaffold +
+    # login (renamed from the old `setup`; `setup` stays a hidden back-compat alias, registered below).
+    stp = sub.add_parser("init", help="THE first-run command: wire Claude Code + scaffold this project's "
+                                      "private memory + sign in + open your board. Idempotent — re-run to resume.")
+    stp.add_argument("--github", action="store_true",
+                     help="sign in with GitHub (the default) — enables private cross-device sync of your "
+                          ".context/ via your free account. `--no-login` skips sign-in entirely.")
     stp.add_argument("--project", action="store_true",
                      help="wire the project's .claude/settings.json instead of ~/.claude (the default is a "
                           "global wire, so every session is covered)")
@@ -11414,18 +16892,28 @@ def build_parser() -> argparse.ArgumentParser:
     stp.add_argument("--no-init", dest="no_init", action="store_true",
                      help="skip the per-project scaffold step (wire/sign-in only — e.g. a machine with no project yet)")
     stp.add_argument("--no-cmm", dest="no_cmm", action="store_true",
-                     help="don't auto-engage Codebase Memory for this project (passed through to `init`)")
+                     help="don't auto-engage Codebase Memory for this project (passed through to `scaffold`)")
     stp.add_argument("--name", dest="name", default=None,
-                     help="name this project for the board, skipping the prompt (passed through to `init`)")
+                     help="name this project for the board, skipping the prompt (passed through to `scaffold`)")
     stp.add_argument("--no-open", dest="no_open", action="store_true",
-                     help="don't launch/open the kanban board after scaffolding (passed through to `init`)")
+                     help="don't launch/open the kanban board after scaffolding (passed through to `scaffold`)")
     stp.add_argument("--no-browser", dest="no_browser", action="store_true",
-                     help="start the board but don't pop a browser tab (passed through to `init`)")
+                     help="start the board but don't pop a browser tab (passed through to `scaffold`)")
+    stp.add_argument("--no-weave", dest="no_weave", action="store_true",
+                     help="skip the local-engine weave step (OpenCode + Ollama + Pippin, CELE-t374). "
+                          "The weave is consent-gated anyway; this suppresses even the offer.")
+    stp.add_argument("--no-orientation", dest="no_orientation", action="store_true",
+                     help="skip the first-run Orientation tutorial project (ORIE, CELE-t387). By default "
+                          "a fresh install creates a dedicated onboarding board so you don't land on an "
+                          "empty one; this opts out.")
     stp.add_argument("--no-login", dest="no_login", action="store_true",
-                     help="skip the sign-in step. Login is required by default (Modal parity); this is the "
+                     help="skip the sign-in step. Login is on by default (Modal parity); this is the "
                           "documented opt-out for a purely local-first install.")
     stp.add_argument("--email", help="sign in with email + password instead of the GitHub browser flow")
-    stp.set_defaults(func=cmd_setup)
+    stp.set_defaults(func=cmd_init)
+    # Hidden back-compat alias: `celeborn setup` routes to the same everything-command as `init`,
+    # without appearing in --help (CELE-t228 — agents used to flip a coin between init and setup).
+    sub._name_parser_map["setup"] = stp
 
     wq = sub.add_parser("wire-quality", help="opt-in deterministic quality gates: auto-test-on-edit + "
                                              "board `tsc --noEmit` (PostToolUse + Stop hooks; AGENTS.md fallback)")
@@ -11438,10 +16926,65 @@ def build_parser() -> argparse.ArgumentParser:
                      help="wire = install hooks + bootstrap; sync-rules = refresh .grok/rules/celeborn.md")
     gkp.set_defaults(func=cmd_grok)
 
+    ocp = sub.add_parser("opencode", help="OpenCode integration — wire the plugin/PM agent (CELE-t204), "
+                                          "or inspect/steer the engine from Settings (CELE-t352)")
+    ocp.add_argument("opencode_action", nargs="?", default="wire", metavar="wire|status|set",
+                     help="wire = install/refresh .opencode/{plugin,agent}/ + merge opencode.json; "
+                          "status = live engine state; set = persist an engine setting")
+    ocp.add_argument("--json", action="store_true", help="JSON output (status/set)")
+    ocp.add_argument("--no-probe", action="store_true",
+                     help="status: skip the live `opencode serve` network probe (config only)")
+    ocp.add_argument("--default-model", metavar="ID", help="set: model a fresh session starts with")
+    ocp.add_argument("--serve-url", metavar="URL", help="set: `opencode serve` REST base")
+    ocp.add_argument("--compaction-hijack", choices=("on", "off"), dest="compaction_hijack",
+                     help="set: replace OpenCode's blind summary with the Hot tier (CELE-t142)")
+    ocp.add_argument("--card-gate", choices=("on", "off"), dest="card_gate",
+                     help="set: deny writes/research without a claimed card (CELE-t131/t140)")
+    ocp.set_defaults(func=cmd_opencode)
+
+    olp = sub.add_parser("ollama", help="Local Ollama daemon — installed models, keep-alive, pull/rm "
+                                        "(runs the Qwen-4b PM + night-run local models, CELE-t352)")
+    olp.add_argument("ollama_action", nargs="?", default="status", metavar="status|pull|rm|set",
+                     help="status = live daemon state; pull/rm <model>; set --host/--keep-alive")
+    olp.add_argument("model", nargs="?", help="model tag for pull/rm (e.g. qwen3:8b)")
+    olp.add_argument("--json", action="store_true", help="JSON output")
+    olp.add_argument("--host", metavar="URL", help="set: Ollama daemon base URL")
+    olp.add_argument("--keep-alive", metavar="MIN", type=int, dest="keep_alive",
+                     help="set: minutes a model stays warm after its last call")
+    olp.set_defaults(func=cmd_ollama)
+
+    wvp = sub.add_parser("weave", help="the sovereign weave: detect/install OpenCode + Ollama from "
+                                       "their official upstream channels, pull Pippin (Qwen3-4b), "
+                                       "wire plugin + config — a free local agent stack (CELE-t374)")
+    wvp.add_argument("weave_action", nargs="?", default="install", metavar="install|status",
+                     help="install (default) = idempotent detect → consented upstream install → "
+                          "Pippin pull → wire + config merge; status = pure read of every component "
+                          "against the pins (references/weave-pin.json)")
+    wvp.add_argument("--yes", action="store_true",
+                     help="pre-consent to the official upstream installers (scripted installs; "
+                          "interactive runs are prompted per component)")
+    wvp.add_argument("--no-models", dest="no_models", action="store_true",
+                     help="skip the ~2.5 GB Pippin model pulls (binaries + wiring only)")
+    wvp.add_argument("--json", action="store_true", help="status: JSON output")
+    wvp.set_defaults(func=cmd_weave)
+
+    erp = sub.add_parser("engine-room", help="the Engine Room: start/stop/restart/health for the two "
+                                             "local engines (Local Code + Local Model) the weave installs")
+    erp.add_argument("engine_action", nargs="?", default="status", metavar="status|up|down|restart",
+                     help="status (default) = Scotty-style health of both engines; up/down/restart = "
+                          "lifecycle (Celeborn only ever touches a process it started itself)")
+    erp.add_argument("target", nargs="?", default="all", metavar="code|model|all",
+                     help="which engine to act on (default: all)")
+    erp.add_argument("--json", action="store_true", help="JSON output (board Settings + Stage)")
+    erp.set_defaults(func=cmd_engine_room)
+
     hp = sub.add_parser("hook", help="in-process Claude Code hook entry point (reads the event JSON on "
                                      "stdin); what `wire` points every hook at")
     hp.add_argument("event", choices=list(HOOK_EVENTS),
                     help="which hook event to run: " + ", ".join(HOOK_EVENTS))
+    hp.add_argument("--harness", default=None,
+                    help="translate the stdin payload from this harness's native shape before "
+                         "dispatch (currently: opencode); default: Claude-shaped, or $CELEBORN_HARNESS")
     hp.set_defaults(func=cmd_hook)
 
     cp = sub.add_parser("consent", help="review the click-reducing automations (all opt-out) + record "
@@ -11469,9 +17012,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("logout", help="revoke the session and delete local credentials").set_defaults(
         func=lambda a: __import__("celeborn_sync").cmd_logout(a))
-    sub.add_parser("whoami", help="show the signed-in account (email, username, MFA, tier)").set_defaults(
-        func=lambda a: __import__("celeborn_sync").cmd_whoami(a))
+    whp = sub.add_parser("whoami", help="show the signed-in account (email, username, MFA, tier)")
+    whp.add_argument("--json", action="store_true", help="emit a thin identity snapshot for the board Settings Account section")
+    whp.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_whoami(a))
     acp = sub.add_parser("account", help="account: show identity (default), or `migrate` to heal a CLI/GitHub split")
+    acp.add_argument("--json", action="store_true", help="emit a thin identity snapshot for the board Settings Account section")
     acp.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_whoami(a))
     acsub = acp.add_subparsers(dest="account_cmd")
     amp = acsub.add_parser("migrate",
@@ -11498,6 +17043,20 @@ def build_parser() -> argparse.ArgumentParser:
     syp.add_argument("--watch", action="store_true", help="keep syncing on an interval instead of once")
     syp.add_argument("--interval", type=int, default=5, help="seconds between syncs in --watch mode (default 5)")
     syp.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_sync(a))
+
+    # config (CELE-t355): the read/write seam behind the board Settings sections (context bands, fleet
+    # liveness TTLs, board display toggles, hosted-sync + integration flags). Project keys land in
+    # .celebornrc; machine-global keys (--fleet) land in ~/.config/celeborn/fleet.json's settings block.
+    cfp = sub.add_parser("config", help="read/write board Settings knobs (.celebornrc + fleet.json)")
+    cfp.add_argument("--json", action="store_true", help="emit the resolved settings state as JSON (for the board)")
+    cfp.set_defaults(func=lambda a: __import__("celeborn_config").cmd_config(a))
+    cfsub = cfp.add_subparsers(dest="config_cmd")
+    cfset = cfsub.add_parser("set", help="write one key: celeborn config set <key> <value> [--fleet]")
+    cfset.add_argument("key", help="settings key (see `celeborn config` for the list)")
+    cfset.add_argument("value", help="new value (bool: true/false · int · str · int_list: '50,75,100,125')")
+    cfset.add_argument("--fleet", action="store_true", help="write to the machine-global fleet.json settings (for fleet-scoped keys)")
+    cfset.add_argument("--json", action="store_true", help="emit the write report as JSON")
+    cfset.set_defaults(func=lambda a: __import__("celeborn_config").cmd_config(a))
 
     # Architecture (CELE-t187): capture NON-SECRET infrastructure topology (vendor names, IPs,
     # control-surface URLs, DB endpoints) into .context/infra-local.json (gitignored). init/show are
@@ -11586,9 +17145,9 @@ def build_parser() -> argparse.ArgumentParser:
     prd_.add_argument("--session", default=None, help=argparse.SUPPRESS)
     prd_.set_defaults(func=cmd_pr)
 
-    # Manage hosted projects on celeborn.thot.ai (t97): list them, or remove one (incl. an orphan whose
+    # Manage hosted projects on celeborncode.ai (t97): list them, or remove one (incl. an orphan whose
     # repo was deleted — removal is hosted-only, no local .context/ needed). RM cascades server-side.
-    prp = sub.add_parser("project", help="manage hosted projects (list / remove) on celeborn.thot.ai")
+    prp = sub.add_parser("project", help="manage hosted projects (list / remove) on celeborncode.ai")
     prsub = prp.add_subparsers(dest="project_cmd")
     prsub.add_parser("list", help="list your hosted projects (name · id)").set_defaults(
         func=lambda a: __import__("celeborn_sync").cmd_project(a))
@@ -11599,7 +17158,7 @@ def build_parser() -> argparse.ArgumentParser:
     prp.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_project(a))  # bare `project` → list
 
     # Hidden: best-effort live push of changed cards to the hosted board, spawned detached by a local
-    # task mutation so celeborn.thot.ai updates in ~realtime. Not for direct use.
+    # task mutation so celeborncode.ai updates in ~realtime. Not for direct use.
     hpp = sub.add_parser("hosted-push", help=argparse.SUPPRESS)
     hpp.add_argument("--ids", default="", help="comma-separated task ids to push")
     hpp.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_hosted_push(a))
@@ -11611,12 +17170,37 @@ def build_parser() -> argparse.ArgumentParser:
     hpa.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_hosted_push_agents(a))
 
     # GitHub App: bind a repo so the App ingests its PR/issue threads (capture free; pull = Pro sync).
-    ghp = sub.add_parser("github", help="GitHub App integration (link a repo to ingest PR/issue threads)")
+    ghp = sub.add_parser("github", help="GitHub integration: App ingest (link) + board→Issues mirror (CELE-t214)")
     ghsub = ghp.add_subparsers(dest="github_cmd", required=True)
     ghl = ghsub.add_parser("link", help="link <owner/repo> to this project for GitHub App ingest")
     ghl.add_argument("repo", metavar="owner/repo", help="GitHub repository as <owner>/<repo>")
     ghl.add_argument("--installation", help="App installation id (shown on the App's post-install page)")
     ghl.set_defaults(func=lambda a: __import__("celeborn_sync").cmd_github_link(a))
+
+    # Board → GitHub Issues mirror (CELE-t214). Operator-credential direct REST API (Bearer token via
+    # --token/env/`gh auth token`), separate from the read-only ingest App. See celeborn_github.py.
+    ghc = ghsub.add_parser("connect", help="connect a mirror repo (token via --token/CELEBORN_GITHUB_TOKEN/gh)")
+    ghc.add_argument("repo", metavar="owner/repo", nargs="?", help="mirror repo as <owner>/<repo> (prompted if omitted)")
+    ghc.add_argument("--token", help="GitHub token (prefer CELEBORN_GITHUB_TOKEN env or `gh auth login` — never commit tokens)")
+    ghc.add_argument("--json", action="store_true", help="print connection JSON after success")
+    ghc.set_defaults(func=lambda a: __import__("celeborn_github").cmd_github(a))
+    ghst = ghsub.add_parser("status", help="verify the stored GitHub mirror connection")
+    ghst.add_argument("--json", action="store_true", help="print JSON (for the board API)")
+    ghst.set_defaults(func=lambda a: __import__("celeborn_github").cmd_github(a))
+    ghrec = ghsub.add_parser("reconcile", help="audit GitHub vs Celeborn (Celeborn wins); --apply pushes outward")
+    ghrec.add_argument("--apply", action="store_true", help="push all Celeborn cards → GitHub (no orphan import)")
+    ghrec.add_argument("--json", action="store_true", help="print JSON report")
+    ghrec.set_defaults(func=lambda a: __import__("celeborn_github").cmd_github(a))
+    ghpull = ghsub.add_parser("pull", help="pull GitHub Issues → tasks (idempotent; links via issue number/marker)")
+    ghpull.add_argument("--dry-run", dest="dry_run", action="store_true", help="preview without writing tasks.md")
+    ghpull.set_defaults(func=lambda a: __import__("celeborn_github").cmd_github(a))
+    ghpush = ghsub.add_parser("push", help="push tasks → GitHub Issues (PREVIEW by default; --apply to write)")
+    ghpush.add_argument("ids", nargs="*", help="task ids to push (default: all cards)")
+    ghpush.add_argument("--apply", action="store_true", help="actually write to GitHub (default is a safe preview)")
+    ghpush.set_defaults(func=lambda a: __import__("celeborn_github").cmd_github(a))
+    ghflush = ghsub.add_parser("flush", help="drain the auto-push queue now (also runs after capture)")
+    ghflush.add_argument("--force", action="store_true", help="ignore per-task debounce")
+    ghflush.set_defaults(func=lambda a: __import__("celeborn_github").cmd_github(a))
 
     # Bidirectional Jira Cloud integration (Phase 10/11). Lazily imported; transport is the Jira REST
     # API + an API token (works headless, unlike the OAuth MCP server). See celeborn_jira.py.
@@ -11677,6 +17261,38 @@ def build_parser() -> argparse.ArgumentParser:
     cmsc = cmsub.add_parser("sync-check", help="watch upstream for a newer pinned release; gate it behind the contract test, plan a PR (S2)")
     cmsc.add_argument("--apply", action="store_true", help="execute a green plan as a branch + gh PR (default: dry-run plan)")
     cmsc.set_defaults(func=lambda a: __import__("celeborn_cmm_provision").cmd_sync_check(a))
+
+    # Encrypted secrets manager for Pro (CELE-t224, Infisical). Lazily imported; the whole family is
+    # Pro-gated (the vault itself is Infisical's free tier — Pro gates the wrapper + discipline
+    # enforcement). CLI-first over the pinned, auto-provisioned `infisical` binary; see celeborn_secrets.py.
+    sec = sub.add_parser("secrets", help="Pro: encrypted secrets vault (Infisical) — store keys once, inject at run time")
+    secsub = sec.add_subparsers(dest="secrets_cmd", required=True)
+    _sec_f = lambda a: __import__("celeborn_secrets").cmd_secrets(a)  # noqa: E731
+    sc_setup = secsub.add_parser("setup", help="one-command onboarding: pinned CLI + browser login + hands-off project provisioning")
+    sc_setup.add_argument("--host", help="Infisical host for self-hosters (default: Infisical Cloud)")
+    sc_setup.add_argument("--project", help="vault project name (default: the repo folder name)")
+    sc_setup.set_defaults(func=_sec_f)
+    sc_set = secsub.add_parser("set", help="put a secret in the vault (hidden prompt — the value never touches this repo's disk)")
+    sc_set.add_argument("name", help="secret name, e.g. ANTHROPIC_API_KEY")
+    sc_set.add_argument("--env", help="vault environment (default: rc default_env, usually dev)")
+    sc_set.add_argument("--stdin", action="store_true", help="read the value from stdin instead of a prompt (automation)")
+    sc_set.set_defaults(func=_sec_f)
+    sc_get = secsub.add_parser("get", help="print one secret value (for scripting — prefer `secrets run`)")
+    sc_get.add_argument("name")
+    sc_get.add_argument("--env", help="vault environment (default: rc default_env)")
+    sc_get.set_defaults(func=_sec_f)
+    sc_list = secsub.add_parser("list", help="list secret NAMES in the current env (never values)")
+    sc_list.add_argument("--env", help="vault environment (default: rc default_env)")
+    sc_list.set_defaults(func=_sec_f)
+    sc_run = secsub.add_parser("run", help="run a command with vault secrets injected as env vars: secrets run -- <cmd …>")
+    sc_run.add_argument("--env", help="vault environment (default: rc default_env)")
+    sc_run.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- <command …>")
+    sc_run.set_defaults(func=_sec_f)
+    sc_status = secsub.add_parser("status", help="provider, host, project link, login + binary state")
+    sc_status.add_argument("--json", action="store_true", help="print JSON (for the board API)")
+    sc_status.set_defaults(func=_sec_f)
+    sc_doc = secsub.add_parser("doctor", help="secrets-discipline check: live secret values in repo .env files")
+    sc_doc.set_defaults(func=_sec_f)
     return p
 
 

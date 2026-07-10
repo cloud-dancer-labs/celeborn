@@ -15,12 +15,15 @@ The suite has three layers:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -77,6 +80,15 @@ class CelebornTestCase(unittest.TestCase):
         # drives session-start would register its temp project into the real fleet registry.
         self._old_xdg = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self.root / "_xdg")
+        # Isolate the ambient session id (CELE-t194): `celeborn` now reads CLAUDE_CODE_SESSION_ID —
+        # which the harness sets in every tool subprocess — as the authoritative card owner. If the
+        # suite runs inside a Claude window that var is live and would override every test's explicit
+        # `--by`/`--session`. Scrub it so tests are deterministic (the plain-CLI path); tests that
+        # exercise the ambient channel set it explicitly via mock.patch.dict.
+        self._old_ccsid = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        # Same isolation for the harness-neutral alias (P6, CELE-t143): OpenCode's native
+        # celeborn_* tools set CELEBORN_SESSION_ID on their CLI subprocesses.
+        self._old_cbsid = os.environ.pop("CELEBORN_SESSION_ID", None)
         # Every test starts from a real `celeborn init` against the shipped templates.
         r = self.init()
         self.assertIsNone(r.exit_code, f"init failed: {r.all}")
@@ -110,6 +122,12 @@ class CelebornTestCase(unittest.TestCase):
             os.environ.pop("XDG_CONFIG_HOME", None)
         else:
             os.environ["XDG_CONFIG_HOME"] = self._old_xdg
+        _ccsid = getattr(self, "_old_ccsid", None)
+        if _ccsid is not None:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = _ccsid
+        _cbsid = getattr(self, "_old_cbsid", None)
+        if _cbsid is not None:
+            os.environ["CELEBORN_SESSION_ID"] = _cbsid
         self._tmp.cleanup()
 
     # thin wrappers that always target this test's temp project via --path
@@ -118,7 +136,7 @@ class CelebornTestCase(unittest.TestCase):
         # smart-init's repo-reading behaviour is covered directly in TestSmartInit. --no-cmm keeps
         # the fixture free of CMM auto-engage side-effects (settings.json/.mcp.json/North Star);
         # the auto-engage-on-init behaviour is covered directly in TestCmmInitAutoEngage.
-        return run_cli("--path", str(self.root), "init", "--no-scan", "--no-cmm")
+        return run_cli("--path", str(self.root), "scaffold", "--no-scan", "--no-cmm")
 
     def cli(self, *argv: str) -> Run:
         return run_cli("--path", str(self.root), *argv)
@@ -200,18 +218,19 @@ class TestParsingHelpers(unittest.TestCase):
         self.assertEqual(cb._est_tokens("abcde", 4), 2)  # ceil division
 
 
-# --------------------------------------------------------------------------- 1b. identity / disambiguation
+# --------------------------------------------------------------------------- 1b. identity / disambiguation (CELE-t233)
 
 class TestAboutIdentity(unittest.TestCase):
     """`celeborn about` is the install-time identity check: an agent that ran `pip install celeborn`
     mid-conversation runs it to confirm it grabbed the coding-agent context substrate — not one of
     the same-named projects (Apache Celeborn; the frkngksl/Celeborn Windows tool). Guard the
-    disambiguation so it can't silently rot."""
+    disambiguation so it can't silently rot (CELE-t233)."""
 
     def test_about_self_identifies_as_celeborn_code(self):
         r = run_cli("about")
         self.assertIsNone(r.exit_code, f"about errored: {r.all}")
         self.assertIn("Celeborn Code", r.out)
+        # canonical, agent-actionable facts
         self.assertIn("uv tool install celeborn", r.out)
         self.assertIn("cloud-dancer-labs/celeborn", r.out)
 
@@ -221,6 +240,7 @@ class TestAboutIdentity(unittest.TestCase):
         self.assertIn("frkngksl/Celeborn", out)
 
     def test_top_level_help_carries_brand_and_disambiguation(self):
+        # A mid-install agent inspecting `--help` must see the brand + that we are not the namesakes.
         help_text = run_cli("--help").all
         self.assertIn("Celeborn Code", help_text)
         self.assertIn("Apache Celeborn", help_text)
@@ -241,9 +261,11 @@ class TestInit(CelebornTestCase):
         data = json.loads(self.read("session.json"))
         self.assertIsNotNone(data["updated_at"])  # template had null
 
-    def test_gitignores_the_index(self):
+    def test_gitignores_the_whole_context(self):
+        # CELE-t228: private-only — scaffold wholesale-gitignores /.context/ (which covers index.db,
+        # tasks.json, etc.), rather than listing derived files individually.
         gi = (self.root / ".gitignore").read_text()
-        self.assertIn(".context/index.db", gi)
+        self.assertIn("/.context/", gi)
 
     def test_is_idempotent(self):
         # Mutate a file, re-init, and confirm the existing copy is preserved (not clobbered).
@@ -256,13 +278,13 @@ class TestInit(CelebornTestCase):
     def test_gitignore_not_duplicated(self):
         self.init()
         gi = (self.root / ".gitignore").read_text()
-        self.assertEqual(gi.count(".context/index.db\n"), 1)
+        self.assertEqual(gi.count("/.context/\n"), 1)
 
     def test_private_gitignores_whole_context(self):
         # --private keeps the working memory out of git entirely (root-anchored).
         root = Path(tempfile.mkdtemp())
         try:
-            r = run_cli("--path", str(root), "init", "--private")
+            r = run_cli("--path", str(root), "scaffold", "--private")
             self.assertIsNone(r.exit_code, r.all)
             gi = (root / ".gitignore").read_text()
             self.assertIn("/.context/", gi)
@@ -273,27 +295,25 @@ class TestInit(CelebornTestCase):
     def test_private_is_idempotent(self):
         root = Path(tempfile.mkdtemp())
         try:
-            run_cli("--path", str(root), "init", "--private")
-            run_cli("--path", str(root), "init", "--private")
+            run_cli("--path", str(root), "scaffold", "--private")
+            run_cli("--path", str(root), "scaffold", "--private")
             gi = (root / ".gitignore").read_text()
             self.assertEqual(gi.count("/.context/\n"), 1)
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    def test_public_flag_tracks_context(self):
-        # --public keeps the default behaviour (only the index is ignored, not all of .context/).
+    def test_context_is_private_only_no_public_flag(self):
+        # CELE-t228: `.context/` is private-only. There is no `--public` (removed) and no commit path —
+        # every scaffold wholesale-gitignores /.context/, whatever the repo visibility.
         root = Path(tempfile.mkdtemp())
         try:
-            run_cli("--path", str(root), "init", "--public")
+            r = run_cli("--path", str(root), "scaffold", "--public")
+            self.assertIsNotNone(r.exit_code)                    # --public no longer exists → error
+            run_cli("--path", str(root), "scaffold")             # default (and only) behaviour
             gi = (root / ".gitignore").read_text()
-            self.assertIn(".context/index.db", gi)
-            self.assertNotIn("/.context/\n", gi)
+            self.assertIn("/.context/", gi)                      # wholesale-ignored, always
         finally:
             shutil.rmtree(root, ignore_errors=True)
-
-    def test_repo_visibility_none_without_git(self):
-        # No .git -> never shells out; unknown visibility.
-        self.assertIsNone(cb._repo_visibility(self.root))
 
     def test_annotates_claude_md(self):
         # init (run in setUp) drops a managed block in CLAUDE.md so Claude Code auto-loads the orient.
@@ -327,7 +347,7 @@ class TestInit(CelebornTestCase):
         root = Path(tempfile.mkdtemp())
         try:
             (root / "CLAUDE.md").write_text("# My Project\n\nHand-written guidance.\n")
-            run_cli("--path", str(root), "init")
+            run_cli("--path", str(root), "scaffold")
             text = (root / "CLAUDE.md").read_text()
             self.assertIn("Hand-written guidance.", text)          # original preserved
             self.assertIn("maintained by Celeborn", text)          # block appended
@@ -338,11 +358,207 @@ class TestInit(CelebornTestCase):
     def test_no_claude_md_optout(self):
         root = Path(tempfile.mkdtemp())
         try:
-            run_cli("--path", str(root), "init", "--no-claude-md")
+            run_cli("--path", str(root), "scaffold", "--no-claude-md")
             self.assertFalse((root / "CLAUDE.md").exists())
             self.assertTrue((root / "AGENTS.md").is_file())
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+class TestOrientationBootstrap(unittest.TestCase):
+    """First-run Orientation (ORIE) tutorial project (CELE-t387). Isolate BOTH the fleet registry
+    (XDG_CONFIG_HOME) and the Orientation directory (CELEBORN_ORIENTATION_DIR) into a temp sandbox so
+    the real ~/Celeborn/Orientation and ~/.config/celeborn are never touched."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._env = mock.patch.dict(os.environ, {
+            "XDG_CONFIG_HOME": str(self.root / "_xdg"),
+            "CELEBORN_ORIENTATION_DIR": str(self.root / "Celeborn" / "Orientation"),
+            # Pin the low_disk signal off so init-step tests never depend on this machine's
+            # actual free disk (the CELE-t391 auto-detect); low-disk tests override it to "1".
+            "CELEBORN_LOW_DISK": "0",
+        })
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_creates_named_orie_project_idempotently(self):
+        ctx, created = cb._ensure_orientation_project()
+        self.assertTrue(created)
+        self.assertEqual(ctx, self.root / "Celeborn" / "Orientation" / ".context")
+        self.assertTrue(ctx.is_dir())
+        # Named "Orientation" with the explicit ORIE slug (so the board renders ORIE-tN).
+        cfg = cb.load_config(ctx)
+        self.assertEqual(cfg.get("project_name"), "Orientation")
+        self.assertEqual(cfg.get("project_slug"), "ORIE")
+        self.assertEqual(cb.project_slug(ctx), "ORIE")
+        self.assertTrue(cb.board_url(ctx).endswith("/board/ORIE"))
+        # A board to serve.
+        self.assertTrue(cb._tasks_path(ctx).is_file())
+        # Re-run: no duplicate, created=False, same ctx.
+        ctx2, created2 = cb._ensure_orientation_project()
+        self.assertEqual(ctx2, ctx)
+        self.assertFalse(created2)
+
+    def test_registered_in_fleet_exactly_once(self):
+        cb._ensure_orientation_project()
+        cb._ensure_orientation_project()  # idempotent re-run must not double-register
+        reg = cb._load_fleet_registry()
+        orie = [r for r in reg.get("projects", []) if r.get("slug") == "ORIE"]
+        self.assertEqual(len(orie), 1)
+        self.assertEqual(orie[0].get("name"), "Orientation")
+
+    def test_step_skips_with_no_orientation(self):
+        import argparse
+        r = cb._setup_step_orientation(argparse.Namespace(no_orientation=True))
+        self.assertIsNone(r)
+        self.assertFalse((self.root / "Celeborn" / "Orientation" / ".context").exists())
+
+    def test_step_returns_ctx_only_on_first_creation(self):
+        import argparse
+        args = argparse.Namespace(no_orientation=False, no_open=True, no_browser=True)
+        first = cb._setup_step_orientation(args)
+        self.assertIsNotNone(first)          # first run → landing signal
+        second = cb._setup_step_orientation(args)
+        self.assertIsNone(second)            # already present → no re-point
+
+    # ---- starter-card curriculum seeder (CELE-t388) ----
+
+    def _core_keys(self):
+        return [e["key"] for e in cb.ORIENTATION_CURRICULUM if e["condition"] is None]
+
+    def test_first_seed_populates_core_curriculum(self):
+        ctx, _ = cb._ensure_orientation_project()
+        new_ids = cb._seed_orientation_cards(ctx)
+        tasks = cb._load_tasks(ctx)
+        core = self._core_keys()
+        self.assertEqual(len(new_ids), len(core))          # every core card, exactly once
+        self.assertEqual(len(tasks), len(core))
+        titles = [t["title"] for t in tasks]
+        self.assertNotIn("Make some room for Pippin", titles)  # conditional absent w/o signal
+        for t in tasks:                                     # all seeded todo, branded, stop-carrying
+            self.assertEqual(t["state"], "todo")
+            self.assertEqual(t["spine"], cb.ORIENTATION_SPINE)
+            self.assertTrue(t["emoji"])
+            self.assertTrue(t["stop"])
+            self.assertTrue(t["notes"])
+        # Tombstone set persisted in the ORIE config.
+        self.assertEqual(cb.load_config(ctx).get("orientation_seeded"), core)
+
+    def test_reseed_is_idempotent(self):
+        ctx, _ = cb._ensure_orientation_project()
+        cb._seed_orientation_cards(ctx)
+        again = cb._seed_orientation_cards(ctx)
+        self.assertEqual(again, [])                         # nothing new → zero cards minted
+        self.assertEqual(len(cb._load_tasks(ctx)), len(self._core_keys()))
+
+    def test_new_curriculum_entry_seeds_exactly_one_card(self):
+        ctx, _ = cb._ensure_orientation_project()
+        cb._seed_orientation_cards(ctx)
+        before = cb._load_tasks(ctx)
+        extra = {"key": "new-feature", "emoji": "✨", "condition": None,
+                 "title": "A brand-new lesson", "tags": ["tutorial"],
+                 "stop": "seen", "notes": "Runbook: show the new thing."}
+        with mock.patch.object(cb, "ORIENTATION_CURRICULUM", cb.ORIENTATION_CURRICULUM + [extra]):
+            new_ids = cb._seed_orientation_cards(ctx)
+        self.assertEqual(len(new_ids), 1)                   # the release top-up: one new card
+        after = cb._load_tasks(ctx)
+        self.assertEqual(len(after), len(before) + 1)
+        self.assertEqual(after[-1]["title"], "A brand-new lesson")
+        self.assertEqual([t["id"] for t in after[:-1]], [t["id"] for t in before])  # rest untouched
+
+    def test_deleted_card_is_tombstoned_not_resummoned(self):
+        ctx, _ = cb._ensure_orientation_project()
+        cb._seed_orientation_cards(ctx)
+        tasks = cb._load_tasks(ctx)
+        removed = tasks[0]
+        cb._save_tasks(ctx, [t for t in tasks if t["id"] != removed["id"]])  # user deletes a tutorial
+        again = cb._seed_orientation_cards(ctx)
+        self.assertEqual(again, [])                         # tombstone honored — never re-added
+        self.assertNotIn(removed["title"], [t["title"] for t in cb._load_tasks(ctx)])
+
+    def test_low_disk_signal_gates_the_pippin_card(self):
+        ctx, _ = cb._ensure_orientation_project()
+        cb._seed_orientation_cards(ctx)                     # no signal → not seeded
+        titles = [t["title"] for t in cb._load_tasks(ctx)]
+        self.assertNotIn("Make some room for Pippin", titles)
+        new_ids = cb._seed_orientation_cards(ctx, signals={"low_disk"})
+        self.assertEqual(len(new_ids), 1)                   # signal present → exactly the one card
+        titles = [t["title"] for t in cb._load_tasks(ctx)]
+        self.assertIn("Make some room for Pippin", titles)
+        self.assertEqual(cb._seed_orientation_cards(ctx, signals={"low_disk"}), [])  # once only
+
+    def test_user_created_cards_are_never_touched(self):
+        ctx, _ = cb._ensure_orientation_project()
+        cb._seed_orientation_cards(ctx)
+        tasks = cb._load_tasks(ctx)
+        mine = {"id": cb._next_task_id(tasks), "title": "My own card", "state": "doing",
+                "owner": "me", "tags": [], "blocked_by": [], "phase": "", "stop": "done",
+                "progress": 40, "engine_floor": 0, "jira": "", "github": "", "autonomy": [],
+                "created": "2026-07-09T00:00:00", "updated": "2026-07-09T00:00:00",
+                "subtasks": [], "notes": "hands off"}
+        cb._save_tasks(ctx, tasks + [mine])
+        cb._seed_orientation_cards(ctx, signals={"low_disk"})   # a real seeding pass runs after it
+        kept = [t for t in cb._load_tasks(ctx) if t["id"] == mine["id"]]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["title"], "My own card")
+        self.assertEqual(kept[0]["state"], "doing")
+        self.assertEqual(kept[0]["notes"], "hands off")
+
+    def test_init_step_seeds_on_first_creation(self):
+        import argparse
+        args = argparse.Namespace(no_orientation=False, no_open=True, no_browser=True)
+        cb._setup_step_orientation(args)                    # first run seeds the full deck
+        ctx = self.root / "Celeborn" / "Orientation" / ".context"
+        self.assertEqual(len(cb._load_tasks(ctx)), len(self._core_keys()))
+        cb._setup_step_orientation(args)                    # re-init duplicates nothing
+        self.assertEqual(len(cb._load_tasks(ctx)), len(self._core_keys()))
+
+    # ---- the low_disk signal wiring (CELE-t391) ----
+
+    def test_init_step_low_disk_env_seeds_pippin_card(self):
+        import argparse
+        args = argparse.Namespace(no_orientation=False, no_open=True, no_browser=True)
+        with mock.patch.dict(os.environ, {"CELEBORN_LOW_DISK": "1"}):   # the installer's wiring
+            cb._setup_step_orientation(args)
+        ctx = self.root / "Celeborn" / "Orientation" / ".context"
+        titles = [t["title"] for t in cb._load_tasks(ctx)]
+        self.assertIn("Make some room for Pippin", titles)
+        self.assertEqual(len(titles), len(self._core_keys()) + 1)      # full deck + the one conditional
+        with mock.patch.dict(os.environ, {"CELEBORN_LOW_DISK": "1"}):   # re-init: tombstoned, no dupe
+            cb._setup_step_orientation(args)
+        self.assertEqual(len(cb._load_tasks(ctx)), len(self._core_keys()) + 1)
+
+    def test_low_disk_probe_env_overrides_both_ways(self):
+        with mock.patch.dict(os.environ, {"CELEBORN_LOW_DISK": "1"}):
+            self.assertTrue(cb._low_disk_for_pippin())
+        with mock.patch.dict(os.environ, {"CELEBORN_LOW_DISK": "0"}):
+            self.assertFalse(cb._low_disk_for_pippin())
+
+    def test_low_disk_probe_auto_detect(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CELEBORN_LOW_DISK", None)       # no override → the real probe runs
+            need = cb.PIPPIN_DISK_NEED_BYTES
+            # Ample disk → False without ever probing the model runtime (no network on happy path).
+            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=need * 4)), \
+                 mock.patch.object(cb, "_weave_status") as ws:
+                self.assertFalse(cb._low_disk_for_pippin())
+                ws.assert_not_called()
+            # Low disk + Pippin pull pending → True.
+            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=need // 2)), \
+                 mock.patch.object(cb, "_weave_status",
+                                   return_value={"models": {"pm": False, "ghost": False}}):
+                self.assertTrue(cb._low_disk_for_pippin())
+            # Low disk but Pippin already pulled → nothing to make room for.
+            with mock.patch("shutil.disk_usage", return_value=mock.Mock(free=need // 2)), \
+                 mock.patch.object(cb, "_weave_status",
+                                   return_value={"models": {"pm": True, "ghost": True}}):
+                self.assertFalse(cb._low_disk_for_pippin())
+            # A failed probe must never break init → False.
+            with mock.patch("shutil.disk_usage", side_effect=OSError("no statvfs")):
+                self.assertFalse(cb._low_disk_for_pippin())
 
 
 class TestSmartInit(unittest.TestCase):
@@ -378,7 +594,7 @@ class TestSmartInit(unittest.TestCase):
         self._git("commit", "-qm", "initial commit: scaffold widget CLI")
 
     def _init(self, *extra):
-        return run_cli("--path", str(self.root), "init", "--no-claude-md", "--no-agents-md", *extra)
+        return run_cli("--path", str(self.root), "scaffold", "--no-claude-md", "--no-agents-md", *extra)
 
     def test_seeds_state_from_readme_and_manifest(self):
         self._make_repo()
@@ -544,6 +760,154 @@ class TestArchive(CelebornTestCase):
         self.assertIn("[cold]", r.out)  # tagged as cold tier, not lost
 
 
+# ---------------------------------------------------------- 4b. state.md archive (## Now history)
+
+STATE_HEADER = "# Project state — headline\n\n"
+
+
+def _state_with_sessions(n: int, keep_structural: bool = True) -> str:
+    """A state.md whose ## Now holds structural bullets + `n` dated SESSION history bullets,
+    newest-first (2026-02-{n} at the top down to 2026-02-01), then a ## Pointers section."""
+    lines = [STATE_HEADER, "## Now\n"]
+    if keep_structural:
+        lines += ["- **Focus:** shipping the thing\n",
+                  "- **Next action:** run the tests\n",
+                  "- **Branch:** main · **Status:** green\n"]
+    for i in range(n, 0, -1):
+        lines.append(f"- **SESSION `s{i:03d}` (2026-02-{i:02d}) — did work item {i}.**\n")
+    lines.append("\n## Pointers\n- notes → notes.md\n")
+    return "".join(lines)
+
+
+class TestStateArchiveUnit(unittest.TestCase):
+    """Pure-function coverage for the ## Now history parser + planner."""
+
+    def test_split_state_now_isolates_section(self):
+        text = _state_with_sessions(2)
+        before, heading, body, after = cb.split_state_now(text)
+        self.assertEqual(before, STATE_HEADER)
+        self.assertTrue(heading.startswith("## Now"))
+        self.assertIn("SESSION", body)
+        self.assertNotIn("## Pointers", body)   # body stops at the next h2
+        self.assertIn("## Pointers", after)
+
+    def test_no_now_section_is_noop(self):
+        text = "# state\n\n## Later\n- something 2026-02-01\n"
+        new, archived = cb.plan_state_archive(text, keep=1)
+        self.assertEqual(archived, [])
+        self.assertEqual(new, text)
+
+    def test_structural_bullets_are_never_archived(self):
+        text = _state_with_sessions(1)   # 3 structural + 1 dated
+        new, archived = cb.plan_state_archive(text, keep=0)   # archive ALL history
+        self.assertEqual(len(archived), 1)                    # only the dated bullet
+        self.assertIn("**Focus:**", new)
+        self.assertIn("**Next action:**", new)
+        self.assertIn("**Branch:**", new)
+        self.assertNotIn("SESSION", new)
+
+    def test_keeps_newest_by_date_archives_oldest(self):
+        text = _state_with_sessions(6)
+        new, archived = cb.plan_state_archive(text, keep=2)
+        self.assertEqual(len(archived), 4)
+        # newest two (2026-02-06, 05) survive; oldest (01..04) leave
+        self.assertIn("2026-02-06", new)
+        self.assertIn("2026-02-05", new)
+        self.assertNotIn("2026-02-04", new)
+        self.assertNotIn("2026-02-01", new)
+        joined = "".join(archived)
+        self.assertIn("2026-02-01", joined)
+        self.assertIn("2026-02-04", joined)
+
+    def test_under_budget_is_noop(self):
+        text = _state_with_sessions(3)
+        new, archived = cb.plan_state_archive(text, keep=6)
+        self.assertEqual(archived, [])
+        self.assertEqual(new, text)
+
+    def test_pointers_and_header_preserved(self):
+        text = _state_with_sessions(10)
+        new, _ = cb.plan_state_archive(text, keep=2)
+        self.assertTrue(new.startswith(STATE_HEADER))
+        self.assertIn("## Pointers", new)
+        self.assertIn("notes → notes.md", new)
+
+
+class TestStateArchive(CelebornTestCase):
+    """End-to-end `celeborn archive` + capture-time self-heal for state.md."""
+
+    def test_archive_state_moves_oldest_keeps_budget(self):
+        self.write("state.md", _state_with_sessions(10))
+        r = self.cli("archive", "--what", "state", "--state-keep", "3")
+        self.assertIsNone(r.exit_code)
+        state = self.read("state.md")
+        # 3 newest dated bullets + 3 structural bullets remain
+        self.assertIn("2026-02-10", state)
+        self.assertIn("2026-02-08", state)
+        self.assertNotIn("2026-02-07", state)
+        arch = self.read("state-archive/archive.md")
+        self.assertIn("2026-02-01", arch)
+        self.assertIn("2026-02-07", arch)
+
+    def test_archive_state_noop_under_budget(self):
+        self.write("state.md", _state_with_sessions(2))
+        r = self.cli("archive", "--what", "state", "--state-keep", "6")
+        self.assertIn("nothing to archive", r.out)
+        self.assertFalse((self.ctx / "state-archive" / "archive.md").is_file())
+
+    def test_archive_all_covers_both_tiers(self):
+        self.write("state.md", _state_with_sessions(10))
+        self.write("journal.md", "# Journal\n\n" + "".join(
+            f"## 2026-01-{i:02d} entry {i}\n- did {i}\n\n" for i in range(1, 26)))
+        r = self.cli("archive", "--state-keep", "2", "--keep", "20")
+        self.assertIsNone(r.exit_code)
+        self.assertTrue((self.ctx / "state-archive" / "archive.md").is_file())
+        self.assertTrue((self.ctx / "journal-archive" / "archive.md").is_file())
+
+    def test_archived_state_history_still_searchable(self):
+        self.write("state.md", _state_with_sessions(10))
+        self.cli("archive", "--what", "state", "--state-keep", "2")
+        self.cli("index")
+        r = self.cli("search", "work item 1")   # an archived (cold-tier) bullet
+        self.assertIsNone(r.exit_code)
+        self.assertIn("match", r.out)
+        self.assertIn("[cold]", r.out)
+
+    def test_capture_auto_archives_over_budget_state(self):
+        # A bloated state.md self-heals on the next capture (auto_archive default on), no manual cmd.
+        self.write("state.md", _state_with_sessions(20))
+        before, _ = cb.plan_state_archive(self.read("state.md"), 6)
+        transcript = self._one_turn_transcript()
+        self.cli("capture", "--transcript", transcript, "--session", "sess-auto", "--quiet")
+        _, remaining = cb.plan_state_archive(self.read("state.md"), 6)
+        self.assertEqual(remaining, [])   # now within the keep-6 cap
+        self.assertTrue((self.ctx / "state-archive" / "archive.md").is_file())
+
+    def test_capture_respects_auto_archive_off(self):
+        rc_path = self.ctx / ".celebornrc"
+        rc = json.loads(rc_path.read_text())
+        rc["auto_archive"] = False
+        rc_path.write_text(json.dumps(rc, indent=2) + "\n")
+        self.write("state.md", _state_with_sessions(20))
+        transcript = self._one_turn_transcript()
+        self.cli("capture", "--transcript", transcript, "--session", "sess-off", "--quiet")
+        _, remaining = cb.plan_state_archive(self.read("state.md"), 6)
+        self.assertEqual(len(remaining), 14)   # untouched — 20 history bullets, keep 6
+        self.assertFalse((self.ctx / "state-archive" / "archive.md").is_file())
+
+    def _one_turn_transcript(self) -> str:
+        """Write a minimal one-user-turn transcript the capturer will record, returning its path."""
+        p = self.root / "transcript.jsonl"
+        rows = [
+            {"type": "user", "uuid": "u1", "sessionId": "sess",
+             "message": {"role": "user", "content": "do a thing"}},
+            {"type": "assistant", "uuid": "a1", "sessionId": "sess",
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}},
+        ]
+        p.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return str(p)
+
+
 # --------------------------------------------------------------------------- 5. promote (distillation)
 
 class TestPromote(CelebornTestCase):
@@ -592,6 +956,7 @@ class TestWire(CelebornTestCase):
             "PreCompact": "celeborn hook pre-compact",
             "SessionEnd": "celeborn hook session-end",
             "Stop": "celeborn hook stop",
+            "Notification": "celeborn hook notification",   # CELE-t169 blocked-progress alert
         }
         for ev, cmd in expected.items():
             cmds = [h["command"] for g in d["hooks"][ev] for h in g["hooks"]]
@@ -855,6 +1220,153 @@ class TestCardlessWorkGate(CelebornTestCase):
         self.assertNotIn("NO TASK CLAIMED", ctx)
 
 
+class TestAutonomyGate(CelebornTestCase):
+    """CELE-t212 (contract t203 §3.4) — the per-card autonomy gate. A card's `autonomy` grant list
+    (subset of research/edits/tests/commit, set at grooming) bounds what its owning session may do:
+    ungranted classes hard-DENY; granted classes stay SILENT (deny-only — the gate defers to the
+    harness's own permission layer, never auto-allows). Absent field: silent under Claude (prompts
+    govern), most-restrictive under opencode (the plugin throw IS the permission system there)."""
+
+    def _decide(self, tool_name, harness="", session_id="sauto", **tool_input):
+        return cb.dispatch_hook(
+            "pre-tool-use",
+            {"tool_name": tool_name, "tool_input": tool_input, "session_id": session_id},
+            str(self.root), harness=harness)
+
+    def _decision(self, tool_name, **kw) -> str:
+        out = self._decide(tool_name, **kw)
+        return json.loads(out)["hookSpecificOutput"]["permissionDecision"] if out else ""
+
+    def _card(self, autonomy=None):
+        """One doing card linked to session 'sauto' (the t194 link the gate resolves through)."""
+        self.cli("tasks", "add", "Night card")
+        if autonomy is not None:
+            self.cli("tasks", "edit", "t1", "--autonomy", autonomy)
+        self.cli("claim", "t1", "--session", "sauto", "--by", "nightagent")
+
+    # --- field plumbing ----------------------------------------------------------------------------
+
+    def test_autonomy_field_round_trips_in_canonical_order(self):
+        self.cli("tasks", "add", "Night card", "--autonomy", "tests, edits")
+        self.assertIn("- autonomy: edits, tests", (self.ctx / "tasks.md").read_text())
+        t = cb._load_tasks(self.ctx)[0]
+        self.assertEqual(t["autonomy"], ["edits", "tests"])   # canonical AUTONOMY_GRANTS order
+        r = self.cli("tasks", "show", "t1")
+        self.assertIn("autonomy:   edits, tests", r.out)
+
+    def test_unknown_grant_token_is_rejected_at_the_cli(self):
+        r = run_cli("--path", str(self.root), "tasks", "add", "Night card", "--autonomy", "edits,deploy")
+        self.assertTrue(r.exit_code)
+        self.assertIn("unknown autonomy grant", r.err + r.out)
+        self.cli("tasks", "add", "Night card")
+        r3 = run_cli("--path", str(self.root), "tasks", "edit", "t1", "--autonomy", "yolo")
+        self.assertTrue(r3.exit_code)
+
+    def test_ungroomed_cards_render_byte_identical(self):
+        self.cli("tasks", "add", "Plain card")
+        self.assertNotIn("autonomy", (self.ctx / "tasks.md").read_text())
+
+    # --- bash command classification ---------------------------------------------------------------
+
+    def test_bash_autonomy_class(self):
+        commit = ("git commit -m x", "git -C /p push origin main", "git add -A && git commit -m x",
+                  "git tag v1.0", "git stash", "git branch -d old", "git checkout main",
+                  "git reset --hard HEAD~1", "git config core.editor vim")
+        tests = ("pytest tests/ -k gate", "python3 -m pytest tests", "npm test", "pnpm run test:unit",
+                 "cargo test", "deno test", "make check", "npx vitest run")
+        neither = ("git status && git log -1", "git diff HEAD", "git tag -l", "git stash list",
+                   "git branch -a", "git fetch origin", "git config --get user.name",
+                   "ls -la", "celeborn tasks", "echo pytesty")
+        for c in commit:
+            self.assertEqual(cb._bash_autonomy_class(c), "commit", c)
+        for c in tests:
+            self.assertEqual(cb._bash_autonomy_class(c), "tests", c)
+        for c in neither:
+            self.assertEqual(cb._bash_autonomy_class(c), "", c)
+
+    # --- enforcement: groomed card -----------------------------------------------------------------
+
+    def test_granted_classes_stay_silent_never_allow(self):
+        # Deny-only by design: a granted class emits NOTHING (the harness permission layer still
+        # applies), it never emits an "allow" that would bypass the harness's own prompts.
+        self._card("edits,tests")
+        self.assertEqual(self._decide("Edit", file_path="x.py"), "")
+        self.assertEqual(self._decide("Bash", command="pytest tests/"), "")
+        self.assertEqual(self._decide("Bash", command="ls -la"), "")     # unclassified bash flows
+
+    def test_ungranted_classes_deny_with_grooming_command(self):
+        self._card("edits,tests")
+        self.assertEqual(self._decision("Bash", command="git commit -m x"), "deny")
+        self.assertEqual(self._decision("WebFetch", url="https://x.y"), "deny")
+        out = self._decide("Bash", command="git push origin main")
+        self.assertIn("--autonomy edits,tests,commit", out)   # the exact widen command
+        self.assertIn("never implied", out)                   # git-write off by default, said out loud
+
+    def test_commit_is_never_implied(self):
+        self._card("research,edits,tests")                    # everything BUT commit
+        self.assertEqual(self._decision("Bash", command="git commit -m done"), "deny")
+
+    def test_commit_grant_lifts_git_write_deny(self):
+        self._card("edits,commit")
+        self.assertEqual(self._decide("Bash", command="git commit -m done"), "")
+        self.assertEqual(self._decide("Bash", command="git push origin main"), "")
+
+    def test_enforced_identically_under_opencode_tool_names(self):
+        self._card("edits,tests")
+        self.assertEqual(self._decide("edit", harness="opencode", filePath="x"), "")
+        self.assertEqual(self._decision("bash", harness="opencode", command="git commit -m x"), "deny")
+        self.assertEqual(self._decision("webfetch", harness="opencode", url="u"), "deny")
+
+    def test_senior_guards_stay_senior(self):
+        # A granted `edits` card must not slip past the t101 redirect guard — guard order is fixed.
+        self._card("edits,tests,commit")
+        out = self._decide("Bash", command="cd sub && echo x > out.txt")
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("cd", out)
+
+    # --- enforcement: ungroomed card (absent field) ------------------------------------------------
+
+    def test_absent_field_is_silent_under_claude(self):
+        # Pre-t212 behavior preserved: no bound set → the harness's own permission prompts govern.
+        self._card()
+        self.assertEqual(self._decide("Edit", file_path="x.py"), "")
+        self.assertEqual(self._decide("Bash", command="git commit -m x"), "")
+
+    def test_absent_field_is_most_restrictive_under_opencode(self):
+        # OpenCode has no permission prompts — the gate IS the permission system, so an ungroomed
+        # card grants nothing (t203 §3.4). Read/orient bash still flows: a gated session can claim.
+        self._card()
+        self.assertEqual(self._decision("edit", harness="opencode", filePath="x"), "deny")
+        self.assertEqual(self._decision("bash", harness="opencode", command="git commit -m x"), "deny")
+        self.assertEqual(self._decision("bash", harness="opencode", command="pytest"), "deny")
+        self.assertEqual(self._decide("bash", harness="opencode", command="celeborn tasks"), "")
+        self.assertEqual(self._decide("read", harness="opencode", filePath="x"), "")
+        out = self._decide("edit", harness="opencode", filePath="x")
+        self.assertIn("no autonomy grants", out)
+        self.assertIn("--autonomy edits", out)
+
+    def test_cardless_session_is_not_this_gates_concern(self):
+        # No card resolved → autonomy gate silent; the t131 card-less gate owns that case (and does
+        # fire here, proving the chain order: card gate first, autonomy gate second).
+        self.cli("tasks", "add", "Unclaimed card")
+        out = self._decide("Edit", session_id="someoneelse", file_path="x.py")
+        self.assertIn("a card is MANDATORY", out)              # t131 wording, not the autonomy deny
+        self.assertNotIn("autonomy gate", out)
+        # ...and a git write from a card-less session under claude stays ungated (bash never card-gates).
+        self.assertEqual(self._decide("Bash", session_id="someoneelse", command="git status"), "")
+
+    def test_owner_match_fallback_intersects_multiple_cards(self):
+        # Two doing cards owned by this session's short id, no t194 link: most-restrictive wins —
+        # the effective grant set is the intersection (t203 §3.4 ambiguity clause).
+        self.cli("tasks", "add", "Card A", "--autonomy", "edits,commit")
+        self.cli("tasks", "add", "Card B", "--autonomy", "edits,tests")
+        for tid in ("t1", "t2"):
+            self.cli("tasks", "edit", tid, "--owner", "sauto2", "--state", "doing")
+        self.assertEqual(self._decide("Edit", session_id="sauto2xyz", file_path="x.py"), "")
+        self.assertEqual(self._decision("Bash", session_id="sauto2xyz", command="git commit -m x"), "deny")
+        self.assertEqual(self._decision("Bash", session_id="sauto2xyz", command="pytest"), "deny")
+
+
 class TestPermissionBaseline(CelebornTestCase):
     """t100 — `wire --global` merges the SAFE 'big three' permission baseline into
     ~/.claude/settings.json: read-only built-ins + safe Bash prefixes → permissions.allow, and
@@ -1018,7 +1530,7 @@ class TestPermissionsSettingsCli(CelebornTestCase):
             r = self.cli("skills", "--json")
         self.assertIsNone(r.exit_code, r.all)
         d = json.loads(r.out)
-        self.assertEqual(len(d["core"]), 5)
+        self.assertEqual(len(d["core"]), 6)
         self.assertEqual(len(d["recommended"]), 6)
         self.assertEqual(d["mattpocock"]["total"], len(cb.MATTPOCOCK_SKILLS))
         self.assertEqual(d["mattpocock"]["installed_count"], 0)   # fresh temp project has no skills dir
@@ -1114,6 +1626,75 @@ class TestSkillsAutoUpdate(CelebornTestCase):
         self.assertEqual(d["harness"], "claude")
         self.assertTrue(d["mattpocock"]["claude_only"])
         self.assertEqual(d["mattpocock"]["refresh_days"], cb.SKILLS_REFRESH_DAYS)
+
+
+class TestAutonomyConfig(CelebornTestCase):
+    """`celeborn autonomy` (CELE-t353) — the Agents & autonomy defaults surface (read + write) backing
+    the board Settings section. Persists to `.celebornrc` under an `autonomy` block; the ship-preflight
+    marker is locked-on and not settable."""
+
+    def test_defaults_when_no_block(self):
+        # A fresh project has no `autonomy` block → the built-in defaults (grants = research/edits/tests,
+        # never commit; queue; 4 elves; local PM).
+        cfg = cb._autonomy_config(self.ctx)
+        self.assertEqual(cfg["default_grants"], cb._autoprovision_grants())
+        self.assertNotIn("commit", cfg["default_grants"])
+        self.assertEqual(cfg["night_questions"], "queue")
+        self.assertEqual(cfg["elves_per_night"], 4)
+        self.assertEqual(cfg["pm_model"], "qwen-4b-local")
+
+    def test_json_shape_and_locked_preflight(self):
+        d = json.loads(self.cli("autonomy", "--json").out)
+        for key in ("grants", "night_questions", "elves_per_night", "pm_model", "ship_preflight"):
+            self.assertIn(key, d)
+        # commit chip is the amber/risk one and off by default; the others are on.
+        commit = next(o for o in d["grants"]["options"] if o["value"] == "commit")
+        self.assertTrue(commit["risk"])
+        self.assertFalse(commit["active"])
+        self.assertTrue(next(o for o in d["grants"]["options"] if o["value"] == "edits")["active"])
+        # ship pre-flight is displayed ON and LOCKED — never a toggleable field.
+        self.assertEqual(d["ship_preflight"]["value"], True)
+        self.assertEqual(d["ship_preflight"]["locked"], True)
+        self.assertEqual(d["elves_per_night"]["min"], cb.AUTONOMY_ELVES_MIN)
+        self.assertEqual(d["elves_per_night"]["max"], cb.AUTONOMY_ELVES_MAX)
+
+    def test_set_grants_persists_to_rc_canonical(self):
+        r = self.cli("autonomy", "--set-grants", "tests,commit,research")
+        self.assertIsNone(r.exit_code, r.all)
+        block = json.loads((self.ctx / ".celebornrc").read_text())["autonomy"]
+        # stored in canonical AUTONOMY_GRANTS order, unknowns impossible (validated)
+        self.assertEqual(block["default_grants"], ["research", "tests", "commit"])
+        # re-read reflects it, incl. commit now active
+        d = json.loads(self.cli("autonomy", "--json").out)
+        self.assertTrue(next(o for o in d["grants"]["options"] if o["value"] == "commit")["active"])
+
+    def test_set_night_elves_pm(self):
+        self.assertIsNone(self.cli("autonomy", "--night-questions", "block",
+                                   "--elves", "8", "--pm-model", "haiku-hosted").exit_code)
+        cfg = cb._autonomy_config(self.ctx)
+        self.assertEqual(cfg["night_questions"], "block")
+        self.assertEqual(cfg["elves_per_night"], 8)
+        self.assertEqual(cfg["pm_model"], "haiku-hosted")
+
+    def test_rejects_bad_grant_and_out_of_range_elves(self):
+        self.assertIsNotNone(self.cli("autonomy", "--set-grants", "research,bogus").exit_code)
+        self.assertIsNotNone(self.cli("autonomy", "--elves", "99").exit_code)
+        # a rejected write never touched the rc
+        self.assertNotIn("autonomy", json.loads((self.ctx / ".celebornrc").read_text()))
+
+    def test_normalizes_garbage_block(self):
+        # A hand-edited rc with junk values → normalized, never crashes (unknown grants dropped, elves
+        # clamped, bad night/pm fall back to the first valid option).
+        rc = self.ctx / ".celebornrc"
+        data = json.loads(rc.read_text())
+        data["autonomy"] = {"default_grants": ["edits", "bogus"], "night_questions": "nope",
+                            "elves_per_night": 999, "pm_model": "gpt-9"}
+        rc.write_text(json.dumps(data, indent=2) + "\n")
+        cfg = cb._autonomy_config(self.ctx)
+        self.assertEqual(cfg["default_grants"], ["edits"])
+        self.assertEqual(cfg["night_questions"], "queue")
+        self.assertEqual(cfg["elves_per_night"], cb.AUTONOMY_ELVES_MAX)
+        self.assertEqual(cfg["pm_model"], "qwen-4b-local")
 
 
 class TestConsent(unittest.TestCase):
@@ -1439,6 +2020,182 @@ class TestQualifiedTaskIds(CelebornTestCase):
         self.assertIn("First card", r.out)
 
 
+class TestSessionAuthoritativeOwnership(CelebornTestCase):
+    """CELE-t194 — kill the recurring @claude/@unknown + no-context-chip defect at the source. An
+    agent-initiated `celeborn claim` / `tasks add --claim` from a Bash tool call must be owned by the
+    SESSION (grabbed by the code from CLAUDE_CODE_SESSION_ID), never by a `--by` the agent typed, and
+    must write the session→card link that the fleet's context-token chip joins against. No agent
+    naming, no subjective decision — the same outcome every time."""
+
+    SID = "aabbccdd-1111-2222-3333-444455556666"   # a realistic ambient session id
+    SHORT = "aabbcc"                                 # its 6-char owner head
+
+    def _ambient(self):
+        return mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID})
+
+    def test_ambient_session_owns_the_card_without_a_flag(self):
+        # An agent that runs a bare `celeborn claim` (no --session) is still session-owned: the code
+        # reads CLAUDE_CODE_SESSION_ID, the agent doesn't name anything.
+        self.cli("tasks", "add", "Wire the adapter")
+        with self._ambient():
+            self.cli("claim", "t1")
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["owner"], self.SHORT)
+
+    def test_by_model_name_is_ignored_when_a_session_is_ambient(self):
+        # The exact wack-a-mole: `celeborn claim t1 --by claude`. The session wins; owner is NEVER the
+        # model name, so the board never shows @claude.
+        self.cli("tasks", "add", "Wire the adapter")
+        with self._ambient():
+            r = self.cli("claim", "t1", "--by", "claude")
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["owner"], self.SHORT)
+        self.assertIn("ignored", r.all.lower())     # the ignore is surfaced, not silent
+
+    def test_claim_records_the_session_link_for_the_context_chip(self):
+        # The second symptom: without this link _active_agents can't join the live transcript → no
+        # context-token chip. The link must be written even though no --session was passed.
+        self.cli("tasks", "add", "Wire the adapter")
+        with self._ambient():
+            self.cli("claim", "t1")
+        link = (cb._load_metrics(self.ctx).get("agent_sessions") or {}).get(self.SID) or {}
+        self.assertEqual(link.get("owner"), self.SHORT)
+        self.assertEqual(link.get("task"), "t1")
+
+    def test_tasks_add_claim_also_links_the_session(self):
+        # add-and-claim is the other claim entry point — it must link too, or an add-claimed card has
+        # no context chip.
+        with self._ambient():
+            self.cli("tasks", "add", "Wire the adapter", "--claim")
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["owner"], self.SHORT)
+        link = (cb._load_metrics(self.ctx).get("agent_sessions") or {}).get(self.SID) or {}
+        self.assertEqual(link.get("task"), "t1")
+
+    def test_celeborn_session_id_is_the_harness_neutral_ambient_alias(self):
+        # P6 (CELE-t143): OpenCode's native celeborn_* tools have no Claude env — they set
+        # CELEBORN_SESSION_ID on their CLI subprocesses instead. A tool-call `tasks add --claim`
+        # must be session-owned and session-linked through the alias exactly like the Claude var
+        # (this is the whole reason `celeborn_tasks_add claim=true` gets a context chip).
+        with mock.patch.dict(os.environ, {"CELEBORN_SESSION_ID": self.SID}):
+            self.cli("tasks", "add", "Wire the adapter", "--claim")
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["owner"], self.SHORT)
+        link = (cb._load_metrics(self.ctx).get("agent_sessions") or {}).get(self.SID) or {}
+        self.assertEqual(link.get("task"), "t1")
+
+    def test_claude_ambient_wins_over_the_celeborn_alias(self):
+        # Precedence is documented, not accidental: inside a Claude window the harness var is the
+        # session; the alias only speaks when nothing else does.
+        other = "99999999-8888-7777-6666-555544443333"
+        self.cli("tasks", "add", "Wire the adapter")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID,
+                                          "CELEBORN_SESSION_ID": other}):
+            self.cli("claim", "t1")
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["owner"], self.SHORT)
+        sessions = cb._load_metrics(self.ctx).get("agent_sessions") or {}
+        self.assertIn(self.SID, sessions)
+        self.assertNotIn(other, sessions)
+
+    def test_manual_cli_without_a_session_still_honors_by(self):
+        # Outside a Claude window (no ambient id) a human at a plain terminal can still attribute with
+        # --by — the session-authoritative rule only applies when a real session id exists.
+        self.cli("tasks", "add", "Wire the adapter")
+        self.cli("claim", "t1", "--by", "scotch")    # setUp scrubbed CLAUDE_CODE_SESSION_ID
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["owner"], "scotch")
+
+    def test_doctor_flags_a_model_or_unknown_owned_doing_card(self):
+        # Backstop: a card claimed by an unfixed binary (owner @claude / @unknown) is flagged so it can
+        # be re-claimed and repaired.
+        self.cli("tasks", "add", "Wire the adapter")
+        tasks = cb._load_tasks(self.ctx)
+        tasks[0]["owner"] = "unknown"
+        tasks[0]["state"] = "doing"
+        cb._save_tasks(self.ctx, tasks)
+        r = self.cli("doctor")
+        self.assertIn("not owned by a session short-id", r.all)
+
+    def test_doctor_passes_when_doing_card_is_session_owned(self):
+        self.cli("tasks", "add", "Wire the adapter")
+        with self._ambient():
+            self.cli("claim", "t1")
+        r = self.cli("doctor")
+        self.assertIn("every doing card is owned by a session short-id", r.all)
+
+
+class TestAwaitingAlertClearsOnResume(CelebornTestCase):
+    """CELE-t195 — the 'awaiting you' badge must clear when work RESUMES, not only on the next user
+    prompt. A permission grant or an AskUserQuestion answer resumes the same turn and never fires
+    user-prompt-submit, so the old clear (only there) left the badge stale for the rest of the turn.
+    The fix clears the session's card alert on pre-tool-use (the earliest 'work resumed' signal)."""
+
+    def _pre_tool_use(self, session_id, tool_name="Bash", **tool_input):
+        return cb.dispatch_hook(
+            "pre-tool-use",
+            {"tool_name": tool_name, "tool_input": tool_input or {"command": "celeborn tasks"},
+             "session_id": session_id},
+            str(self.root))
+
+    def _claim_doing(self, sid):
+        self.cli("tasks", "add", "Wire the adapter")
+        self.cli("claim", "t1", "--session", sid)      # owner + agent_sessions link + state=doing
+
+    def test_tool_call_clears_awaiting_alert_without_a_new_prompt(self):
+        self._claim_doing("S1")
+        cb._set_alert(self.ctx, "t1", "permission", "Needs permission to proceed.", "S1")
+        self.assertIsNotNone(cb._alert_for(self.ctx, "t1"))          # badge is up
+        with mock.patch.object(cs, "schedule_agents_push", lambda *a, **k: None):
+            self._pre_tool_use("S1")                                 # session resumes work
+        self.assertIsNone(cb._alert_for(self.ctx, "t1"))            # badge cleared on resume
+
+    def test_stopped_and_idle_alerts_also_clear_on_resume(self):
+        for kind in ("stopped", "idle"):
+            with self.subTest(kind=kind):
+                self._claim_doing("S1")
+                cb._set_alert(self.ctx, "t1", kind, "…", "S1")
+                with mock.patch.object(cs, "schedule_agents_push", lambda *a, **k: None):
+                    self._pre_tool_use("S1")
+                self.assertIsNone(cb._alert_for(self.ctx, "t1"))
+                self.cli("tasks", "rm", "t1")                        # reset for the next subTest
+
+    def test_another_sessions_tool_call_leaves_the_alert(self):
+        # A different window working its own card must not clear THIS card's badge.
+        self._claim_doing("S1")
+        cb._set_alert(self.ctx, "t1", "permission", "…", "S1")
+        with mock.patch.object(cs, "schedule_agents_push", lambda *a, **k: None):
+            self._pre_tool_use("OTHER")                              # unrelated session
+        self.assertIsNotNone(cb._alert_for(self.ctx, "t1"))        # still up
+
+    def test_tool_call_is_a_noop_when_no_alert_exists(self):
+        # Fast path: the overwhelmingly common no-alert tool call must not error.
+        self._claim_doing("S1")
+        with mock.patch.object(cs, "schedule_agents_push", lambda *a, **k: None):
+            out = self._pre_tool_use("S1")
+        self.assertEqual(out, "")                                    # allowed, no crash
+
+    def test_ended_sessions_alert_is_filtered_from_the_projection(self):
+        # The t187 case: a live 'stopped' alert whose owning session has ended must NOT surface on the
+        # board, even though the record still exists (the SessionEnd hook may never have cleared it).
+        self._claim_doing("deadsession-xyz")
+        cb._set_alert(self.ctx, "t1", "stopped", "…", "deadsession-xyz")
+        self.assertIsNotNone(cb._alert_for(self.ctx, "t1"))          # record still present…
+        cb._mark_session_ended(self.ctx, "deadsession-xyz")          # …but the window is gone
+        live = cb._live_alerts(self.ctx)
+        self.assertNotIn("t1", live)                                 # so the board drops the badge
+        doc = cb._tasks_doc(self.ctx, cb._load_tasks(self.ctx))
+        card = next(c for c in doc["tasks"] if c["id"] == "t1")
+        self.assertIsNone(card["alert"])
+
+    def test_live_session_alert_still_surfaces(self):
+        # Guard against over-filtering: an alert from a still-live session must remain visible.
+        self._claim_doing("S1")
+        cb._set_alert(self.ctx, "t1", "permission", "…", "S1")
+        self.assertIn("t1", cb._live_alerts(self.ctx))
+
+    def test_ship_clears_a_stale_alert(self):
+        self._claim_doing("S1")
+        cb._set_alert(self.ctx, "t1", "stopped", "…", "S1")
+        self.cli("tasks", "edit", "t1", "--progress", "99")          # crest so ship is allowed
+        self.cli("ship", "t1")
+        self.assertIsNone(cb._alert_for(self.ctx, "t1"))
+
+
 class TestQualityRecommendations(CelebornTestCase):
     """t70 Phase 3 — portable quality recommendations. Change-derived advisor signals (sensitive paths
     → security review; substantial code changes → code review + verify), rendered as Claude slash
@@ -1606,6 +2363,9 @@ class TestFleetSlugDedup(unittest.TestCase):
             os.environ.pop("XDG_CONFIG_HOME", None)
         else:
             os.environ["XDG_CONFIG_HOME"] = self._old_xdg
+        _ccsid = getattr(self, "_old_ccsid", None)
+        if _ccsid is not None:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = _ccsid
         self._tmp.cleanup()
 
     def _project(self, folder, slug=None):
@@ -1613,7 +2373,7 @@ class TestFleetSlugDedup(unittest.TestCase):
         root = Path(tempfile.mkdtemp()) / folder
         root.mkdir()
         self.addCleanup(lambda: shutil.rmtree(root.parent, ignore_errors=True))
-        run_cli("--path", str(root), "init", "--no-scan")
+        run_cli("--path", str(root), "scaffold", "--no-scan")
         if slug is not None:
             (root / ".context" / ".celebornrc").write_text(json.dumps({"project_slug": slug}))
         return root
@@ -1682,13 +2442,16 @@ class TestFleetRepair(unittest.TestCase):
             os.environ.pop("XDG_CONFIG_HOME", None)
         else:
             os.environ["XDG_CONFIG_HOME"] = self._old_xdg
+        _ccsid = getattr(self, "_old_ccsid", None)
+        if _ccsid is not None:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = _ccsid
         self._tmp.cleanup()
 
     def _project(self, folder, slug=None):
         root = Path(tempfile.mkdtemp()) / folder
         root.mkdir()
         self.addCleanup(lambda: shutil.rmtree(root.parent, ignore_errors=True))
-        run_cli("--path", str(root), "init", "--no-scan")
+        run_cli("--path", str(root), "scaffold", "--no-scan")
         if slug is not None:
             (root / ".context" / ".celebornrc").write_text(json.dumps({"project_slug": slug}))
         return root
@@ -1773,13 +2536,16 @@ class TestFleetAutoRegister(unittest.TestCase):
             os.environ.pop("XDG_CONFIG_HOME", None)
         else:
             os.environ["XDG_CONFIG_HOME"] = self._old_xdg
+        _ccsid = getattr(self, "_old_ccsid", None)
+        if _ccsid is not None:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = _ccsid
         self._tmp.cleanup()
 
     def _project(self, folder):
         root = Path(tempfile.mkdtemp()) / folder
         root.mkdir()
         self.addCleanup(lambda: shutil.rmtree(root.parent, ignore_errors=True))
-        run_cli("--path", str(root), "init", "--no-scan")
+        run_cli("--path", str(root), "scaffold", "--no-scan")
         return root
 
     def _registry_paths(self):
@@ -1815,6 +2581,248 @@ class TestFleetAutoRegister(unittest.TestCase):
              mock.patch.object(cb, "_ensure_skills_fresh", lambda *a, **k: None):
             cb.dispatch_hook("session-start", {"session_id": "S1"}, str(root))
         self.assertIn(str(root.resolve()), self._registry_paths())
+
+
+class TestCommitIntents(CelebornTestCase):
+    """CELE-t303 — the blackboard's THIRD coordination channel: declared planned commits. Touches
+    say where an agent is, the board says what it owns — an intent says what it is ABOUT to do to
+    the shared tree, so concurrent agents negotiate commit order BEFORE a same-file sweep, not
+    after. Substrate is the machine-global fleet registry (XDG-isolated by the fixture); the payoff
+    is the per-turn envelope warning to the PEER, never the author."""
+
+    A = "aaaa1111-0000-0000-0000-000000000001"
+    B = "bbbb2222-0000-0000-0000-000000000002"
+
+    def _as(self, sid):
+        return mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": sid})
+
+    def test_declare_and_list_roundtrip(self):
+        self.cli("tasks", "add", "Land the reducer")           # t1 — an intent needs a real card
+        with self._as(self.A):
+            r = self.cli("intent", "land the reducer", "--files", "board/stage.ts,scripts/x.py",
+                         "--task", "t1", "--eta", "30m")
+        self.assertIn("Intent declared", r.all)
+        rows = cb._active_intents(self.root, self.ctx)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["by"], self.A[:6])
+        self.assertEqual(rows[0]["files"], ["board/stage.ts", "scripts/x.py"])
+        self.assertEqual(rows[0]["task"], "t1")
+        self.assertTrue(rows[0]["eta"])           # 30m parsed into a concrete timestamp
+        lst = self.cli("intent", "list")
+        self.assertIn("plans to commit board/stage.ts, scripts/x.py", lst.out)
+
+    def test_declare_requires_a_session(self):
+        """CELE-t370: an intent with no session has no identity — it must not land. Peers can't act
+        on 'someone plans to commit this'; they need to know WHO."""
+        self.cli("tasks", "add", "Land the reducer")           # t1
+        # no self._as(...) → setUp already scrubbed the ambient session id, so there is no identity
+        r = self.cli("intent", "land it", "--files", "a.py", "--task", "t1")
+        self.assertIsNotNone(r.exit_code)
+        self.assertIn("requires a session id", r.all)
+        self.assertEqual(cb._active_intents(self.root, self.ctx), [])   # nothing filed
+
+    def test_declare_requires_task_card_that_exists(self):
+        """CELE-t370: the card is the intent's purpose. --task is mandatory and must name a real
+        card, so a peer can always look up why the commit is coming."""
+        with self._as(self.A):
+            missing = self.cli("intent", "land it", "--files", "a.py")          # no --task at all
+            self.assertIsNotNone(missing.exit_code)
+            self.assertIn("requires --task", missing.all)
+            ghost = self.cli("intent", "land it", "--files", "a.py", "--task", "t404")  # not on board
+            self.assertIsNotNone(ghost.exit_code)
+            self.assertIn("no such card", ghost.all)
+        self.assertEqual(cb._active_intents(self.root, self.ctx), [])   # neither filed
+
+    def test_declare_requires_a_description(self):
+        """CELE-t370: purpose is card + a human line; the free-text '<what>' stays mandatory."""
+        self.cli("tasks", "add", "Land the reducer")           # t1
+        with self._as(self.A):
+            r = self.cli("intent", "--files", "a.py", "--task", "t1")
+        self.assertIsNotNone(r.exit_code)
+        self.assertIn("requires a description", r.all)
+        self.assertEqual(cb._active_intents(self.root, self.ctx), [])
+
+    def test_list_json_carries_touches_and_display_labels(self):
+        """CELE-t347: `intent list --json` is the board's /api/intents feed. It must ship this
+        project's touches alongside the intents, and every intent row must carry the CLI-rendered
+        display strings (line · eta/age labels · qualified id) so the board surfaces the chip and
+        the amber hold-warn with the t303 vocabulary verbatim, never re-derived in TS."""
+        self.cli("tasks", "add", "Land the reducer")           # t1
+        with self._as(self.A):
+            self.cli("touch", "board/x.ts", "--task", "t1")
+            self.cli("intent", "land the reducer", "--files", "board/x.ts",
+                     "--task", "t1", "--eta", "30m")
+        doc = json.loads(self.cli("intent", "list", "--json").out)
+        self.assertEqual(len(doc["intents"]), 1)
+        row = doc["intents"][0]
+        self.assertIn("plans to commit board/x.ts", row["line"])   # verbatim _intent_line
+        self.assertIn("out", row["eta_label"])                     # 30m → "~Nm out"
+        self.assertTrue(row["age_label"])
+        self.assertTrue(row["qualified"].endswith("t1"))           # SLUG-t1, not bare
+        self.assertNotEqual(row["qualified"], "t1")
+        # touches ride in the same payload, scoped to this project
+        self.assertIn("board/x.ts", {t["path"] for t in doc["touches"]})
+
+    def test_list_json_all_omits_project_scoped_touches(self):
+        """`--all` is the machine-wide intents view — no single project ctx to read touches from,
+        so the payload omits the touch channel rather than guess which project's to attach."""
+        self.cli("tasks", "add", "Plan")                       # t1
+        with self._as(self.A):
+            self.cli("intent", "plan", "--files", "a.py", "--task", "t1")
+        doc = json.loads(self.cli("intent", "list", "--all", "--json").out)
+        self.assertIn("intents", doc)
+        self.assertNotIn("touches", doc)
+
+    def test_redeclare_replaces_own_plan_not_a_queue(self):
+        self.cli("tasks", "add", "Plan")                       # t1
+        with self._as(self.A):
+            self.cli("intent", "first plan", "--files", "a.py", "--task", "t1")
+            self.cli("intent", "second plan", "--files", "b.py", "--task", "t1")
+        rows = cb._active_intents(self.root, self.ctx)
+        self.assertEqual(len(rows), 1)            # one intent per (agent, project)
+        self.assertEqual(rows[0]["what"], "second plan")
+        self.assertEqual(rows[0]["files"], ["b.py"])
+
+    def test_done_withdraws_only_own_intent(self):
+        self.cli("tasks", "add", "Plan")                       # t1
+        with self._as(self.A):
+            self.cli("intent", "plan A", "--files", "a.py", "--task", "t1")
+        with self._as(self.B):
+            self.cli("intent", "plan B", "--files", "b.py", "--task", "t1")
+            r = self.cli("intent", "done")
+        self.assertIn("withdrawn", r.all)
+        rows = cb._active_intents(self.root, self.ctx)
+        self.assertEqual([r["by"] for r in rows], [self.A[:6]])   # A's plan survives
+
+    def test_done_requires_a_session(self):
+        """CELE-t370: release is session-scoped, always. A `done` with no identity must refuse
+        rather than fall through and risk dropping a peer's plan."""
+        self.cli("tasks", "add", "Plan")                       # t1
+        with self._as(self.A):
+            self.cli("intent", "plan A", "--files", "a.py", "--task", "t1")
+        # outside any session context (setUp scrubbed the ambient id) → release has no identity
+        r = self.cli("intent", "done")
+        self.assertIsNotNone(r.exit_code)
+        self.assertIn("requires a session id", r.all)
+        self.assertEqual([x["by"] for x in cb._active_intents(self.root, self.ctx)], [self.A[:6]])
+
+    def test_bare_clear_releases_only_own_intent(self):
+        """CELE-t370: the old bare `clear` wiped everyone. Now it is session-scoped — B's `clear`
+        drops only B's plan; A's survives."""
+        self.cli("tasks", "add", "Plan")                       # t1
+        with self._as(self.A):
+            self.cli("intent", "plan A", "--files", "a.py", "--task", "t1")
+        with self._as(self.B):
+            self.cli("intent", "plan B", "--files", "b.py", "--task", "t1")
+            r = self.cli("intent", "clear")
+        self.assertIn("yours only", r.all)
+        self.assertEqual([x["by"] for x in cb._active_intents(self.root, self.ctx)], [self.A[:6]])
+
+    def test_clear_all_agents_wipes_the_whole_fleet(self):
+        """CELE-t370: the deliberate fleet reset is now an explicit --all-agents, not the default."""
+        self.cli("tasks", "add", "Plan")                       # t1
+        with self._as(self.A):
+            self.cli("intent", "plan A", "--files", "a.py", "--task", "t1")
+        with self._as(self.B):
+            r = self.cli("intent", "plan B", "--files", "b.py", "--task", "t1")
+            r = self.cli("intent", "clear", "--all-agents")
+        self.assertIn("all-agents", r.all.lower())
+        self.assertEqual(cb._active_intents(self.root, self.ctx), [])   # both gone
+
+    def test_clear_requires_a_session(self):
+        self.cli("tasks", "add", "Plan")                       # t1
+        with self._as(self.A):
+            self.cli("intent", "plan A", "--files", "a.py", "--task", "t1")
+        # no session context → even --all-agents refuses without an identity to act under
+        r = self.cli("intent", "clear", "--all-agents")
+        self.assertIsNotNone(r.exit_code)
+        self.assertIn("requires a session id", r.all)
+        self.assertEqual(len(cb._active_intents(self.root, self.ctx)), 1)   # untouched
+
+    def test_files_default_to_the_cards_touches(self):
+        self.cli("tasks", "add", "Card seven")                 # t1
+        self.cli("tasks", "add", "Card eight")                 # t2
+        with self._as(self.A):
+            self.cli("touch", "src/x.py", "--task", "t1")
+            self.cli("touch", "src/y.py", "--task", "t1")
+            self.cli("touch", "src/other.py", "--task", "t2")     # different card — not inherited
+            self.cli("intent", "ship t1", "--task", "t1")
+        rows = cb._active_intents(self.root, self.ctx)
+        self.assertEqual(rows[0]["files"], ["src/x.py", "src/y.py"])
+
+    def test_overlap_warns_the_peer_never_the_author(self):
+        self.cli("tasks", "add", "Big refactor")               # t1
+        with self._as(self.A):
+            self.cli("intent", "big refactor", "--files", "src/x.py", "--task", "t1")
+            self.cli("touch", "src/x.py", "--task", "t1")          # author edits its own target
+        with self._as(self.B):
+            self.cli("touch", "src/x.py", "--task", "t2")          # peer is in the same file
+        notice_b = cb._intent_overlap_notice(self.ctx, self.B[:6])
+        self.assertIn("src/x.py", notice_b)
+        self.assertIn(f"@{self.A[:6]}", notice_b)
+        self.assertIn("you are touching", notice_b)
+        # the author sees nothing — its own plan is not a collision
+        self.assertEqual(cb._intent_overlap_notice(self.ctx, self.A[:6]), "")
+
+    def test_no_touch_overlap_means_no_warning(self):
+        self.cli("tasks", "add", "Big refactor")               # t1
+        with self._as(self.A):
+            self.cli("intent", "big refactor", "--files", "src/x.py", "--task", "t1")
+        with self._as(self.B):
+            self.cli("touch", "src/unrelated.py", "--task", "t2")
+        self.assertEqual(cb._intent_overlap_notice(self.ctx, self.B[:6]), "")
+
+    def test_envelope_carries_the_overlap_warning_to_the_peer(self):
+        self.cli("tasks", "add", "Landing the reducer")        # t1
+        with self._as(self.A):
+            self.cli("intent", "landing the reducer", "--files", "src/x.py", "--task", "t1")
+        with self._as(self.B):
+            self.cli("touch", "src/x.py", "--task", "t2")
+        out = cb.dispatch_hook("user-prompt-submit", {"session_id": self.B, "prompt": "hi"},
+                               str(self.root))
+        self.assertIn("Celeborn blackboard intents", out)
+        self.assertIn("src/x.py", out)
+        # and the author's own turn carries no warning block
+        out_a = cb.dispatch_hook("user-prompt-submit", {"session_id": self.A, "prompt": "hi"},
+                                 str(self.root))
+        self.assertNotIn("Celeborn blackboard intents", out_a)
+
+    def test_ttl_prunes_stale_intents_on_read(self):
+        self.cli("tasks", "add", "Old plan")                   # t1
+        with self._as(self.A):
+            self.cli("intent", "old plan", "--files", "a.py", "--task", "t1")
+        data = cb._load_fleet_registry()
+        stale = (cb._dt.datetime.now() - cb._dt.timedelta(hours=3)).isoformat(timespec="seconds")
+        data["intents"][0]["at"] = stale
+        cb._save_fleet_registry(data)
+        self.assertEqual(cb._active_intents(self.root, self.ctx), [])
+        # and the prune persisted — the stale row is gone from disk, not just filtered
+        self.assertEqual(cb._load_fleet_registry().get("intents"), [])
+
+    def test_ship_withdraws_the_cards_intents(self):
+        self.cli("tasks", "add", "Wire the adapter")
+        with self._as(self.A):
+            self.cli("claim", "t1")
+            self.cli("intent", "landing t1", "--files", "src/x.py", "--task", "t1")
+            self.cli("tasks", "edit", "t1", "--progress", "99")
+            r = self.cli("ship", "t1")
+        self.assertIn("withdrew 1 commit intent", r.all)
+        self.assertEqual(cb._active_intents(self.root, self.ctx), [])
+
+    def test_orient_surfaces_declared_intents(self):
+        self.cli("tasks", "add", "Landing the reducer")        # t1
+        with self._as(self.A):
+            self.cli("intent", "landing the reducer", "--files", "src/x.py", "--task", "t1")
+        r = self.cli("status")
+        self.assertIn("intents (fleet blackboard", r.out)
+        self.assertIn("plans to commit src/x.py", r.out)
+
+    def test_eta_parsing_units(self):
+        self.assertEqual(cb._parse_eta_minutes("20"), 20)
+        self.assertEqual(cb._parse_eta_minutes("45m"), 45)
+        self.assertEqual(cb._parse_eta_minutes("1.5h"), 90)
+        self.assertIsNone(cb._parse_eta_minutes(""))
+        self.assertIsNone(cb._parse_eta_minutes("soon"))
 
 
 class TestHook(CelebornTestCase):
@@ -1954,6 +2962,31 @@ class TestHook(CelebornTestCase):
         self.assertIn("owner:      sess-7", show)
         self.assertIn("state:      doing", show)
 
+    def test_user_prompt_submit_picks_up_a_dispatched_card(self):
+        # The full CELE-t213 loop: PM `dispatch` stages the card (owner ← sid6, TODO) and queues the
+        # brief; the coder's next turn drains it (session-aware) as its work instruction, and the
+        # marker riding in the brief triggers claim-on-receipt — TODO → DOING + the t203 §1.3
+        # agent_sessions link — with the PM never reading a byte of coder output.
+        self.cli("tasks", "add", "Dispatched card")           # t1, todo
+        self.cli("dispatch", "t1", "--to", "sess-7")
+        tp = self._transcript({"message": {"usage": {"input_tokens": 1000}}})
+        try:
+            with mock.patch.dict(os.environ, {"CELEBORN_AGENT": ""}):
+                r = self.hook("user-prompt-submit", {
+                    "session_id": "sess-7", "transcript_path": tp,
+                    "prompt": "continuing where I left off",   # no marker in the typed prompt
+                })
+        finally:
+            os.unlink(tp)
+        ctx = json.loads(r.out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Dispatched card", ctx)                 # the brief rides in as the instruction
+        self.assertIn("card claim", ctx)                      # …and the receipt claimed it
+        show = self.cli("tasks", "show", "t1").out
+        self.assertIn("owner:      sess-7", show)
+        self.assertIn("state:      doing", show)
+        link = (cb._load_metrics(self.ctx).get("agent_sessions") or {}).get("sess-7") or {}
+        self.assertEqual(link.get("task"), "t1")              # §1.3 link written at pickup
+
     def test_prose_task_mention_claims_card_as_session(self):
         # CELE-t131: naming a project-qualified card in PROSE (no pasted marker) on a fresh session is a
         # strong, intentional signal — Celeborn CLAIMS the card, owned by the SESSION short id (the
@@ -2019,6 +3052,369 @@ class TestHook(CelebornTestCase):
             r = run_cli("--path", str(self.root), "hook", "session-start")
         self.assertIsNone(r.exit_code, r.all)
         self.assertIn("Orient load", r.out)     # still produced the payload; just no session_id
+
+
+class TestOpenCodeHarness(CelebornTestCase):
+    """`--harness opencode` on `celeborn hook` (CELE-t139): the OpenCode plugin shells lifecycle
+    events with OpenCode-shaped payloads on stdin; `_opencode_to_claude_shape()` translates them
+    into the internal dispatch_hook shape. Pure-translation cases + end-to-end dispatch parity,
+    including the transcript-less paths (OpenCode never has a Claude JSONL transcript)."""
+
+    def hook(self, event, payload=None) -> Run:
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload or {}))):
+            return run_cli("--path", str(self.root), "hook", event, "--harness", "opencode")
+
+    def test_translation_maps_lifecycle_events(self):
+        for oc, ce in (("session.created", "session-start"),
+                       ("message.updated", "user-prompt-submit"),
+                       ("tool.execute.before", "pre-tool-use"),
+                       ("session.idle", "stop"),
+                       ("session.error", "session-end"),
+                       ("experimental.session.compacting", "pre-compact")):
+            self.assertEqual(cb._opencode_to_claude_shape(oc, {})[0], ce)
+
+    def test_translation_lifts_payload_fields(self):
+        ev, p = cb._opencode_to_claude_shape("tool.execute.before", {
+            "sessionID": "oc-1", "directory": "/w", "tool": "edit",
+            "args": {"filePath": "x.py"}, "text": "hello", "reason": "why"})
+        self.assertEqual(ev, "pre-tool-use")
+        self.assertEqual(p, {"session_id": "oc-1", "cwd": "/w", "tool_name": "Edit",
+                             "tool_input": {"filePath": "x.py"}, "prompt": "hello",
+                             "reason": "why"})
+
+    def test_translation_normalizes_tool_names_to_claude_casing(self):
+        # CELE-t140: the deny chain matches Claude-cased names exactly (redirect/publish guards on
+        # "Bash", the card-less gate on _CARD_GATED_TOOLS), so lowercase OpenCode built-ins must
+        # normalize in the translation seam. `patch` maps to Edit (same gated-edit class); unknown
+        # names (MCP/custom tools) pass through unchanged.
+        for oc, claude in (("edit", "Edit"), ("write", "Write"), ("patch", "Edit"),
+                           ("webfetch", "WebFetch"), ("websearch", "WebSearch"),
+                           ("task", "Task"), ("bash", "Bash"), ("read", "Read"),
+                           ("glob", "Glob"), ("grep", "Grep"), ("list", "List"),
+                           ("Edit", "Edit"), ("my_mcp_tool", "my_mcp_tool")):
+            _, p = cb._opencode_to_claude_shape("tool.execute.before", {"tool": oc})
+            self.assertEqual(p["tool_name"], claude, f"{oc} should normalize to {claude}")
+
+    # --- P3 (CELE-t140): the card gate end-to-end through `hook pre-tool-use --harness opencode` —
+    # the exact call the plugin's tool.execute.before makes; a deny here is what the plugin throws.
+
+    def _pre_tool_use(self, tool, session_id="oc-gate-1", **args) -> Run:
+        return self.hook("pre-tool-use", {"sessionID": session_id,
+                                          "directory": str(self.root),
+                                          "tool": tool, "args": args})
+
+    def _decision(self, r: Run) -> str:
+        return (json.loads(r.out)["hookSpecificOutput"]["permissionDecision"]
+                if r.out.strip() else "")
+
+    def test_cardless_gated_tool_autoprovisions_instead_of_denying(self):
+        # CELE-t211 supersedes the P3 pin (card-less gated tools used to deny under opencode): with
+        # no human at a permission prompt, the PM puts the coder ON the board instead of blocking
+        # it. First gated call → allow + provenance; the session is carded now, so every later
+        # gated call sails in silence. Child sessions still deny (pinned in TestPMAutoProvision).
+        self.cli("tasks", "add", "Wire the adapter")          # open card exists, session owns none
+        first = self._pre_tool_use("edit", filePath="x.py")
+        self.assertEqual(self._decision(first), "allow")
+        self.assertIn("auto-provisioned", first.out)
+        for tool in ("write", "patch", "webfetch", "websearch", "task"):
+            r = self._pre_tool_use(tool, filePath="x.py")
+            self.assertEqual(r.out.strip(), "", f"{tool} should pass silently once carded")
+
+    def test_cardless_never_gates_reads_or_the_cli(self):
+        self.cli("tasks", "add", "Wire the adapter")
+        for tool, args in (("bash", {"command": "celeborn tasks"}),
+                           ("read", {"filePath": "x.py"}), ("glob", {"pattern": "*"}),
+                           ("grep", {"pattern": "x"}), ("list", {"path": "."})):
+            r = self._pre_tool_use(tool, **args)
+            self.assertEqual(r.out.strip(), "", f"{tool} must never gate")
+
+    def test_cardless_never_gates_native_celeborn_tools(self):
+        # P6 (CELE-t143): the plugin skips the gate subprocess for celeborn_* entirely, but the
+        # CLI-side deny chain is the defense-in-depth layer — a card-less session must be able to
+        # read the board and claim its way out THROUGH the native tools, so their names must sail
+        # through pre-tool-use with no opinion (unknown-name pass-through, pinned here on the
+        # exact four the plugin registers).
+        self.cli("tasks", "add", "Wire the adapter")          # open card exists, session owns none
+        for tool, args in (("celeborn_search", {"query": "adapter"}),
+                           ("celeborn_tasks", {}),
+                           ("celeborn_claim", {"id": "t1"}),
+                           ("celeborn_tasks_add", {"title": "New card"})):
+            r = self._pre_tool_use(tool, **args)
+            self.assertEqual(r.out.strip(), "", f"{tool} must never gate")
+
+    def test_claiming_clears_the_opencode_gate(self):
+        # An explicitly claimed + groomed card sails with NO PM intervention — auto-provision
+        # (CELE-t211) only fires for a card-less session, so the pre-claimed path stays silent.
+        self.cli("tasks", "add", "Wire the adapter")          # t1
+        self.cli("claim", "t1", "--session", "oc-gate-1")
+        self.cli("tasks", "edit", "t1", "--autonomy", "edits")   # opencode: ungroomed = nothing granted
+        self.assertEqual(self._pre_tool_use("edit", filePath="x").out.strip(), "")
+
+    def test_redirect_guard_fires_on_lowercase_bash(self):
+        # The cd+redirect shell-hygiene guard matches tool_name == "Bash"; OpenCode's lowercase
+        # `bash` must hit it after normalization (it silently skipped before CELE-t140).
+        r = self._pre_tool_use("bash", command="cd sub && echo hi > out.txt")
+        self.assertEqual(self._decision(r), "deny")
+        self.assertIn("cd", r.out)
+
+    def test_translation_passes_through_celeborn_vocabulary_and_bad_payload(self):
+        # The plugin shells Celeborn event names directly; they pass through unmapped, and a
+        # non-dict payload degrades to {} (fail-open, never raises).
+        ev, p = cb._opencode_to_claude_shape("user-prompt-submit", None)
+        self.assertEqual(ev, "user-prompt-submit")
+        self.assertEqual(p, {})
+
+    def test_compacting_panic_saves_but_defers_metric_to_compacted(self):
+        # ★ P5 (CELE-t142): experimental.session.compacting shells `hook pre-compact`, which still
+        # panic-saves (the snapshot must exist BEFORE the window is summarized) — but under the
+        # opencode harness the compaction metric is deferred to session.compacted, where the plugin
+        # runs `celeborn record compaction` on actual success, so an aborted compaction is never
+        # counted and a landed one is never counted twice.
+        r = self.hook("pre-compact", {"sessionID": "oc-c1"})
+        self.assertIn("Celeborn saved you", r.out)
+        self.assertEqual(len(cb._panic_snapshots(self.ctx)), 1)
+        self.assertEqual(cb._load_metrics(self.ctx).get("compactions_bridged", 0), 0)
+        self.cli("record", "compaction")                      # what the plugin runs on compacted
+        self.assertEqual(cb._load_metrics(self.ctx).get("compactions_bridged", 0), 1)
+
+    def test_session_compacted_is_not_routed_to_pre_compact(self):
+        # The plugin handles session.compacted itself (bare `record compaction`, no hook call);
+        # a raw event name arriving via the translation path must pass through UNMAPPED and
+        # no-op in dispatch — routing it into pre-compact would fire a second panic-save per
+        # compaction on top of the compacting-time one.
+        ev, _ = cb._opencode_to_claude_shape("session.compacted", {"sessionID": "oc-c1"})
+        self.assertEqual(ev, "session.compacted")
+        out = cb.dispatch_hook("session.compacted", {"session_id": "oc-c1"}, str(self.root),
+                               harness="opencode")
+        self.assertEqual(out, "")
+        self.assertEqual(cb._load_metrics(self.ctx).get("compactions_bridged", 0), 0)
+        self.assertEqual(len(cb._panic_snapshots(self.ctx)), 0)
+
+    def test_session_start_translates_opencode_payload(self):
+        # The plugin shells the Celeborn event vocabulary directly (HOOK_EVENTS gains no new
+        # entries); the OpenCode-shaped payload is translated and sessionID attributes the orient.
+        r = self.hook("session-start", {"sessionID": "oc-sess-1", "directory": str(self.root)})
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("## Celeborn memory (Orient load)", r.out)
+        self.assertEqual(cb._load_metrics(self.ctx).get("last_session_id"), "oc-sess-1")
+
+    def test_env_var_triggers_translation_without_flag(self):
+        # The plugin exports CELEBORN_HARNESS=opencode on every shell-out; that alone must
+        # trigger translation (the rc `harness` pin deliberately does NOT).
+        with mock.patch.dict(os.environ, {"CELEBORN_HARNESS": "opencode"}):
+            with mock.patch.object(sys, "stdin",
+                                   io.StringIO(json.dumps({"sessionID": "oc-env-1"}))):
+                r = run_cli("--path", str(self.root), "hook", "session-start")
+        self.assertIn("Orient load", r.out)
+        self.assertEqual(cb._load_metrics(self.ctx).get("last_session_id"), "oc-env-1")
+
+    def test_user_prompt_submit_without_transcript_claims_pasted_card(self):
+        # OpenCode has no Claude transcript; claim-on-receipt + the envelope must run anyway
+        # (only the context-size nudge needs a transcript). Owner = session SHORT id (t131-B).
+        self.cli("tasks", "add", "Wire the adapter")          # t1, todo
+        with mock.patch.dict(os.environ, {"CELEBORN_AGENT": ""}):
+            r = self.hook("user-prompt-submit", {
+                "sessionID": "oc-s2", "directory": str(self.root),
+                "text": "start on this please\n\n⟨celeborn:t1⟩"})
+        ctx = json.loads(r.out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("card claim", ctx)
+        show = self.cli("tasks", "show", "t1").out
+        self.assertIn("owner:      oc-s2", show)
+        self.assertIn("state:      doing", show)
+
+    def test_stop_without_transcript_sets_stopped_alert(self):
+        # session.idle shells `hook stop`: with no transcript there is nothing to capture (stdout
+        # stays silent), but the idle-Stop alert must still ride the DOING card (CELE-t169).
+        self.cli("tasks", "add", "Card in flight")            # t1
+        with mock.patch.dict(os.environ, {"CELEBORN_AGENT": ""}):
+            self.hook("user-prompt-submit", {"sessionID": "oc-4", "directory": str(self.root),
+                                             "text": "⟨celeborn:t1⟩"})   # link session → card
+            r = self.hook("stop", {"sessionID": "oc-4"})
+        self.assertEqual(r.out.strip(), "")
+        alert = (cb._load_alerts(self.ctx).get("alerts") or {}).get("t1") or {}
+        self.assertEqual(alert.get("kind"), "stopped")
+        self.assertEqual(alert.get("session"), "oc-4")
+
+    def test_claude_payload_untranslated_without_flag_or_env(self):
+        # A plain Claude-shaped call must NOT run through the translator (it would drop
+        # transcript_path); the flagless path stays byte-identical to before CELE-t139.
+        with mock.patch.object(sys, "stdin",
+                               io.StringIO(json.dumps({"session_id": "s-claude"}))):
+            r = run_cli("--path", str(self.root), "hook", "session-start")
+        self.assertIn("Orient load", r.out)
+        self.assertEqual(cb._load_metrics(self.ctx).get("last_session_id"), "s-claude")
+
+    # --- P4 (CELE-t141): touch / capture / token bands — the transcript-less paths the plugin's
+    # tool.execute.after / file.edited / message.updated wiring drives.
+
+    def test_translation_maps_after_and_file_edited_to_post_tool_use(self):
+        self.assertEqual(cb._opencode_to_claude_shape("tool.execute.after", {})[0], "post-tool-use")
+        self.assertEqual(cb._opencode_to_claude_shape("file.edited", {})[0], "post-tool-use")
+
+    def test_translation_lifts_file_edited_payload_as_an_edit(self):
+        # file.edited carries only the path — it must surface as an Edit with a file_path so the
+        # post-tool-use touch path treats it like any other file mutation.
+        ev, p = cb._opencode_to_claude_shape("file.edited", {"sessionID": "oc-9", "file": "lib/x.py"})
+        self.assertEqual(ev, "post-tool-use")
+        self.assertEqual(p["tool_name"], "Edit")
+        self.assertEqual(p["tool_input"], {"file_path": "lib/x.py"})
+        # ... but never clobbers real tool args when both ride one payload.
+        _, p2 = cb._opencode_to_claude_shape("tool.execute.after", {
+            "tool": "edit", "args": {"filePath": "a.py"}, "file": "b.py"})
+        self.assertEqual(p2["tool_input"], {"filePath": "a.py"})
+
+    def test_record_tokens_stamps_the_live_capture_cursor(self):
+        # `celeborn record tokens` (what the plugin runs per completed assistant message) writes the
+        # REAL window onto captures[sid]: absolute total, delta vs the previous report, live marker.
+        self.cli("record", "tokens", "--session", "oc-tok-1", "--tokens", "42000")
+        cap = cb._load_metrics(self.ctx)["captures"]["oc-tok-1"]
+        self.assertEqual(cap["tokens_session"], 42000)
+        self.assertTrue(cap["live"])
+        self.assertEqual(cap["last_delta"], 42000)
+        self.cli("record", "tokens", "--session", "oc-tok-1", "--tokens", "50000")
+        cap = cb._load_metrics(self.ctx)["captures"]["oc-tok-1"]
+        self.assertEqual(cap["tokens_session"], 50000)
+        self.assertEqual(cap["last_delta"], 8000)
+        # A post-compaction shrink is legitimate: absolute total wins, delta clamps to 0.
+        self.cli("record", "tokens", "--session", "oc-tok-1", "--tokens", "9000")
+        cap = cb._load_metrics(self.ctx)["captures"]["oc-tok-1"]
+        self.assertEqual(cap["tokens_session"], 9000)
+        self.assertEqual(cap["last_delta"], 0)
+
+    def test_live_session_becomes_an_active_agents_row(self):
+        # The board's /clear-nudge chips + per-card band pills read `_active_agents`; a live-reported
+        # window (no transcript file) must emit a row with the REAL token count, attributed to the
+        # session's claimed card. That row is exactly what band(k) renders.
+        self.cli("tasks", "add", "Wire the bands")            # t1
+        self.cli("claim", "t1", "--session", "oc-band-1")
+        self.cli("record", "tokens", "--session", "oc-band-1", "--tokens", "97000")
+        rows = cb._active_agents(self.ctx, 30.0, show_all=False)
+        row = next((r for r in rows if r["session"] == "oc-band-1"[:8]), None)
+        self.assertIsNotNone(row, rows)
+        self.assertEqual(row["tokens"], 97000)
+        self.assertEqual(row["task_id"], "t1")
+        self.assertTrue(row["owned"])
+
+    # --- CELE-t206 (closes t163): the text board annotates every live DOING card with its context
+    # window + /clear-nudge band + session id + coder model, automatically off the agent join.
+
+    def test_context_band_mirrors_the_hosted_band_ts(self):
+        # Same thresholds as board/lib/band.ts — the single source both surfaces share.
+        for k, word in [(0, "fresh"), (49, "fresh"), (50, "mid"), (74, "mid"),
+                        (75, "clear soon"), (99, "clear soon"), (100, "clear now"),
+                        (124, "clear now"), (125, "clear urgent"), (400, "clear urgent")]:
+            self.assertEqual(cb._context_band(k)[1], word, k)
+
+    def test_doing_annotation_degrades_and_suppresses_redundant_session(self):
+        # No live window → no phantom band (and no session shoved right where tokens sit — the t163 bug).
+        self.assertEqual(cb._doing_card_annotation(None, "", "", "scotch"), "")
+        # Full triple when everything is known and the session differs from the owner handle.
+        full = cb._doing_card_annotation(247000, "d4ea23", "Opus 4.8", "scotch")
+        self.assertIn("~247k ctx", full)
+        self.assertIn("clear urgent", full)
+        self.assertIn("d4ea23", full)
+        self.assertIn("Opus 4.8", full)
+        # Session chip suppressed when the owner IS that short-id — no "@d4ea23 · d4ea23".
+        self.assertNotIn("d4ea23 · d4ea23", cb._doing_card_annotation(247000, "d4ea23", "", "d4ea23"))
+
+    def test_tasks_board_annotates_a_live_doing_card(self):
+        # A prompt-autogenerated card owned by its session (no explicit handle) still shows its live
+        # tokens + band on the text board — automatic off the agent join, not the claim verb (t163).
+        self.cli("tasks", "add", "Ship the annotation")       # t1
+        self.cli("claim", "t1", "--session", "oc-anno-1")
+        self.cli("record", "tokens", "--session", "oc-anno-1", "--tokens", "97000")
+        r = self.cli("tasks")
+        line = next(l for l in r.out.splitlines() if "Ship the annotation" in l)
+        self.assertIn("~97k ctx", line)
+        self.assertIn("clear soon", line)                     # 97k → 75..100 band
+        # Owner IS the session short id here, so the session chip is suppressed (shown once, as @owner).
+        self.assertEqual(line.count("oc-ann"), 1)
+
+    def test_doing_context_join_maps_live_tokens_and_session(self):
+        # The join the text board render + JSON projection both ride: every live DOING card maps to
+        # its fullest window's tokens and the working session's short id, keyed by task id.
+        self.cli("tasks", "add", "Joined card")               # t1
+        self.cli("claim", "t1", "--session", "oc-join-1")
+        self.cli("record", "tokens", "--session", "oc-join-1", "--tokens", "30000")
+        toks, sess, press = cb._doing_context_join(self.ctx)
+        self.assertEqual(toks.get("t1"), 30000)
+        self.assertEqual(sess.get("t1"), "oc-joi")            # sid[:6]
+        self.assertEqual(press.get("t1"), "none")             # 30k is under every threshold (t207)
+
+    def test_tasks_board_has_no_band_for_a_doing_card_with_no_live_window(self):
+        # A claimed card whose session isn't reporting tokens shows no band — degrades cleanly.
+        self.cli("tasks", "add", "Idle claim")                # t1
+        self.cli("claim", "t1", "--session", "oc-idle-1")
+        line = next(l for l in self.cli("tasks").out.splitlines() if "Idle claim" in l)
+        self.assertNotIn("ctx", line)
+        self.assertNotIn("clear", line)
+
+    def test_ended_or_stale_live_sessions_drop_off_the_board(self):
+        self.cli("record", "tokens", "--session", "oc-gone-1", "--tokens", "10000")
+        cb._mark_session_ended(self.ctx, "oc-gone-1")
+        self.assertEqual(cb._active_agents(self.ctx, 30.0, show_all=False), [])
+        # A stale updated_at (outside the window) also drops — but --all still shows it.
+        self.cli("record", "tokens", "--session", "oc-old-1", "--tokens", "5000")
+        m = cb._load_metrics(self.ctx)
+        m["captures"]["oc-old-1"]["updated_at"] = "2020-01-01T00:00:00"
+        cb._save_metrics(self.ctx, m)
+        self.assertEqual(cb._active_agents(self.ctx, 30.0, show_all=False), [])
+        self.assertEqual(len(cb._active_agents(self.ctx, 30.0, show_all=True)), 1)
+
+    def test_heartbeat_words_a_live_window_as_live_context(self):
+        self.cli("record", "tokens", "--session", "oc-hb-1", "--tokens", "61234")
+        r = self.hook("user-prompt-submit", {"sessionID": "oc-hb-1",
+                                             "directory": str(self.root), "text": "hi"})
+        ctx = json.loads(r.out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("tokens in the live context window", ctx)
+        self.assertNotIn("recorded this session", ctx)
+
+    def test_post_tool_use_auto_touches_the_edited_file(self):
+        # A completed file mutation must land on the board's active-file chips without the agent
+        # running the touch protocol: owner = the claim's session short id, task = the DOING card.
+        self.cli("tasks", "add", "Wire the touches")          # t1
+        self.cli("claim", "t1", "--session", "oc-touch-1")
+        r = self.hook("post-tool-use", {"sessionID": "oc-touch-1", "directory": str(self.root),
+                                        "tool": "edit", "args": {"filePath": "lib/x.py"}})
+        self.assertEqual(r.out.strip(), "")                   # no model-facing output
+        touches = cb._load_touches(self.ctx)["files"]
+        self.assertIn("lib/x.py", touches)
+        recs = touches["lib/x.py"]                             # schema/2: a list of toucher records
+        self.assertEqual(recs[0]["by"], "oc-tou")             # sid[:6] — the session IS the agent
+        self.assertEqual(recs[0]["task"], "t1")
+
+    def test_post_tool_use_registers_alongside_another_agents_touch(self):
+        # CELE-t309: a second writer no longer clobbers the first — both stay on the file so the
+        # declared two-writer hotspot (and its overlap signal) survives.
+        self.cli("touch", "lib/x.py", "--by", "human-1", "--why", "mid-edit")
+        self.hook("post-tool-use", {"sessionID": "oc-touch-2", "directory": str(self.root),
+                                    "tool": "write", "args": {"filePath": "lib/x.py"}})
+        recs = cb._load_touches(self.ctx)["files"]["lib/x.py"]
+        self.assertEqual({r["by"] for r in recs}, {"human-1", "oc-tou"})  # both writers visible
+
+    def test_post_tool_use_folds_activity_into_the_digest(self):
+        # The user turn opens the window entry; the turn's reported tool calls fold into it —
+        # activity.md (orient's "what actually happened" backstop) works without a transcript.
+        self.hook("user-prompt-submit", {"sessionID": "oc-act-1", "directory": str(self.root),
+                                         "text": "fix the parser"})
+        self.hook("post-tool-use", {"sessionID": "oc-act-1", "directory": str(self.root),
+                                    "tool": "edit", "args": {"filePath": "lib/parser.py"}})
+        self.hook("post-tool-use", {"sessionID": "oc-act-1", "directory": str(self.root),
+                                    "tool": "bash", "args": {"command": "pytest -q\nignored second line"}})
+        activity = self.read("activity.md")
+        self.assertIn("lib/parser.py", activity)
+        self.assertIn("pytest -q", activity)
+        self.assertNotIn("ignored second line", activity)     # command head only, like the capture
+        self.assertIn("fix the parser", activity)
+        window = json.loads((self.ctx / "auto" / "window.json").read_text())
+        self.assertEqual(len(window), 1)                      # one turn = one bounded fact row
+        self.assertEqual(window[0]["files"], ["lib/parser.py"])
+
+    def test_post_tool_use_ignores_reads_and_missing_input(self):
+        self.hook("post-tool-use", {"sessionID": "oc-act-2", "directory": str(self.root),
+                                    "tool": "read", "args": {"filePath": "lib/x.py"}})
+        self.assertFalse((self.ctx / "auto" / "window.json").exists())
+        self.assertEqual(cb._load_touches(self.ctx).get("files") or {}, {})
 
 
 class TestHandoff(CelebornTestCase):
@@ -2125,6 +3521,245 @@ class TestDoctor(CelebornTestCase):
         self.addCleanup(setattr, shutil, "which", shutil.which)
         shutil.which = lambda _name: None
         self.assertFalse(cb._gh_unauthenticated())
+
+class TestOpenCodeWire(CelebornTestCase):
+    """CELE-t204 — `celeborn opencode wire`: the OpenCode↔Celeborn unit (event plugin + Pippin PM
+    agent + provider block) installed per-project into `.opencode/{plugin,agent}/` + the root
+    `opencode.json`, version-stamped and idempotent, with a never-clobber config merge (§6)."""
+
+    # --- the pure merge -------------------------------------------------------------------------
+
+    def test_merge_into_empty_config(self):
+        merged, changed = cb._merge_opencode_config({}, {"$schema": "s", "provider": {"ollama": {"a": 1}}})
+        self.assertTrue(changed)
+        self.assertEqual(merged["provider"]["ollama"]["a"], 1)
+
+    def test_merge_never_clobbers_existing_keys(self):
+        existing = {"theme": "user-theme",
+                    "provider": {"ollama": {"options": {"baseURL": "http://mine:9999/v1"},
+                                            "models": {"my-model": {"name": "Mine"}}},
+                                 "anthropic": {"keep": True}},
+                    "plugin": ["their-plugin"]}
+        incoming = {"theme": "clobber",
+                    "provider": {"ollama": {"options": {"baseURL": "http://localhost:11434/v1",
+                                                        "apiKey": "ollama"},
+                                            "models": {"qwen3:4b-instruct": {"name": "PM", "tools": True}}}},
+                    "plugin": ["celeborn"]}
+        merged, changed = cb._merge_opencode_config(existing, incoming)
+        self.assertTrue(changed)
+        self.assertEqual(merged["theme"], "user-theme")                       # scalar: existing wins
+        self.assertEqual(merged["provider"]["ollama"]["options"]["baseURL"],
+                         "http://mine:9999/v1")                               # nested scalar wins
+        self.assertEqual(merged["provider"]["ollama"]["options"]["apiKey"], "ollama")  # missing added
+        self.assertIn("my-model", merged["provider"]["ollama"]["models"])     # user model kept
+        self.assertIn("qwen3:4b-instruct", merged["provider"]["ollama"]["models"])  # PM model added
+        self.assertTrue(merged["provider"]["anthropic"]["keep"])              # sibling provider kept
+        self.assertEqual(merged["plugin"], ["their-plugin", "celeborn"])      # list union, order kept
+
+    def test_merge_is_idempotent(self):
+        incoming = {"provider": {"ollama": {"models": {"qwen3:4b-instruct": {"tools": True}}}}}
+        once, _ = cb._merge_opencode_config({}, incoming)
+        twice, changed = cb._merge_opencode_config(once, incoming)
+        self.assertFalse(changed)
+        self.assertEqual(twice, once)
+
+    # --- the install ----------------------------------------------------------------------------
+
+    def test_wire_installs_plugin_agent_and_config(self):
+        r = self.cli("opencode", "wire")
+        self.assertIsNone(r.exit_code, r.all)
+        plug = (self.root / ".opencode" / "plugin" / "celeborn.js").read_text()
+        self.assertIn("@celeborn/opencode-plugin v", plug)                    # version-stamped
+        self.assertIn("tool.execute.before", plug)                           # the t140 card gate rides along
+        agent = (self.root / ".opencode" / "agent" / "project-manager.md").read_text()
+        self.assertIn("ollama/qwen3:4b-instruct", agent)          # PM pinned to Pippin's real tag (t374)
+        cfg = json.loads((self.root / "opencode.json").read_text())
+        self.assertIn("qwen3:4b-instruct", cfg["provider"]["ollama"]["models"])   # Pippin · PM
+        self.assertIn("qwen3:4b", cfg["provider"]["ollama"]["models"])            # Pippin · ghost
+        self.assertNotIn("qwen-4b", cfg["provider"]["ollama"]["models"])          # retired alias gone
+        self.assertNotIn("plugin", cfg)      # auto-discovery covers it; no npm-style entry installed
+        self.assertNotIn("comment-usage", cfg)                               # reference chatter stripped
+
+    def test_wire_reports_version_and_rewire(self):
+        self.assertIsNone(cb._opencode_installed_version(self.root))          # not installed yet
+        self.cli("opencode", "wire")
+        v = cb._opencode_installed_version(self.root)
+        self.assertRegex(v, r"^\d")
+        r = self.cli("opencode", "wire")                                      # second run = re-wire
+        self.assertIn("re-wired", r.out)
+
+    def test_wire_preserves_user_config(self):
+        (self.root / "opencode.json").write_text(json.dumps(
+            {"theme": "mine", "provider": {"ollama": {"options": {"baseURL": "http://mine/v1"}}}}))
+        self.cli("opencode", "wire")
+        cfg = json.loads((self.root / "opencode.json").read_text())
+        self.assertEqual(cfg["theme"], "mine")
+        self.assertEqual(cfg["provider"]["ollama"]["options"]["baseURL"], "http://mine/v1")
+        self.assertIn("qwen3:4b-instruct", cfg["provider"]["ollama"]["models"])  # still gained the PM model
+
+    def test_wire_leaves_invalid_config_untouched(self):
+        (self.root / "opencode.json").write_text("{ not json")
+        r = self.cli("opencode", "wire")
+        self.assertIsNone(r.exit_code, r.all)                                 # still wires plugin+agent
+        self.assertEqual((self.root / "opencode.json").read_text(), "{ not json")
+        self.assertTrue((self.root / ".opencode" / "plugin" / "celeborn.js").is_file())
+
+    def test_wire_flag_on_cmd_wire(self):
+        r = self.cli("wire", "--opencode")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertTrue((self.root / ".opencode" / "plugin" / "celeborn.js").is_file())
+
+
+class TestWeave(CelebornTestCase):
+    """CELE-t374 — the sovereign weave: pins, detection, the never-clobber GLOBAL config merge, the
+    headless consent gate, and the retirement of the hand-made `qwen-4b` alias in favor of the two
+    real upstream tags (references/weave-contract.md §1–§2)."""
+
+    _OLLAMA_DOWN = {"host": "http://localhost:11434", "running": False, "version": None, "models": []}
+
+    def test_pins_flatten_with_contract_fallbacks(self):
+        pins = cb._weave_pins()
+        self.assertEqual(pins["pippin_pm"], "qwen3:4b-instruct")
+        self.assertEqual(pins["pippin_ghost"], "qwen3:4b")
+        self.assertRegex(pins["opencode_version"], r"^\d+\.\d+\.\d+")
+        self.assertRegex(pins["ollama_floor"], r"^\d+\.\d+")
+
+    def test_opencode_pin_tracks_package_json(self):
+        # Single source of truth: opencode/package.json's @opencode-ai/plugin dependency; the
+        # weave-pin.json mirror must never drift from it (sovereignty rule 3).
+        module = cb._opencode_module_dir()
+        if module is None:
+            self.skipTest("no opencode/ module beside this checkout")
+        dep = str(json.loads((module / "package.json").read_text())
+                  ["dependencies"]["@opencode-ai/plugin"]).lstrip("^~=v")
+        self.assertEqual(cb._weave_pins()["opencode_version"], dep)
+        pin = cb._weave_pin()
+        if pin:
+            self.assertEqual(pin["opencode"]["version"], dep)
+
+    def test_retired_alias_absent_from_packaged_config(self):
+        # `qwen-4b` only ever resolved via a local `ollama cp` rebrand — retired (rule 1). The
+        # packaged provider block must carry BOTH real Pippin tags and never the alias.
+        module = cb._opencode_module_dir()
+        if module is None:
+            self.skipTest("no opencode/ module beside this checkout")
+        models = json.loads((module / "opencode.json").read_text())["provider"]["ollama"]["models"]
+        self.assertIn("qwen3:4b-instruct", models)                            # Pippin · PM
+        self.assertIn("qwen3:4b", models)                                     # Pippin · ghost
+        self.assertNotIn("qwen-4b", models)
+
+    def test_pm_default_is_real_upstream_tag(self):
+        self.assertEqual(cb.DEFAULTS["pm_model"], "qwen3:4b-instruct")
+
+    def test_status_shape_when_nothing_installed(self):
+        with mock.patch.object(shutil, "which", return_value=None), \
+             mock.patch.object(cb, "_ollama_status", return_value=dict(self._OLLAMA_DOWN)):
+            st = cb._weave_status(self.ctx)
+        self.assertFalse(st["opencode"]["installed"])
+        self.assertFalse(st["ollama"]["installed"])
+        self.assertFalse(any(st["models"].values()))
+        self.assertEqual(set(st["models"]), {"qwen3:4b-instruct", "qwen3:4b"})
+
+    def test_status_detects_running_daemon_and_pulled_models(self):
+        live = {"host": "http://localhost:11434", "running": True, "version": "0.31.1",
+                "models": [{"name": "qwen3:4b-instruct", "size": 1}, {"name": "qwen3:4b", "size": 1}]}
+        with mock.patch.object(shutil, "which", return_value=None), \
+             mock.patch.object(cb, "_ollama_status", return_value=live):
+            st = cb._weave_status(self.ctx)
+        self.assertTrue(st["ollama"]["installed"])       # a running daemon counts, binary on PATH or not
+        self.assertTrue(all(st["models"].values()))
+
+    def test_global_config_merge_additive_and_idempotent(self):
+        # The stop-condition contract: merge the GLOBAL opencode config additively; idempotent re-run
+        # clean (second call reports current and writes nothing); user keys never clobbered.
+        gdir = self.root / "fake-opencode-home"
+        with mock.patch.dict(os.environ, {"OPENCODE_CONFIG_HOME": str(gdir)}):
+            self.assertEqual(cb._merge_global_opencode_config(), "merged")
+            cfg = json.loads((gdir / "opencode.json").read_text())
+            self.assertIn("qwen3:4b-instruct", cfg["provider"]["ollama"]["models"])
+            self.assertEqual(cb._merge_global_opencode_config(), "current")
+            cfg["theme"] = "mine"
+            (gdir / "opencode.json").write_text(json.dumps(cfg))
+            cb._merge_global_opencode_config()
+            self.assertEqual(json.loads((gdir / "opencode.json").read_text())["theme"], "mine")
+
+    def test_consent_never_installs_headless(self):
+        # A non-interactive run must NEVER execute an upstream installer silently (rule 1's consent
+        # style); --yes is the documented scripted-install override.
+        with mock.patch.object(cb, "_init_is_interactive", return_value=False):
+            self.assertFalse(cb._weave_consent("OpenCode", "curl …", assume_yes=False))
+            self.assertTrue(cb._weave_consent("OpenCode", "curl …", assume_yes=True))
+
+    def test_weave_status_cli_json(self):
+        with mock.patch.object(shutil, "which", return_value=None), \
+             mock.patch.object(cb, "_ollama_status", return_value=dict(self._OLLAMA_DOWN)):
+            r = self.cli("weave", "status", "--json")
+        self.assertIsNone(r.exit_code, r.all)
+        st = json.loads(r.out)
+        for key in ("pins", "opencode", "ollama", "models", "plugin_installed"):
+            self.assertIn(key, st)
+
+
+class TestEngineRoom(CelebornTestCase):
+    """The Engine Room (CELE-t375): lifecycle + health for the Local Code + Local Model engines.
+    Pure state-machine + the sovereignty rule (Celeborn only stops a process it started) — no real
+    daemons are spawned; reachability, the binary probe, and the managed pid are mocked."""
+
+    def _state(self, engine, *, reachable, managed_pid=None, binary="/usr/bin/x"):
+        with mock.patch.object(cb, "_engine_reachable", return_value=reachable), \
+             mock.patch.object(cb, "_engine_binary", return_value=binary), \
+             mock.patch.object(cb, "_read_managed_pid", return_value=managed_pid), \
+             mock.patch.object(cb, "_http_json", return_value={}):
+            return cb._engine_state(self.ctx, engine, {})
+
+    def test_version_lt_numeric_and_suffix(self):
+        self.assertTrue(cb._version_lt("0.31.0", "0.31.1"))
+        self.assertFalse(cb._version_lt("0.31.1", "0.31.1"))
+        self.assertFalse(cb._version_lt("0.32.0", "0.31.1"))
+        self.assertFalse(cb._version_lt("1.17.13", "1.17.13"))
+        self.assertFalse(cb._version_lt("0.31.1-rc1", "0.31.1"))     # pre-release suffix ignored
+
+    def test_state_provenance_matrix(self):
+        # reachable + a live managed pid → we started it (managed); reachable without one → you did
+        # (external); our pid alive but not answering → degraded; installed & down; neither → absent.
+        self.assertEqual(self._state("code", reachable=True, managed_pid=4242)["provenance"], "managed")
+        ext = self._state("model", reachable=True, managed_pid=None)
+        self.assertEqual((ext["state"], ext["provenance"]), ("nominal", "external"))
+        self.assertEqual(self._state("code", reachable=False, managed_pid=4242)["state"], "degraded")
+        self.assertEqual(self._state("code", reachable=False)["state"], "down")
+        self.assertEqual(self._state("code", reachable=False, binary=None)["state"], "not-installed")
+
+    def test_headline_rollup(self):
+        L = cb._ENGINE_LABEL
+        def room(cs, ms):
+            return {"code": {"label": L["code"], "state": cs}, "model": {"label": L["model"], "state": ms}}
+        self.assertEqual(cb._engine_room_headline(room("nominal", "nominal")), "All systems nominal")
+        self.assertIn("Local Model Engine down", cb._engine_room_headline(room("nominal", "down")))
+        self.assertIn("offline", cb._engine_room_headline(room("down", "not-installed")))
+        self.assertIn("degraded", cb._engine_room_headline(room("degraded", "nominal")))
+
+    def test_stop_refuses_external_daemon(self):
+        # Sovereignty: an engine YOU started (external) is reported, never killed — Celeborn only
+        # signals a process it spawned itself. No os.kill should ever be reached here.
+        external = {"engine": "model", "label": cb._ENGINE_LABEL["model"], "base": "http://x",
+                    "state": "nominal", "provenance": "external", "managed_pid": None,
+                    "installed": True, "reachable": True, "version": "0.31.1"}
+        with mock.patch.object(cb, "_engine_state", return_value=external), \
+             mock.patch("os.kill", side_effect=AssertionError("must not signal an external daemon")):
+            r = cb._engine_stop(self.ctx, "model", {})
+        self.assertFalse(r["changed"])
+        self.assertIn("won't stop", r["note"])
+
+    def test_status_cli_json_shape(self):
+        with mock.patch.object(cb, "_engine_reachable", return_value=False), \
+             mock.patch.object(cb, "_engine_binary", return_value=None):
+            r = self.cli("engine-room", "status", "--json")
+        self.assertIsNone(r.exit_code, r.all)
+        st = json.loads(r.out)
+        self.assertEqual(set(st["engines"]), {"code", "model"})
+        self.assertIn("headline", st)
+        self.assertEqual(st["engines"]["code"]["state"], "not-installed")
+
 
 class TestMemoryDrift(CelebornTestCase):
     """`doctor` keeps live memory HONEST: state.md/notes.md must not point at files the repo no
@@ -2442,12 +4077,15 @@ class TestRemind(CelebornTestCase):
         self.assertIn("~60,000 stale tokens", self.cli("remind", "--tokens", "60000", "--every", "50000").out)
 
     def test_auto_uses_rolling_estimate(self):
-        # `record turn` accumulates a context estimate; `remind --auto` reads it.
+        # `record turn` accumulates a context estimate; `remind --auto` reads it. At 120k the
+        # estimate has also crossed the default 100k soft limit, so the tracked-mark modes speak
+        # the context-pressure warning (CELE-t207) rather than the calm milestone line.
         self.cli("record", "turn", "--tokens", "60000")
         self.cli("record", "turn", "--tokens", "60000")  # 120k total → past the 100k band
         self.assertEqual(json.loads(self.read("metrics.json"))["context_estimate"], 120000)
         r = self.cli("remind", "--auto")
-        self.assertIn("~120,000 stale tokens", r.out)
+        self.assertIn("~120,000 tokens", r.out)
+        self.assertIn("soft limit", r.out)
         # A second --auto in the same band stays silent (it recorded where it last spoke).
         self.assertNotIn("Celeborn", self.cli("remind", "--auto").out)
 
@@ -2457,6 +4095,220 @@ class TestRemind(CelebornTestCase):
         self.assertLess(json.loads(self.read("metrics.json"))["context_estimate"], 100_000)
         # Back below the first milestone → --auto stays silent.
         self.assertNotIn("Celeborn", self.cli("remind", "--auto").out)
+
+
+class TestContextPressure(CelebornTestCase):
+    """CELE-t207 — configurable soft/hard context-pressure warnings (remind, cursor flag, board)."""
+
+    def _set_rc(self, **kv):
+        rc_path = self.ctx / ".celebornrc"
+        rc = json.loads(rc_path.read_text())
+        rc.update(kv)
+        rc_path.write_text(json.dumps(rc, indent=2) + "\n")
+
+    def test_pressure_level_grades_against_thresholds(self):
+        self.assertEqual(cb._pressure_level(0, 100_000, 125_000), "none")
+        self.assertEqual(cb._pressure_level(99_999, 100_000, 125_000), "none")
+        self.assertEqual(cb._pressure_level(100_000, 100_000, 125_000), "soft")
+        self.assertEqual(cb._pressure_level(124_999, 100_000, 125_000), "soft")
+        self.assertEqual(cb._pressure_level(125_000, 100_000, 125_000), "hard")
+        # A disabled (≤ 0) threshold never fires; soft alone still grades.
+        self.assertEqual(cb._pressure_level(500_000, 0, 0), "none")
+        self.assertEqual(cb._pressure_level(500_000, 100_000, 0), "soft")
+
+    def test_soft_crossing_warns_and_same_level_stays_quiet(self):
+        # 90k → 105k crosses the default 100k soft limit → the ⚠ warning, naming the live size.
+        r = self.cli("remind", "--tokens", "105000", "--last", "90000")
+        self.assertIn("⚠", r.out)
+        self.assertIn("soft limit", r.out)
+        self.assertIn("~105,000", r.out)
+        # Same level + same milestone band → silent (no re-nag every turn).
+        self.assertEqual(self.cli("remind", "--tokens", "110000", "--last", "105000").out.strip(), "")
+
+    def test_hard_crossing_warns_urgently(self):
+        r = self.cli("remind", "--tokens", "130000", "--last", "110000")
+        self.assertIn("⛔", r.out)
+        self.assertIn("HARD", r.out)
+        self.assertIn("~130,000", r.out)
+        self.assertIn("/clear", r.out)
+
+    def test_soft_to_hard_escalates_within_a_milestone_band(self):
+        # 105k → 126k is the same 100k milestone band, but a NEW threshold crossing — must speak.
+        r = self.cli("remind", "--tokens", "126000", "--last", "105000")
+        self.assertIn("⛔", r.out)
+
+    def test_bare_tokens_without_last_keeps_the_calm_line(self):
+        # No tracked mark → no crossing to detect → legacy milestone wording (stateless hosts unchanged).
+        r = self.cli("remind", "--tokens", "250000")
+        self.assertIn("stale tokens", r.out)
+        self.assertNotIn("⛔", r.out)
+
+    def test_thresholds_configurable_in_celebornrc(self):
+        self._set_rc(context_soft_tokens=30_000, context_hard_tokens=60_000)
+        self.assertIn("⚠", self.cli("remind", "--tokens", "35000", "--last", "0").out)
+        self.assertIn("⛔", self.cli("remind", "--tokens", "65000", "--last", "35000").out)
+
+    def test_cli_limit_flags_override_config(self):
+        self._set_rc(context_soft_tokens=200_000)
+        r = self.cli("remind", "--tokens", "80000", "--last", "0", "--soft-limit", "50000")
+        self.assertIn("⚠", r.out)
+
+    def test_record_tokens_stamps_the_machine_readable_flag(self):
+        # Every live-window report re-grades the session — the flag a future auto-clear reads.
+        self.cli("record", "tokens", "--session", "oc-p-0", "--tokens", "60000")
+        cap = json.loads(self.read("metrics.json"))["captures"]["oc-p-0"]
+        self.assertEqual(cap["pressure"], "none")
+        self.cli("record", "tokens", "--session", "oc-p-0", "--tokens", "110000")
+        cap = json.loads(self.read("metrics.json"))["captures"]["oc-p-0"]
+        self.assertEqual(cap["pressure"], "soft")
+
+    def test_session_mode_warns_from_live_cursor_once(self):
+        # A transcript-less harness (OpenCode) reports its real window; remind --session reads it.
+        self.cli("record", "tokens", "--session", "oc-p-1", "--tokens", "130000")
+        r = self.cli("remind", "--session", "oc-p-1")
+        self.assertIn("⛔", r.out)
+        # Spoken once — the cursor remembers its own last-reminded mark.
+        self.assertEqual(self.cli("remind", "--session", "oc-p-1").out.strip(), "")
+        cap = json.loads(self.read("metrics.json"))["captures"]["oc-p-1"]
+        self.assertEqual(cap["last_remind_tokens"], 130000)
+        self.assertEqual(cap["pressure"], "hard")
+
+    def test_session_mode_without_live_cursor_is_silent(self):
+        self.assertEqual(self.cli("remind", "--session", "ghost-1").out.strip(), "")
+
+    def test_session_mode_rearms_after_window_shrink(self):
+        self.cli("record", "tokens", "--session", "oc-p-2", "--tokens", "130000")
+        self.assertIn("⛔", self.cli("remind", "--session", "oc-p-2").out)
+        # A post-clear/compaction report shrinks the window → re-arm quietly at the new size…
+        self.cli("record", "tokens", "--session", "oc-p-2", "--tokens", "20000")
+        self.assertEqual(self.cli("remind", "--session", "oc-p-2").out.strip(), "")
+        # …so regrowth past a threshold warns again.
+        self.cli("record", "tokens", "--session", "oc-p-2", "--tokens", "105000")
+        self.assertIn("⚠", self.cli("remind", "--session", "oc-p-2").out)
+
+    def test_active_agents_rows_carry_pressure(self):
+        self.cli("record", "tokens", "--session", "oc-p-4", "--tokens", "105000")
+        rows = cb._active_agents(self.ctx, 30.0, show_all=False)
+        row = next(r for r in rows if r["session"].startswith("oc-p-4"))
+        self.assertEqual(row["pressure"], "soft")
+
+    def test_board_annotation_shows_pressure_chip(self):
+        # The DOING card carries the ⚠/⛔ limit chip next to its band — the board half of t207.
+        self.cli("tasks", "add", "Pressured card")            # t1
+        self.cli("claim", "t1", "--session", "oc-p-5")
+        self.cli("record", "tokens", "--session", "oc-p-5", "--tokens", "130000")
+        line = next(l for l in self.cli("tasks").out.splitlines() if "Pressured card" in l)
+        self.assertIn("⛔ hard limit", line)
+        self.assertIn("clear urgent", line)                   # the fixed band word still renders
+        # Under the soft limit → no chip (the band alone tells the calm story).
+        self.assertNotIn("limit", cb._doing_card_annotation(60000, "s", "m", "o", "none"))
+
+    def test_opencode_hook_surfaces_the_warning_in_the_envelope(self):
+        # The TUI half of t207: with no transcript, the user-prompt-submit envelope reads the
+        # session's live cursor, so the pressure warning rides the same per-turn channel the
+        # heartbeat uses — the plugin delivers it to the model, which relays it to the user.
+        self.cli("record", "tokens", "--session", "oc-p-6", "--tokens", "130000")
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(
+                {"sessionID": "oc-p-6", "directory": str(self.root), "text": "hi"}))):
+            r = run_cli("--path", str(self.root), "hook", "user-prompt-submit",
+                        "--harness", "opencode")
+        ctx = json.loads(r.out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("⛔", ctx)
+        self.assertIn("HARD", ctx)
+        self.assertIn("SURFACE THIS TO THE USER", ctx)
+
+
+class TestAutoclear(CelebornTestCase):
+    """CELE-t209 — opt-in OpenCode seamless clear-and-continue: the `autoclear: due` marker on
+    `record tokens`, and the `celeborn autoclear` decision verb (skip / blocked / ready)."""
+
+    def _set_rc(self, **kv):
+        rc_path = self.ctx / ".celebornrc"
+        rc = json.loads(rc_path.read_text())
+        rc.update(kv)
+        rc_path.write_text(json.dumps(rc, indent=2) + "\n")
+
+    def _fresh_hot_tier(self):
+        """Author state.md + session.json so the t208 freshness gate passes (the 'ready' precondition)."""
+        self.write("state.md", "# State\n\n## Now\n- Building the auto-clear resume path; wiring the "
+                               "idle-time sequence and its tests.\n")
+        self.cli("checkpoint", "--focus", "Auto-clear resume path",
+                 "--next", "Verify the ready verdict queues a brief")
+
+    # --- the due-marker on `record tokens` --------------------------------------------------
+
+    def test_no_due_marker_when_opt_out(self):
+        # Default rc (opencode_autoclear off): even a hard window prints no auto-clear marker.
+        r = self.cli("record", "tokens", "--session", "ac-off-1", "--tokens", "130000")
+        self.assertNotIn("autoclear: due", r.out)
+
+    def test_due_marker_when_opt_in_and_hard(self):
+        self._set_rc(opencode_autoclear=True)
+        # Soft (but not hard) → no marker; the trigger is the HARD threshold only.
+        self.assertNotIn("autoclear: due",
+                         self.cli("record", "tokens", "--session", "ac-on-1", "--tokens", "105000").out)
+        # Hard → the machine marker the plugin greps for.
+        self.assertIn("autoclear: due",
+                      self.cli("record", "tokens", "--session", "ac-on-2", "--tokens", "130000").out)
+
+    # --- the `autoclear` decision verb ------------------------------------------------------
+
+    def test_autoclear_disabled_is_skip(self):
+        r = self.cli("autoclear", "--session", "ac-dis-1")
+        self.assertIn("autoclear: skip", r.out)
+        self.assertIn("disabled", r.out)
+        self.assertIsNone(r.exit_code)                       # a clean no-op, never nonzero
+
+    def test_autoclear_skips_when_not_hard(self):
+        self._set_rc(opencode_autoclear=True)
+        self.cli("record", "tokens", "--session", "ac-soft-1", "--tokens", "60000")
+        r = self.cli("autoclear", "--session", "ac-soft-1")
+        self.assertIn("autoclear: skip", r.out)
+        self.assertIn("pressure none", r.out)
+
+    def test_autoclear_ready_preps_and_queues_the_resume_brief(self):
+        self._set_rc(opencode_autoclear=True)
+        self._fresh_hot_tier()
+        sid = "ac-ready-01"
+        self.cli("record", "tokens", "--session", sid, "--tokens", "130000")
+        r = self.cli("autoclear", "--session", sid)
+        self.assertIn("autoclear: ready", r.out)
+        self.assertIsNone(r.exit_code)
+        # The resume brief lands in the session's own outbox (6-char handle) — what the coder drains
+        # on its first post-compaction turn.
+        brief = (self.ctx / "outbox" / f"{sid[:6]}.md").read_text()
+        self.assertIn("Celeborn auto-clear", brief)
+        self.assertIn("Auto-clear resume path", brief)       # the focus rides along
+        self.assertIn("[autoclear]", brief)                  # the queue tag
+        # handoff regenerated + a restorable snapshot taken + the cooldown stamp written.
+        self.assertTrue((self.ctx / "handoff.md").is_file())
+        self.assertTrue((self.ctx / cb.PANIC_DIR).is_dir())
+        cap = json.loads(self.read("metrics.json"))["captures"][sid]
+        self.assertTrue(cap.get("autoclear_at"))
+
+    def test_autoclear_blocked_when_hot_tier_stale(self):
+        self._set_rc(opencode_autoclear=True)
+        # A placeholder headline = the model never authored it → a /clear here resumes into a stub.
+        self.write("state.md", "# State\n<what we are working on and why>\n")
+        sid = "ac-stale-1"
+        self.cli("record", "tokens", "--session", sid, "--tokens", "130000")
+        r = self.cli("autoclear", "--session", sid)
+        self.assertIn("autoclear: blocked", r.out)
+        self.assertEqual(r.exit_code, 1)                     # nonzero → the plugin holds off
+        # No brief is queued while blocked — the coder must freshen first, then it retries.
+        self.assertFalse((self.ctx / "outbox" / f"{sid[:6]}.md").is_file())
+
+    def test_autoclear_cooldown_suppresses_immediate_repeat(self):
+        self._set_rc(opencode_autoclear=True)
+        self._fresh_hot_tier()
+        sid = "ac-cool-01"
+        self.cli("record", "tokens", "--session", sid, "--tokens", "130000")
+        self.assertIn("autoclear: ready", self.cli("autoclear", "--session", sid).out)
+        # The stamp is now set → a second hard report inside the cooldown window emits NO due-marker…
+        self.assertNotIn("autoclear: due",
+                         self.cli("record", "tokens", "--session", sid, "--tokens", "131000").out)
+        # …and a direct re-invocation skips on the cooldown rather than clearing again.
+        self.assertIn("cooldown", self.cli("autoclear", "--session", sid).out)
 
 
 # --------------------------------------------------------------------------- 12. sync (Phase 8b)
@@ -3269,12 +5121,17 @@ class TestRemindTranscript(CelebornTestCase):
         return f.name
 
     def test_over_soft_limit_is_urgent_and_persists(self):
+        # A 200k window with a fresh (0) mark has crossed the limits → the urgent context-pressure
+        # warning (CELE-t207) speaks instead of the calm milestone line, and both the reading and
+        # the machine-readable pressure flag persist to metrics.
         tp = self._tx(200000)
         try:
             out = self.cli("remind", "--transcript", tp, "--soft-limit", "150000", "--every", "50000").out
-            self.assertIn("~200,000 stale tokens", out)        # uniform line; names the live weight
-            self.assertIn("nothing to re-explain", out)
-            self.assertEqual(json.loads(self.read("metrics.json"))["context_estimate"], 200000)
+            self.assertIn("⛔", out)
+            self.assertIn("~200,000 tokens", out)              # names the live weight
+            m = json.loads(self.read("metrics.json"))
+            self.assertEqual(m["context_estimate"], 200000)
+            self.assertEqual(m["context_pressure"]["level"], "hard")
         finally:
             os.unlink(tp)
 
@@ -3488,14 +5345,14 @@ class TestCapture(CelebornTestCase):
         finally:
             os.unlink(tp)
 
-    def test_gitignore_auto_tier_public_and_idempotent(self):
+    def test_gitignore_auto_tier_and_idempotent(self):
         root = Path(tempfile.mkdtemp())
         try:
-            run_cli("--path", str(root), "init", "--public")
+            run_cli("--path", str(root), "scaffold")
             gi = (root / ".gitignore").read_text()
             self.assertIn(".context/auto/", gi)
             self.assertIn(".context/activity.md", gi)
-            run_cli("--path", str(root), "init", "--public")  # idempotent
+            run_cli("--path", str(root), "scaffold")  # idempotent
             self.assertEqual((root / ".gitignore").read_text().count(".context/auto/\n"), 1)
         finally:
             shutil.rmtree(root, ignore_errors=True)
@@ -3904,19 +5761,28 @@ class TestVersion(unittest.TestCase):
 
 
 class TestNoAlertWindows(CelebornTestCase):
-    """t62 (and t47/t50 before it): native OS alert/dialog windows were repeatedly flagged as annoying
-    and have been removed entirely. The reassurance/heartbeat now rides text channels only (stdout +
-    hook context). This class is the regression guard that the GUI-modal subsystem stays gone."""
+    """t62 (and t47/t50 before it): native OS alert/dialog *windows* were repeatedly flagged as
+    annoying and removed entirely — the reassurance/heartbeat rides text channels only. That invariant
+    still holds: the CELE-t169 `celeborn alert` verb raises a *card badge* (writes `.alerts.json`, which
+    the board renders), NOT a focus-stealing OS dialog. This class guards that the GUI-modal subsystem
+    stays gone while allowing the badge-style alert the operator approved."""
 
-    def test_alert_subsystem_is_gone(self):
-        # The helper, the CLI verb's handler, and the icon renderer must not exist.
-        for name in ("_gui_alert", "cmd_alert", "_ensure_bow_icon", "_BOW_JXA"):
+    def test_os_dialog_subsystem_is_gone(self):
+        # The GUI helpers (JXA/osascript dialog + bow icon) must not exist …
+        for name in ("_gui_alert", "_ensure_bow_icon", "_BOW_JXA"):
             self.assertFalse(hasattr(cb, name), f"{name} should have been removed")
+        # … and no OS-dialog mechanism may reappear anywhere in the CLI source (t169's alert is
+        # text/badge only — a modal or notification-center call would resurrect the rejected UX).
+        src = Path(cb.__file__).read_text()
+        for token in ("osascript", "display dialog", "display notification", "JavaScript for Automation"):
+            self.assertNotIn(token, src, f"OS-dialog mechanism {token!r} must not reappear")
 
-    def test_alert_verb_not_registered(self):
-        r = self.cli("alert", "boom")
-        self.assertEqual(r.exit_code, 2)            # argparse: no such command
-        self.assertIn("invalid choice", r.all)
+    def test_alert_verb_is_card_badge_not_dialog(self):
+        # CELE-t169: `celeborn alert` IS a registered verb now, but it's the card-badge kind — `--list`
+        # exits cleanly (proving the verb exists) and setting one writes `.alerts.json`, not a dialog.
+        self.assertTrue(hasattr(cb, "cmd_alert"))
+        r = self.cli("alert", "--list")
+        self.assertIsNone(r.exit_code, r.all)
 
     def test_remind_has_no_alarm_flags(self):
         r = self.cli("remind", "--tokens", "250000", "--alarm-limit", "200000")
@@ -3958,6 +5824,7 @@ class TestTasksParsing(unittest.TestCase):
             "tags": ["ui", "phase-11"], "blocked_by": ["t2"], "phase": "p11",
             "stop": "All tabs render and the e2e test passes",
             "progress": 0, "engine_floor": 0, "jira": "SCRUM-2",
+            "autonomy": ["edits", "tests"],
             "created": "C", "updated": "U", "subtasks": [], "notes": "line one\nline two",
         }]
         reparsed = cb._parse_tasks(cb._render_tasks(tasks))
@@ -4288,8 +6155,9 @@ class TestTasksCommands(CelebornTestCase):
         self.assertIn("deep detail", r.out)
 
     def test_tasks_json_gitignored(self):
+        # CELE-t228: .context/ is blanket-private (`/.context/`), which covers tasks.json.
         gi = (self.root / ".gitignore").read_text()
-        self.assertIn(".context/tasks.json", gi)
+        self.assertIn("/.context/", gi)
 
     def test_tasks_md_is_searchable(self):
         # tasks.md is in TIER_GLOBS, so it gets indexed and surfaces in search.
@@ -4422,8 +6290,9 @@ class TestOutbox(CelebornTestCase):
         self.assertIn("Outbox empty", self.cli("outbox", "list").out)
 
     def test_outbox_gitignored(self):
+        # CELE-t228: .context/ is blanket-private (`/.context/`), which covers outbox/.
         gi = (self.root / ".gitignore").read_text()
-        self.assertIn(".context/outbox/", gi)
+        self.assertIn("/.context/", gi)
 
     # --- multi-agent routing (v0: card-assignment.md) ---
 
@@ -4464,6 +6333,113 @@ class TestOutbox(CelebornTestCase):
         self.cli("outbox", "clear", "--for", "opus-b")
         self.assertIn("keep", self.read("outbox/opus-a.md"))
         self.assertNotIn("drop", self.read("outbox/opus-b.md"))
+
+
+# --------------------------------------------------------------------------- PM dispatch (CELE-t213)
+
+class TestDispatch(CelebornTestCase):
+    """`celeborn dispatch` — the PM hand-off verb: stage a TODO card on a coder session (owner ← its
+    6-char handle, card stays TODO) and queue the brief into that session's outbox. Pickup is the
+    session-aware drain + claim-on-receipt (or the t211 gate-time auto-claim). The PM orchestrates
+    over board + outbox + session registry only — coder chain-of-thought stays opaque."""
+
+    SID = "abc123def4567890"          # session-shaped → collapses to the 6-char handle abc123
+
+    def test_dispatch_stages_owner_and_queues_brief(self):
+        self.cli("tasks", "add", "Build the widget", "--note", "brief detail")
+        r = self.cli("dispatch", "t1", "--to", self.SID)
+        self.assertIsNone(r.exit_code, r.all)
+        t = next(t for t in cb._load_tasks(self.ctx) if t["id"] == "t1")
+        self.assertEqual(t["owner"], "abc123")     # 6-char head — mirrors _claim_identity
+        self.assertEqual(t["state"], "todo")       # DOING is earned at pickup, not at dispatch
+        body = self.read("outbox/abc123.md")
+        self.assertIn("Build the widget", body)
+        self.assertIn("brief detail", body)
+        slug = cb.project_slug(self.ctx)
+        self.assertIn(f"⟨celeborn:{slug}/t1⟩", body)   # the marker that claims at drain time
+
+    def test_dispatch_handle_passes_through_verbatim(self):
+        self.cli("tasks", "add", "Named work")
+        self.cli("dispatch", "t1", "--to", "opus-a")
+        t = next(t for t in cb._load_tasks(self.ctx) if t["id"] == "t1")
+        self.assertEqual(t["owner"], "opus-a")     # a handle is not session-shaped — no collapse
+        self.assertIn("Named work", self.read("outbox/opus-a.md"))
+
+    def test_dispatch_defaults_to_staged_owner(self):
+        self.cli("tasks", "add", "Pre-staged", "--owner", "abc123")
+        r = self.cli("dispatch", "t1")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("Pre-staged", self.read("outbox/abc123.md"))
+
+    def test_dispatch_without_target_errors(self):
+        self.cli("tasks", "add", "Unaddressed")
+        r = self.cli("dispatch", "t1")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("no target", r.all)
+
+    def test_dispatch_refuses_non_todo(self):
+        self.cli("tasks", "add", "Working")
+        self.cli("tasks", "move", "t1", "doing")
+        r = self.cli("dispatch", "t1", "--to", "opus-a")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("only a TODO card", r.all)
+
+    def test_dispatch_blocked_card_needs_force(self):
+        self.cli("tasks", "add", "Blocker")                          # t1, still todo
+        self.cli("tasks", "add", "Dependent", "--blocked-by", "t1")  # t2 — not READY
+        r = self.cli("dispatch", "t2", "--to", "opus-a")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("not READY", r.all)
+        # A refused dispatch stages nothing and queues nothing.
+        self.assertFalse((self.ctx / "outbox" / "opus-a.md").is_file())
+        self.assertEqual(next(t for t in cb._load_tasks(self.ctx) if t["id"] == "t2")["owner"], "")
+        r = self.cli("dispatch", "t2", "--to", "opus-a", "--force")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("Dependent", self.read("outbox/opus-a.md"))
+
+    def test_dispatch_fills_ungroomed_autonomy(self):
+        # An ungroomed card claimed at receipt would go DOING with no grants — under opencode that
+        # denies everything (t212), stranding the coder the PM just dispatched. Default-fill the
+        # t211 working set; commit stays opt-in (t203 §3.4).
+        self.cli("tasks", "add", "Ungroomed")
+        self.cli("dispatch", "t1", "--to", "opus-a")
+        t = next(t for t in cb._load_tasks(self.ctx) if t["id"] == "t1")
+        self.assertEqual(t["autonomy"], cb._autoprovision_grants())
+        self.assertNotIn("commit", t["autonomy"])
+
+    def test_dispatch_keeps_groomed_autonomy(self):
+        self.cli("tasks", "add", "Groomed", "--autonomy", "research")
+        self.cli("dispatch", "t1", "--to", "opus-a")
+        t = next(t for t in cb._load_tasks(self.ctx) if t["id"] == "t1")
+        self.assertEqual(t["autonomy"], ["research"])
+
+    def test_dispatch_warns_on_busy_coder_but_proceeds(self):
+        self.cli("tasks", "add", "In flight", "--owner", "abc123")
+        self.cli("tasks", "move", "t1", "doing")
+        self.cli("tasks", "add", "Next up")
+        r = self.cli("dispatch", "t2", "--to", self.SID)
+        self.assertIsNone(r.exit_code, r.all)      # staging the NEXT card is the point — warn only
+        self.assertIn("DOING card", r.all)
+        self.assertIn("Next up", self.read("outbox/abc123.md"))
+
+    def test_drain_session_pulls_dispatched_queue(self):
+        # The delivery leg: a --session drain also empties the session's 6-char queue — without it
+        # a dispatched brief would sit undelivered forever ($CELEBORN_AGENT is a name, not a session).
+        self.cli("tasks", "add", "Dispatched work")
+        self.cli("dispatch", "t1", "--to", self.SID)
+        self.cli("outbox", "push", "--text", "shared floor")     # unassigned queue still drains too
+        r = self.cli("outbox", "drain", "--session", self.SID)
+        self.assertIn("Dispatched work", r.out)
+        self.assertIn("shared floor", r.out)
+        self.assertEqual(self.cli("outbox", "drain", "--session", self.SID).out.strip(), "")
+        self.assertIn("Dispatched work", self.read("outbox/sent.md"))   # provenance survives
+
+    def test_drain_without_session_leaves_dispatched_queue(self):
+        self.cli("tasks", "add", "Addressed work")
+        self.cli("dispatch", "t1", "--to", self.SID)
+        r = self.cli("outbox", "drain")                          # a name-identity drain: not mine
+        self.assertNotIn("Addressed work", r.out)
+        self.assertIn("Addressed work", self.read("outbox/abc123.md"))
 
 
 # --------------------------------------------------------------------------- claim-on-receipt
@@ -4546,6 +6522,17 @@ class TestClaim(CelebornTestCase):
         with mock.patch.dict(os.environ, {"CELEBORN_AGENT": "grok"}):
             self.cli("claim", "t1")                      # no --by → $CELEBORN_AGENT
         self.assertIn("owner:      grok", self.cli("tasks", "show", "t1").out)
+
+    def test_claim_prefers_session_over_model_handle(self):
+        # CELE-t172 bug 1: a card is owned by its session, never by a model. A model-looking --by is
+        # replaced with the session short-id so 'claude-opus48' can't become an owner.
+        self.cli("tasks", "add", "Model claim")
+        sid = "d0c13a5e-1111-2222-3333-444455556666"
+        r = self.cli("claim", "t1", "--by", "claude-opus48", "--session", sid)
+        self.assertIsNone(r.exit_code, r.all)
+        # The model-looking --by is ignored in favour of the session (CELE-t194 wording).
+        self.assertIn("is ignored", r.all)
+        self.assertIn("owner:      d0c13a", self.cli("tasks", "show", "t1").out)
 
     def test_claim_unknown_id_is_silent_noop(self):
         r = self.cli("claim", "t99")
@@ -4711,7 +6698,7 @@ class TestStandup(CelebornTestCase):
         # Register a second project with its own economy; the aggregate must now sum both.
         other = tempfile.TemporaryDirectory()
         self.addCleanup(other.cleanup)
-        run_cli("--path", other.name, "init", "--no-scan")
+        run_cli("--path", other.name, "scaffold", "--no-scan")
         octx = Path(other.name) / ".context"
         m = cb._load_metrics(octx)
         m["tokens_saved_estimate"] = 30_000_000
@@ -4747,16 +6734,24 @@ class TestStandup(CelebornTestCase):
         self.assertEqual(cb.board_port(self.ctx), 4242)
         self.assertIn("http://localhost:4242", self.cli("board", "--url").out)
 
-    def test_board_port_derives_when_unset(self):
-        # No board_port in rc → falls back to the per-project derived port (not a crash, not 3000).
-        self.assertEqual(cb.board_port(self.ctx), cb._derive_board_port(self.ctx.parent))
+    def test_board_port_defaults_to_shared(self):
+        # No board_port in rc → the shared fleet port 3141 (one server for the whole fleet, CELE-t170);
+        # per-repo derivation is retired from the default path. Never a crash, never 3000.
+        self.assertEqual(cb.board_port(self.ctx), cb.SHARED_BOARD_PORT)
+        self.assertEqual(cb.SHARED_BOARD_PORT, 3141)
         self.assertEqual(self.cli("board", "--port").out.strip(), str(cb.board_port(self.ctx)))
 
     def test_board_command_reports_url_and_liveness(self):
         self.write(".celebornrc", json.dumps({"board_port": 4242}))
+        # --json stays report-only (no launch, no browser) and reports liveness — nothing on 4242 here.
+        data = json.loads(self.cli("board", "--json").out)
+        # Fleet routing appends a per-project `/board/<slug>` path; assert the host:port base.
+        self.assertTrue(data["url"].startswith("http://localhost:4242"), data["url"])
+        self.assertFalse(data["live"])
+        # Plain `celeborn board` ensures the viewer and prints the URL. No tasks.md here → it stays
+        # quiet ("no kanban here") and launches nothing; a non-interactive shell never pops a browser.
         out = self.cli("board").out
         self.assertIn("http://localhost:4242", out)
-        self.assertIn("not running", out)        # nothing is listening on 4242 in the test
 
 
 class TestEnsureOnOrient(CelebornTestCase):
@@ -4790,8 +6785,9 @@ class TestEnsureOnOrient(CelebornTestCase):
         self.assertEqual(st["action"], "started")
         self.assertEqual(st["pid"], 99999)
         self.assertEqual(len(self._spawned), 1)
-        # A pidfile records the launch so the next orient doesn't double-launch while it boots.
-        rec = json.loads((self.ctx / cb.BOARD_PIDFILE).read_text())
+        # A machine-global pidfile records the launch so the next orient (from ANY repo) doesn't
+        # double-launch the shared server while it boots (CELE-t170).
+        rec = json.loads(cb._board_pidfile_path().read_text())
         self.assertEqual(rec["pid"], 99999)
         self.assertEqual(rec["port"], 4242)
 
@@ -4813,7 +6809,9 @@ class TestEnsureOnOrient(CelebornTestCase):
         cb._board_live = lambda port, timeout=0.15: False
         cb._pid_alive = lambda pid: True                          # a launched board is still coming up
         self.write("tasks.md", "# Tasks\n")
-        (self.ctx / cb.BOARD_PIDFILE).write_text(json.dumps({"pid": 4321, "port": 4242}))
+        pidfile = cb._board_pidfile_path()
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        pidfile.write_text(json.dumps({"pid": 4321, "port": 4242}))
         st = cb.ensure_board(self.ctx)
         self.assertEqual(st["action"], "booting")
         self.assertEqual(self._spawned, [])
@@ -4839,6 +6837,137 @@ class TestEnsureOnOrient(CelebornTestCase):
         r = self.cli("board", "--start")
         self.assertIsNone(r.exit_code, r.all)
         self.assertIn("started", r.out)
+
+
+class TestOnboardingFallback(CelebornTestCase):
+    """CELE-t229 — when the Next.js board can't run (no npm/node/deps), `celeborn board` must not
+    dead-end: it serves a stdlib http.server onboarding page whose STEP 1 is register and which
+    always carries a live Support button that works for an unregistered user."""
+
+    def test_onboarding_html_is_register_first_with_support(self):
+        html = cb._onboarding_html(self.ctx, reason="npm missing")
+        # STEP 1 is register — the register URL appears, and before the local-install (npm) step.
+        self.assertIn(cb.CELEBORN_REGISTER_URL, html)
+        self.assertIn("Get started free", html)
+        self.assertLess(html.index(cb.CELEBORN_REGISTER_URL), html.index("npm install"),
+                        "register must come before the optional local-install step")
+        # A live Support escape hatch is always present and points at hosted support.
+        self.assertIn(cb.CELEBORN_SUPPORT_URL, html)
+        self.assertEqual(cb.CELEBORN_SUPPORT_URL, "https://support.thot.ai")
+        self.assertIn("support", html.lower())
+        # The reason is surfaced (not a silent no-op) and the project name is shown.
+        self.assertIn("npm missing", html)
+
+    def test_onboarding_html_escapes_injection(self):
+        # A hostile project name can't break out of the HTML.
+        html = cb._onboarding_html(self.ctx, reason="<script>alert(1)</script>",
+                                   register_url="https://x.test/?a=1&b=2")
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("https://x.test/?a=1&amp;b=2", html)
+
+    def test_serve_onboarding_serves_the_page_over_http(self):
+        # End-to-end over a real socket (port 0), the way the Stop condition asks — proving the
+        # served bytes are the onboarding page. `open_tab=False` so no browser pops in CI.
+        import http.server, threading, urllib.request
+        html = cb._onboarding_html(self.ctx)
+        holder = {}
+
+        def make_server():
+            class _H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    body = html.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *a):
+                    pass
+            srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+            holder["port"] = srv.server_address[1]
+            holder["srv"] = srv
+            return srv
+
+        # Run the (blocking) serve loop on a thread; fetch once; then stop it via shutdown().
+        t = threading.Thread(
+            target=lambda: cb._serve_onboarding(0, "http://127.0.0.1/", html,
+                                                open_tab=False, make_server=make_server),
+            daemon=True)
+        t.start()
+        # Wait for bind, then GET.
+        for _ in range(100):
+            if "port" in holder:
+                break
+            import time; time.sleep(0.01)
+        self.assertIn("port", holder, "server never bound")
+        with urllib.request.urlopen(f"http://127.0.0.1:{holder['port']}/", timeout=2) as resp:
+            self.assertEqual(resp.status, 200)
+            body = resp.read().decode("utf-8")
+        self.assertIn(cb.CELEBORN_REGISTER_URL, body)
+        self.assertIn(cb.CELEBORN_SUPPORT_URL, body)
+        holder["srv"].shutdown()
+        t.join(timeout=2)
+
+    def test_serve_onboarding_reports_bind_failure_without_raising(self):
+        # A taken port must not crash the command — it reports and returns.
+        def boom():
+            raise OSError("address already in use")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            cb._serve_onboarding(3141, "http://localhost:3141/", "<html></html>",
+                                 open_tab=False, make_server=boom)
+        self.assertIn("couldn't bind", buf.getvalue())
+        self.assertIn(cb.CELEBORN_SUPPORT_URL, buf.getvalue())
+
+    def _enable_autostart(self):
+        # The shared fixture disables board_autostart; re-enable it so ensure_board reaches the
+        # runner check (and thus "unavailable") instead of short-circuiting to "off".
+        rc_path = self.ctx / ".celebornrc"
+        rc = json.loads(rc_path.read_text())
+        rc["board_autostart"] = True
+        rc_path.write_text(json.dumps(rc, indent=2) + "\n")
+
+    def test_board_cli_serves_onboarding_when_unavailable(self):
+        # `celeborn board` routes to the onboarding server (not a dead-end print) when the viewer is
+        # unavailable AND we're interactive. Stub the serve loop so the test doesn't block/bind.
+        self.write("tasks.md", "# Tasks\n")
+        self._enable_autostart()
+        self.addCleanup(setattr, cb, "_board_live", cb._board_live)
+        self.addCleanup(setattr, cb, "_board_runner", cb._board_runner)
+        self.addCleanup(setattr, cb, "_init_is_interactive", cb._init_is_interactive)
+        self.addCleanup(setattr, cb, "_serve_onboarding", cb._serve_onboarding)
+        cb._board_live = lambda port, timeout=0.15: False
+        cb._board_runner = lambda board_dir: None          # no app / node_modules / npm
+        cb._init_is_interactive = lambda: True
+        served = {}
+        cb._serve_onboarding = lambda port, url, html, **kw: served.update(
+            port=port, url=url, html=html)
+        args = types.SimpleNamespace(path=str(self.root), supervise=False, port_only=False,
+                                     url_only=False, json=False, start=False, no_open=False)
+        cb.cmd_board(args)
+        self.assertIn("html", served)
+        self.assertEqual(served["port"], cb.board_port(self.ctx))
+        self.assertIn(cb.CELEBORN_REGISTER_URL, served["html"])
+        self.assertIn(cb.CELEBORN_SUPPORT_URL, served["html"])
+
+    def test_board_cli_no_open_does_not_block_serve(self):
+        # `--no-open` (and non-interactive) must stay report-only — never enter the foreground serve.
+        self.write("tasks.md", "# Tasks\n")
+        self._enable_autostart()
+        self.addCleanup(setattr, cb, "_board_live", cb._board_live)
+        self.addCleanup(setattr, cb, "_board_runner", cb._board_runner)
+        self.addCleanup(setattr, cb, "_init_is_interactive", cb._init_is_interactive)
+        self.addCleanup(setattr, cb, "_serve_onboarding", cb._serve_onboarding)
+        cb._board_live = lambda port, timeout=0.15: False
+        cb._board_runner = lambda board_dir: None
+        cb._init_is_interactive = lambda: True
+        cb._serve_onboarding = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not serve under --no-open"))
+        r = self.cli("board", "--no-open")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("can't start", r.out)
 
 
 class TestInitNameAndBoard(CelebornTestCase):
@@ -4904,7 +7033,7 @@ class TestInitNameAndBoard(CelebornTestCase):
         self.addCleanup(setattr, cb, "_init_is_interactive", cb._init_is_interactive)
         cb._init_is_interactive = lambda: True
         spawned, opened = self._board_stubs()
-        r = self.cli("init", "--no-scan", "--no-cmm", "--name", "My Cool Project")
+        r = self.cli("scaffold", "--no-scan", "--no-cmm", "--name", "My Cool Project")
         self.assertIsNone(r.exit_code, r.all)
         self.assertEqual(cb.load_config(self.ctx).get("project_name"), "My Cool Project")
         self.assertTrue((self.ctx / "tasks.md").is_file())
@@ -4915,7 +7044,7 @@ class TestInitNameAndBoard(CelebornTestCase):
     def test_headless_install_skips_board(self):
         # _init_is_interactive stays its real (False) self — no seed, no launch, no tab.
         spawned, opened = self._board_stubs()
-        r = self.cli("init", "--no-scan", "--no-cmm", "--name", "Headless")
+        r = self.cli("scaffold", "--no-scan", "--no-cmm", "--name", "Headless")
         self.assertIsNone(r.exit_code, r.all)
         self.assertEqual(cb.load_config(self.ctx).get("project_name"), "Headless")  # --name still persists
         self.assertFalse((self.ctx / "tasks.md").is_file())
@@ -4926,7 +7055,7 @@ class TestInitNameAndBoard(CelebornTestCase):
         self.addCleanup(setattr, cb, "_init_is_interactive", cb._init_is_interactive)
         cb._init_is_interactive = lambda: True
         spawned, opened = self._board_stubs()
-        r = self.cli("init", "--no-scan", "--no-cmm", "--name", "X", "--no-open")
+        r = self.cli("scaffold", "--no-scan", "--no-cmm", "--name", "X", "--no-open")
         self.assertIsNone(r.exit_code, r.all)
         self.assertFalse((self.ctx / "tasks.md").is_file())
         self.assertEqual(spawned, [])
@@ -4936,7 +7065,7 @@ class TestInitNameAndBoard(CelebornTestCase):
         self.addCleanup(setattr, cb, "_init_is_interactive", cb._init_is_interactive)
         cb._init_is_interactive = lambda: True
         spawned, opened = self._board_stubs()
-        r = self.cli("init", "--no-scan", "--no-cmm", "--name", "X", "--no-browser")
+        r = self.cli("scaffold", "--no-scan", "--no-cmm", "--name", "X", "--no-browser")
         self.assertIsNone(r.exit_code, r.all)
         self.assertTrue((self.ctx / "tasks.md").is_file())
         self.assertEqual(len(spawned), 1)
@@ -5085,7 +7214,7 @@ class TestBoardSupervisor(CelebornTestCase):
         ticks = iter(range(0, 1_000_000, 100))      # +100s per clock() → each child "ran" 100s
         sleeps = []
         restarts = cb._board_supervise(
-            ["npm", "run", "dev"], 4242, Path("/x/tasks.json"), Path("/x/board"),
+            ["npm", "run", "dev"], 4242, Path("/x/board"),
             spawn=spawn, sleeper=sleeps.append, clock=lambda: next(ticks))
         self.assertEqual(restarts, 3)               # three child exits, each relaunched
         self.assertEqual(calls["n"], 3)             # a 4th spawn was attempted and raised → exit
@@ -5095,7 +7224,7 @@ class TestBoardSupervisor(CelebornTestCase):
         # Every child dies instantly (ran < rapid_window) → the supervisor stops hot-looping a
         # broken build after max_rapid deaths instead of relaunching forever.
         restarts = cb._board_supervise(
-            ["npm", "run", "dev"], 4242, Path("/x/t.json"), Path("/x/b"),
+            ["npm", "run", "dev"], 4242, Path("/x/b"),
             spawn=lambda: self._FakeProc(1), sleeper=lambda s: None, clock=lambda: 0.0,
             max_rapid=5, rapid_window_s=10.0)
         self.assertEqual(restarts, 5)               # gave up exactly at the rapid-failure cap
@@ -5103,7 +7232,7 @@ class TestBoardSupervisor(CelebornTestCase):
     def test_backoff_doubles_and_caps(self):
         sleeps = []
         cb._board_supervise(
-            ["npm", "run", "dev"], 4242, Path("/x/t.json"), Path("/x/b"),
+            ["npm", "run", "dev"], 4242, Path("/x/b"),
             spawn=lambda: self._FakeProc(1), sleeper=sleeps.append, clock=lambda: 0.0,
             max_rapid=8, rapid_window_s=10.0, backoff_cap_s=30.0)
         # Exponential until it hits the cap, then flat — and never above the cap.
@@ -5128,8 +7257,7 @@ class TestBoardSupervisor(CelebornTestCase):
         self.addCleanup(setattr, subprocess, "Popen", subprocess.Popen)
         subprocess.Popen = FakePopen
         cb._spawn_board = self._real_spawn_board   # opt in to the genuine impl (Popen is faked above)
-        pid = cb._spawn_board(Path("/x/board"), ["npm", "run", "dev"], 4242,
-                              Path("/x/tasks.json"), self.ctx)
+        pid = cb._spawn_board(Path("/x/board"), ["npm", "run", "dev"], 4242)
         self.assertEqual(pid, 12345)
         argv = captured["argv"]
         self.assertIn("--supervise", argv)               # the supervisor, not bare `npm run dev`
@@ -5147,8 +7275,7 @@ class TestBoardSpawnGuard(CelebornTestCase):
         # No opt-in → the guard is in force: reaching the real launch raises AssertionError rather
         # than booting Next.js. (A clear message points the next author at the stub seams.)
         with self.assertRaises(AssertionError):
-            cb._spawn_board(self.ctx, ["npm", "run", "dev"], 4242,
-                            self.ctx / "tasks.json", self.ctx)
+            cb._spawn_board(self.ctx, ["npm", "run", "dev"], 4242)
 
     def test_opt_in_restores_the_real_impl(self):
         # The escape hatch a launch-path test uses: restore the genuine impl with subprocess.Popen
@@ -5161,8 +7288,7 @@ class TestBoardSpawnGuard(CelebornTestCase):
         self.addCleanup(setattr, subprocess, "Popen", subprocess.Popen)
         subprocess.Popen = FakePopen
         cb._spawn_board = self._real_spawn_board
-        pid = cb._spawn_board(self.ctx, ["npm", "run", "dev"], 4242,
-                              self.ctx / "tasks.json", self.ctx)
+        pid = cb._spawn_board(self.ctx, ["npm", "run", "dev"], 4242)
         self.assertEqual(pid, 4242)
         self.assertIn("--supervise", captured["argv"])   # the real impl ran, just with a fake Popen
 
@@ -5327,12 +7453,48 @@ class TestTouch(CelebornTestCase):
         self.cli("touch", "lib/a.py", "--by", "claude")
         r = self.cli("touch", "lib/a.py", "--by", "grok")
         self.assertIsNone(r.exit_code, r.all)
-        self.assertIn("claude", r.out)
+        self.assertIn("claude", r.all)
+
+    def test_two_writers_on_one_file_both_registered(self):
+        # CELE-t309: a declared two-writer hotspot keeps BOTH touchers on the file (schema/1 kept a
+        # single record per path, so the second writer overwrote the first and vanished).
+        self.cli("touch", "scripts/hot.py", "--by", "grok", "--task", "t211")
+        self.cli("touch", "scripts/hot.py", "--by", "claude", "--task", "t219")
+        rows = json.loads(self.cli("touch", "list", "--json").out)["touches"]
+        hot = [r for r in rows if r["path"] == "scripts/hot.py"]
+        self.assertEqual({r["by"] for r in hot}, {"grok", "claude"})   # both writers visible
+        self.assertEqual({r["task"] for r in hot}, {"t211", "t219"})
+
+    def test_release_drops_only_my_touch_on_a_shared_file(self):
+        self.cli("touch", "scripts/hot.py", "--by", "grok", "--task", "t211")
+        self.cli("touch", "scripts/hot.py", "--by", "claude", "--task", "t219")
+        rel = self.cli("touch", "release", "scripts/hot.py", "--by", "grok")
+        self.assertIn("still on it", rel.all)                         # peer remains
+        recs = cb._load_touches(self.ctx)["files"]["scripts/hot.py"]
+        self.assertEqual([r["by"] for r in recs], ["claude"])         # only grok left
+
+    def test_re_touch_same_handle_freshens_not_duplicates(self):
+        self.cli("touch", "scripts/hot.py", "--by", "grok", "--task", "t211")
+        self.cli("touch", "scripts/hot.py", "--by", "grok", "--why", "still here")
+        recs = cb._load_touches(self.ctx)["files"]["scripts/hot.py"]
+        self.assertEqual(len(recs), 1)                                # one record per (file, handle)
+        self.assertEqual(recs[0]["why"], "still here")
+
+    def test_legacy_schema1_touches_migrate_on_load(self):
+        # A schema/1 file ({path: record}) must read back as the schema/2 list shape transparently.
+        legacy = {"schema": "celeborn-touches/1",
+                  "files": {"old.py": {"by": "grok", "at": cb.now_iso(), "task": "t1", "why": "x"}}}
+        (self.ctx / "touches.json").write_text(json.dumps(legacy))
+        data = cb._load_touches(self.ctx)
+        self.assertEqual(data["schema"], "celeborn-touches/2")
+        self.assertEqual([r["by"] for r in data["files"]["old.py"]], ["grok"])
+        rows = json.loads(self.cli("touch", "list", "--json").out)["touches"]
+        self.assertEqual(rows[0]["by"], "grok")
 
     def test_touch_stale_pruned_from_orient(self):
         self.cli("touch", "old.py", "--by", "grok")
         data = cb._load_touches(self.ctx)
-        data["files"]["old.py"]["at"] = (
+        data["files"]["old.py"][0]["at"] = (
             cb._dt.datetime.now() - cb._dt.timedelta(hours=5)
         ).strftime("%Y-%m-%dT%H:%M:%S")
         cb._save_touches(self.ctx, data)
@@ -5438,6 +7600,7 @@ class TestShip(CelebornTestCase):
 
     def test_ship_releases_touches_and_moves_done(self):
         self.cli("tasks", "add", "Ship me", "--state", "doing", "--owner", "grok")
+        self.cli("tasks", "edit", "t1", "--progress", "99")   # CELE-t176: crest before ship
         self.cli("touch", "src/x.py", "--by", "grok", "--task", "t1")
         self.cli("touch", "src/y.py", "--by", "grok", "--task", "t1")
         r = self.cli("ship", "t1", "--by", "grok")
@@ -5451,10 +7614,73 @@ class TestShip(CelebornTestCase):
 
     def test_ship_appends_note(self):
         self.cli("tasks", "add", "Noted", "--state", "doing", "--note", "started")
+        self.cli("tasks", "edit", "t1", "--progress", "99")   # CELE-t176: crest before ship
         r = self.cli("ship", "t1", "--note", "SHIPPED: all green")
         self.assertIsNone(r.exit_code, r.all)
         self.assertIn("SHIPPED: all green", self.cli("tasks", "show", "t1").out)
         self.assertIn("started", self.cli("tasks", "show", "t1").out)
+
+
+class TestCrestGate(CelebornTestCase):
+    """CELE-t176 — a DOING card must be crested to 99% before it can leave for Done. Guards every
+    path out of DOING: ship, `tasks move … done`, `tasks edit … --state done`. todo→done is triage
+    and stays ungated. 100% is reserved for shipped cards."""
+
+    def test_ship_below_crest_is_refused_and_leaves_card_untouched(self):
+        self.cli("tasks", "add", "WIP", "--state", "doing", "--owner", "grok")
+        self.cli("tasks", "edit", "t1", "--progress", "40")
+        self.cli("touch", "a.py", "--by", "grok", "--task", "t1")
+        r = self.cli("ship", "t1", "--by", "grok")
+        self.assertIsNotNone(r.exit_code, r.all)            # refused
+        self.assertIn("crested to 99", r.all)
+        self.assertIn("--progress 99", r.all)
+        # no side effects: still doing, touch still held
+        self.assertEqual(self.cli("tasks", "show", "t1").out.count("state:      doing"), 1)
+        self.assertIn("a.py", self.cli("touch", "list").out)
+
+    def test_ship_at_crest_succeeds_and_fills_to_100(self):
+        self.cli("tasks", "add", "Done soon", "--state", "doing")
+        self.cli("tasks", "edit", "t1", "--progress", "99")
+        r = self.cli("ship", "t1")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["progress"], 100)
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["state"], "done")
+
+    def test_move_doing_to_done_below_crest_is_refused(self):
+        self.cli("tasks", "add", "WIP", "--state", "doing")
+        self.cli("tasks", "edit", "t1", "--progress", "50")
+        r = self.cli("tasks", "move", "t1", "done")
+        self.assertIsNotNone(r.exit_code, r.all)
+        self.assertIn("crested to 99", r.all)
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["state"], "doing")   # unchanged
+
+    def test_edit_doing_to_done_below_crest_is_refused(self):
+        self.cli("tasks", "add", "WIP", "--state", "doing")
+        self.cli("tasks", "edit", "t1", "--progress", "10")
+        r = self.cli("tasks", "edit", "t1", "--state", "done")
+        self.assertIsNotNone(r.exit_code, r.all)
+        self.assertIn("crested to 99", r.all)
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["state"], "doing")
+
+    def test_edit_can_crest_and_ship_in_one_call(self):
+        self.cli("tasks", "add", "WIP", "--state", "doing")
+        r = self.cli("tasks", "edit", "t1", "--progress", "99", "--state", "done")
+        self.assertIsNone(r.exit_code, r.all)
+        t = cb._load_tasks(self.ctx)[0]
+        self.assertEqual(t["state"], "done")
+        self.assertEqual(t["progress"], 100)   # done normalizes to 100
+
+    def test_todo_to_done_is_ungated(self):
+        # A never-started card closed as triage isn't in-flight work vanishing — no crest required.
+        self.cli("tasks", "add", "Won't do")   # todo, progress 0
+        r = self.cli("tasks", "move", "t1", "done")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["state"], "done")
+
+    def test_reship_of_done_card_is_not_gated(self):
+        self.cli("tasks", "add", "Already done", "--state", "done")
+        r = self.cli("ship", "t1")   # prev state is done, not doing → no gate
+        self.assertIsNone(r.exit_code, r.all)
 
 
 class TestPanicSave(CelebornTestCase):
@@ -5592,7 +7818,7 @@ class TestGrokWire(CelebornTestCase):
             tmp = tempfile.mkdtemp()
             try:
                 root = Path(tmp)
-                r = run_cli("--path", str(root), "init", "--no-scan", "--no-claude-md")
+                r = run_cli("--path", str(root), "scaffold", "--no-scan", "--no-claude-md")
                 self.assertIsNone(r.exit_code, r.all)
                 wg.assert_called_once()
                 self.assertIn("wired Grok Build", r.out)
@@ -5607,7 +7833,7 @@ class TestFleet(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.ctx = self.root / ".context"
-        r = run_cli("--path", str(self.root), "init", "--no-scan")
+        r = run_cli("--path", str(self.root), "scaffold", "--no-scan")
         self.assertIsNone(r.exit_code, r.all)
         self._reg_backup = None
         reg = cb._fleet_registry_path()
@@ -5656,6 +7882,96 @@ class TestFleet(unittest.TestCase):
         doing = data["projects"][0]["doing"]
         self.assertEqual(len(doing), 1)
         self.assertEqual(doing[0]["owner"], "grok")
+
+    def test_fleet_owner_never_shows_model(self):
+        # CELE-t172 bug 1: an owner recorded as a model string ('claude-opus48') must not surface as
+        # the owner on the fleet card. With no live session to substitute a session id, it's dropped.
+        run_cli("--path", str(self.root), "tasks", "add", "Model owner", "--state", "doing",
+                "--owner", "claude-opus48")
+        run_cli("--path", str(self.root), "fleet", "register")
+        data = json.loads(run_cli("--path", str(self.root), "fleet", "--json").out)
+        doing = data["projects"][0]["doing"]
+        self.assertEqual(doing[0]["owner"], "")   # model text suppressed, not '@claude-opus48'
+
+    def test_display_owner_suppresses_model_keeps_handles(self):
+        # CELE-t172 bug 1: model strings drop out; session ids and human/family handles stay.
+        self.assertTrue(cb._looks_like_model_handle("claude-opus48", "Opus 4.8"))
+        self.assertTrue(cb._looks_like_model_handle("Claude/Opus 4.8"))
+        self.assertFalse(cb._looks_like_model_handle("grok"))       # bare family handle
+        self.assertFalse(cb._looks_like_model_handle("516a54", "Opus 4.8"))  # hex session id
+        self.assertEqual(cb._display_owner("claude-opus48", "Opus 4.8", "d0c13a"), "d0c13a")
+        self.assertEqual(cb._display_owner("claude-opus48", "Opus 4.8"), "")
+        self.assertEqual(cb._display_owner("516a54", "Opus 4.8"), "516a54")
+        self.assertEqual(cb._display_owner("grok"), "grok")
+
+    def test_fleet_agent_status_live_session_not_stuck(self):
+        # CELE-t172 bug 4: a DOING card with no active touches reads "stuck" on touches alone — but a
+        # demonstrably-live session (recent transcript/capture/heartbeat) is working, never stuck.
+        doing = [{"id": "t1", "title": "x", "owner": "grok", "state": "doing"}]
+        self.assertEqual(cb._fleet_agent_status(self.ctx, "grok", doing, [], live=False), "stuck")
+        self.assertEqual(cb._fleet_agent_status(self.ctx, "grok", doing, [], live=True), "working")
+
+
+class TestFleetActiveSession(CelebornTestCase):
+    """CELE-t178 — context follows the SESSION, not the card. A live session keeps its context band on
+    the fleet widget after its card ships, until it claims another card (or goes idle / clears). The
+    transcript scan is mocked so the snapshot logic is exercised deterministically."""
+
+    def _live(self):
+        # A fresh checkpoint stamps session.updated_at = now → _cheap_live true → the scan runs.
+        self.cli("checkpoint", "--focus", "x", "--status", "green")
+
+    def test_active_session_surfaces_when_live_but_no_doing_card(self):
+        self._live()
+        row = {"session": "d0c13a99", "agent": "d0c13a", "tokens": 120000, "task_id": None}
+        with mock.patch.object(cb, "_active_agents", return_value=[row]):
+            snap = cb._fleet_project_snapshot(self.root)
+        self.assertEqual(snap["doing"], [])
+        self.assertIsNotNone(snap["active_session"])
+        self.assertEqual(snap["active_session"]["k"], 120)          # 120000 // 1000
+        self.assertEqual(snap["active_session"]["session"], "d0c13a")
+        self.assertEqual(snap["active_session"]["owner"], "")        # bare session id → no @handle
+
+    def test_active_session_keeps_real_owner_handle(self):
+        self._live()
+        row = {"session": "ab12cd34", "agent": "grok", "tokens": 50000, "task_id": None}
+        with mock.patch.object(cb, "_active_agents", return_value=[row]):
+            snap = cb._fleet_project_snapshot(self.root)
+        self.assertEqual(snap["active_session"]["owner"], "grok")
+        self.assertEqual(snap["active_session"]["k"], 50)
+
+    def test_none_when_a_doing_card_carries_the_band(self):
+        # With a DOING card the context rides the card's own band, not a separate active-session band.
+        self.cli("tasks", "add", "WIP", "--state", "doing", "--owner", "grok")
+        self._live()
+        row = {"session": "ab12cd34", "agent": "grok", "tokens": 90000, "task_id": "t1"}
+        with mock.patch.object(cb, "_active_agents", return_value=[row]):
+            snap = cb._fleet_project_snapshot(self.root)
+        self.assertIsNone(snap["active_session"])
+        self.assertEqual(snap["doing"][0]["k"], 90)                 # band on the card, as before
+
+    def test_shipped_card_still_tracks_context(self):
+        # The card's scenario end-to-end: claim → crest → ship, session still live → context persists.
+        self.cli("tasks", "add", "Done card", "--state", "doing", "--owner", "grok")
+        self.cli("tasks", "edit", "t1", "--progress", "99")         # CELE-t176 crest gate
+        self.cli("ship", "t1")
+        self._live()
+        row = {"session": "ab12cd34", "agent": "grok", "tokens": 42000, "task_id": None}
+        with mock.patch.object(cb, "_active_agents", return_value=[row]):
+            snap = cb._fleet_project_snapshot(self.root)
+        self.assertEqual(snap["counts"]["done"], 1)
+        self.assertEqual(snap["doing"], [])
+        self.assertIsNotNone(snap["active_session"])                # NOT cleared by completing the card
+        self.assertEqual(snap["active_session"]["k"], 42)
+
+    def test_idle_project_skips_the_transcript_scan(self):
+        # Perf win preserved (CELE-t170): no doing card + stale capture/session → never scan transcripts.
+        scan = mock.Mock(return_value=[])
+        with mock.patch.object(cb, "_active_agents", scan), \
+             mock.patch.object(cb, "_minutes_since_iso", return_value=999):
+            snap = cb._fleet_project_snapshot(self.root)
+        scan.assert_not_called()
+        self.assertIsNone(snap["active_session"])
 
 
 class TestIntegrity(unittest.TestCase):
@@ -6974,7 +9290,7 @@ class TestCmmInitAutoEngage(unittest.TestCase):
         self._tmp.cleanup()
 
     def _init(self, *extra):
-        return run_cli("--path", str(self.root), "init", "--no-scan", *extra)
+        return run_cli("--path", str(self.root), "scaffold", "--no-scan", *extra)
 
     def _perms(self) -> dict:
         p = self.root / ".claude" / "settings.json"
@@ -7176,6 +9492,15 @@ class TestProgressEngine(CelebornTestCase):
             r = self.cli("doctor")
         self.assertIn("despite commits", r.all)
 
+    def test_add_claim_floors_progress(self):
+        # Regression: `tasks add --claim` IS a claim, so it must stamp the engine floor (5%) the
+        # instant the card goes doing — not leave the DOING bar stuck at 0% (mirrors `celeborn claim`).
+        self.cli("tasks", "add", "Engine addclaim", "--claim", "--by", "tester")
+        tid = next(t["id"] for t in cb._load_tasks(self.ctx) if t["title"] == "Engine addclaim")
+        card = self._card(tid)
+        self.assertEqual(card["state"], "doing")
+        self.assertGreaterEqual(card["progress"], cb.CLAIM_FLOOR)
+
     def test_progress_verb_explains(self):
         tid = self._add("Engine L", subs=["Step one", "Step two"])
         self._claim(tid)
@@ -7183,6 +9508,1911 @@ class TestProgressEngine(CelebornTestCase):
             r = self.cli("progress", tid, "--explain")
         self.assertIn("engine floor", r.out)
         self.assertIn("signals present", r.out)
+
+
+class TestBlockedAlerts(CelebornTestCase):
+    """CELE-t169 — the `celeborn alert` service + Notification/Stop hooks that surface a blocked
+    coding session (permission prompt / idle / stopped) on the DOING card, locally and hosted."""
+
+    SESS = "sess-alert-1"
+
+    def _add(self, title, state="todo"):
+        self.cli("tasks", "add", title, "--state", state)
+        return next(t["id"] for t in cb._load_tasks(self.ctx) if t["title"] == title)
+
+    def _claim(self, tid):
+        return self.cli("claim", tid, "--by", "tester", "--session", self.SESS)
+
+    def _tasks_json(self):
+        return json.loads((self.ctx / cb.TASKS_JSON).read_text())["tasks"]
+
+    def _card_json(self, tid):
+        return next(t for t in self._tasks_json() if t["id"] == tid)
+
+    def _transcript(self) -> str:
+        f = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        f.write(json.dumps({"message": {"usage": {"input_tokens": 1000}}}) + "\n")
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    # --- the verb (the reusable service) --------------------------------------
+    def test_alert_verb_sets_lists_and_stamps_projection(self):
+        tid = self._add("Blocked card")
+        self._claim(tid)
+        r = self.cli("alert", tid, "-m", "Claude needs permission for Bash", "--kind", "permission")
+        self.assertIsNone(r.exit_code, r.all)
+        rec = cb._alert_for(self.ctx, tid)
+        self.assertEqual(rec["kind"], "permission")
+        self.assertIn("permission", rec["message"])
+        # Stamped onto the derived projection the board reads.
+        self.assertEqual(self._card_json(tid)["alert"]["kind"], "permission")
+        # --list surfaces it.
+        r = self.cli("alert", "--list")
+        self.assertIn("permission", r.out)
+
+    def test_alert_only_on_doing_card(self):
+        tid = self._add("Still todo")            # never claimed → todo
+        r = self.cli("alert", tid, "-m", "x", "--kind", "idle")
+        self.assertIsNotNone(r.exit_code)        # refuses a non-doing card
+        self.assertIsNone(cb._alert_for(self.ctx, tid))
+
+    def test_alert_clear(self):
+        tid = self._add("Clearable")
+        self._claim(tid)
+        self.cli("alert", tid, "-m", "waiting", "--kind", "idle")
+        self.assertIsNotNone(cb._alert_for(self.ctx, tid))
+        self.cli("alert", tid, "--clear")
+        self.assertIsNone(cb._alert_for(self.ctx, tid))
+        self.assertIsNone(self._card_json(tid)["alert"])
+
+    # --- the Notification hook ------------------------------------------------
+    def test_notification_hook_classifies_permission(self):
+        tid = self._add("Perm card")
+        self._claim(tid)
+        cb.dispatch_hook("notification",
+                         {"session_id": self.SESS, "message": "Claude needs your permission to use Bash"},
+                         str(self.root))
+        rec = cb._alert_for(self.ctx, tid)
+        self.assertEqual(rec["kind"], "permission")
+
+    def test_notification_hook_idle_when_not_permission(self):
+        tid = self._add("Idle card")
+        self._claim(tid)
+        cb.dispatch_hook("notification",
+                         {"session_id": self.SESS, "message": "Waiting for input"},
+                         str(self.root))
+        self.assertEqual(cb._alert_for(self.ctx, tid)["kind"], "idle")
+
+    def test_notification_hook_noop_without_doing_card(self):
+        # A session signed in to no DOING card → nothing to alert.
+        cb.dispatch_hook("notification",
+                         {"session_id": "unknown-sess", "message": "needs permission"},
+                         str(self.root))
+        self.assertEqual(cb._load_alerts(self.ctx).get("alerts"), {})
+
+    # --- the Stop hook (idle-stop) --------------------------------------------
+    def test_stop_hook_flags_unfinished_doing_card(self):
+        tid = self._add("Stopped card")
+        self._claim(tid)
+        cb.dispatch_hook("stop",
+                         {"session_id": self.SESS, "transcript_path": self._transcript()},
+                         str(self.root))
+        self.assertEqual(cb._alert_for(self.ctx, tid)["kind"], "stopped")
+
+    def test_stop_hook_no_alert_when_no_card(self):
+        cb.dispatch_hook("stop",
+                         {"session_id": "no-card-sess", "transcript_path": self._transcript()},
+                         str(self.root))
+        self.assertEqual(cb._load_alerts(self.ctx).get("alerts"), {})
+
+    # --- clear on resume ------------------------------------------------------
+    def test_user_prompt_submit_clears_alert(self):
+        tid = self._add("Resumes")
+        self._claim(tid)
+        cb._set_alert(self.ctx, tid, "stopped", "awaiting", self.SESS)
+        cb.dispatch_hook("user-prompt-submit",
+                         {"session_id": self.SESS, "transcript_path": self._transcript(), "prompt": "keep going"},
+                         str(self.root))
+        self.assertIsNone(cb._alert_for(self.ctx, tid))
+
+    # --- hosted push rail -----------------------------------------------------
+    def test_build_task_rows_carries_alert(self):
+        tid = self._add("Hosted card")
+        self._claim(tid)
+        other = self._add("Unblocked todo")     # a second, unblocked card (stays todo)
+        self.cli("alert", tid, "-m", "needs approval", "--kind", "permission")
+        rows = {r["task_id"]: r for r in cs.build_task_rows(self.ctx, "pid", [])}
+        self.assertEqual(rows[tid]["alert_kind"], "permission")
+        self.assertIn("approval", rows[tid]["alert_message"])
+        # A card with no alert → null columns (so the hosted upsert clears a stale badge).
+        self.assertIsNone(rows[other]["alert_kind"])
+        self.assertIsNone(rows[other]["alert_message"])
+
+    def test_row_to_task_ignores_alert_columns(self):
+        # The pull path must never write transient alert state back into tasks.md.
+        t = cs._row_to_task({"task_id": "t1", "title": "x", "state": "doing",
+                             "alert_kind": "permission", "alert_message": "m", "alert_at": "2026-01-01T00:00:00"})
+        self.assertNotIn("alert", t)
+        self.assertNotIn("alert_kind", t)
+
+    # --- dock answer note/journal labelling (CELE-t345) ------------------------
+    def test_answer_text_no_question_labels_as_message(self):
+        # The always-on Stage prompt line delivers a plain message (kind=text, no --question);
+        # it must journal as a "message", NOT the "permission" fallback.
+        tid = self._add("Msg card")
+        self._claim(tid)
+        r = self.cli("answer", tid, "--kind", "text", "--response", "ship it",
+                     "--session", self.SESS)
+        self.assertIsNone(r.exit_code, r.all)
+        note = self._card_json(tid).get("notes", "")
+        self.assertIn("💬 [dock", note)
+        self.assertIn("message → ship it", note)
+        self.assertNotIn("permission → ship it", note)
+        journal = (self.ctx / "journal.md").read_text()
+        self.assertIn("**Asked:** (message)", journal)
+        self.assertNotIn("(permission request)", journal)
+
+    def test_answer_permission_keeps_permission_fallback(self):
+        # A permission answer with no --question still reads as a permission request.
+        tid = self._add("Perm answer card")
+        self._claim(tid)
+        r = self.cli("answer", tid, "--kind", "permission", "--response", "once",
+                     "--session", self.SESS)
+        self.assertIsNone(r.exit_code, r.all)
+        note = self._card_json(tid).get("notes", "")
+        self.assertIn("permission → once", note)
+        journal = (self.ctx / "journal.md").read_text()
+        self.assertIn("**Asked:** (permission request)", journal)
+
+    # --- per-prompt model pick (CELE-t346) -------------------------------------
+    def test_answer_model_rides_note_journal_and_outbox(self):
+        # The per-prompt [model ▾] pick (CELE-t346) must ride the card note trail, the journal entry,
+        # and — on the outbox path (no waiting ask) — the delivered message, so the next turn knows it.
+        tid = self._add("Model pick card")
+        self._claim(tid)
+        r = self.cli("answer", tid, "--kind", "text", "--response", "use the fast one",
+                     "--session", self.SESS, "--model", "Opus 4.8")
+        self.assertIsNone(r.exit_code, r.all)
+        note = self._card_json(tid).get("notes", "")
+        self.assertIn("· via Opus 4.8", note)
+        journal = (self.ctx / "journal.md").read_text()
+        self.assertIn("**Model:** Opus 4.8", journal)
+        outbox_dir = self.ctx / "outbox"
+        outbox = "".join(f.read_text() for f in outbox_dir.glob("*.md")) if outbox_dir.is_dir() else ""
+        self.assertIn("requested model: Opus 4.8", outbox)
+
+    def test_answer_no_model_omits_model_lines(self):
+        # Without --model, none of the model annotations appear (backward compatible with legacy sends).
+        tid = self._add("No model card")
+        self._claim(tid)
+        r = self.cli("answer", tid, "--kind", "text", "--response", "ok",
+                     "--session", self.SESS)
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertNotIn("· via ", self._card_json(tid).get("notes", ""))
+        self.assertNotIn("**Model:**", (self.ctx / "journal.md").read_text())
+
+
+# --------------------------------------------------------------------------- architecture (CELE-t187)
+
+class TestArchitecture(CelebornTestCase):
+    """The per-project architecture diagram: local capture (init/show) + the credential-stripping
+    push-row builder. The load-bearing invariant is that credentials NEVER reach the sync payload."""
+
+    def test_init_creates_infra_local(self):
+        r = self.cli("architecture", "init")
+        self.assertIsNone(r.exit_code, r.all)
+        p = self.ctx / cb.INFRA_LOCAL_NAME
+        self.assertTrue(p.is_file())
+        doc = json.loads(p.read_text())
+        self.assertEqual(doc["schema"], cb.INFRA_SCHEMA)
+        # The CLI node is always seeded.
+        self.assertTrue(any(n["id"] == "cli" for n in doc["nodes"]))
+
+    def test_init_refuses_overwrite_without_force(self):
+        self.cli("architecture", "init")
+        r = self.cli("architecture", "init")
+        self.assertEqual(r.exit_code, 1)
+        r2 = self.cli("architecture", "init", "--force")
+        self.assertIsNone(r2.exit_code, r2.all)
+
+    def test_init_autodetects_from_env_names(self):
+        # An env var NAME (never a value) seeds a vendor node.
+        (self.root / ".env").write_text("ANTHROPIC_API_KEY=sk-should-not-be-read\nSTRIPE_SECRET_KEY=whatever\n")
+        self.cli("architecture", "init")
+        doc = json.loads((self.ctx / cb.INFRA_LOCAL_NAME).read_text())
+        vendors = {n["vendor"] for n in doc["nodes"]}
+        self.assertIn("Anthropic", vendors)
+        self.assertIn("Stripe", vendors)
+
+    def test_show_lists_nodes(self):
+        self.cli("architecture", "init")
+        r = self.cli("architecture", "show")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("Celeborn CLI", r.out)
+
+    def test_show_without_file_is_graceful(self):
+        r = self.cli("architecture", "show")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("architecture init", r.out)
+
+    def test_infra_local_is_skipped_by_the_raw_file_channel(self):
+        # The .json file must NOT ride the generic context_files push — that would upload credentials.
+        self.assertIn(cs.INFRA_LOCAL_NAME, cs.SYNC_SKIP_NAMES)
+
+    def test_build_row_strips_credentials(self):
+        doc = {
+            "schema": cb.INFRA_SCHEMA,
+            "nodes": [{"id": "db", "name": "DB", "kind": "database", "vendor": "Supabase"}],
+            "flows": [],
+            "credentials": {"supabase": {"env": "CELEBORN_SUPABASE_ANON_KEY", "value": "sk-secret-xyz"}},
+        }
+        (self.ctx / cb.INFRA_LOCAL_NAME).write_text(json.dumps(doc))
+        row = cs.build_architecture_row(self.ctx, "proj-123", [])
+        self.assertIsNotNone(row)
+        self.assertEqual(row["project_id"], "proj-123")
+        self.assertNotIn("credentials", row["doc"])
+        # Belt-and-suspenders: the secret value must appear nowhere in the serialized payload.
+        self.assertNotIn("sk-secret-xyz", json.dumps(row["doc"]))
+        # Non-secret topology survives.
+        self.assertEqual(row["doc"]["nodes"][0]["vendor"], "Supabase")
+
+    def test_build_row_none_when_absent(self):
+        self.assertIsNone(cs.build_architecture_row(self.ctx, "proj-123", []))
+
+    def test_build_row_redacts_secret_pasted_into_a_node(self):
+        # A token accidentally pasted into a node field is redacted by the defense-in-depth pass.
+        doc = {"nodes": [{"id": "x", "name": "X", "kind": "app", "notes": "ghp_0123456789abcdefghijABCDEFGHIJ0123"}],
+               "flows": []}
+        (self.ctx / cb.INFRA_LOCAL_NAME).write_text(json.dumps(doc))
+        row = cs.build_architecture_row(self.ctx, "p", [r"ghp_[A-Za-z0-9]+"])
+        self.assertNotIn("ghp_0123456789abcdefghijABCDEFGHIJ0123", json.dumps(row["doc"]))
+
+
+class TestArchitectureTrace(CelebornTestCase):
+    """CELE-t201 — the auto-architecture-trace: dependency-manifest detection, additive merge (never
+    clobber hand-authored nodes), the cadence (every 3 turns) + manifest-edit trigger, and the opt-in
+    no-op invariant (nothing happens unless infra-local.json already exists)."""
+
+    def _seed_infra(self, nodes=None):
+        doc = {"schema": cb.INFRA_SCHEMA, "nodes": nodes or [{"id": "cli", "name": "Celeborn CLI",
+               "kind": "client", "vendor": "local"}], "flows": [], "credentials": {}}
+        (self.ctx / cb.INFRA_LOCAL_NAME).write_text(json.dumps(doc))
+        return doc
+
+    def test_detects_vendor_from_dependency_manifest(self):
+        (self.root / "package.json").write_text('{"dependencies":{"@anthropic-ai/sdk":"^1.0.0"}}')
+        vendors = {n["vendor"] for n in cb._detect_infra_nodes(self.root)}
+        self.assertIn("Anthropic", vendors)
+
+    def test_merge_is_additive_and_never_overwrites(self):
+        # A hand-authored Supabase DB node with custom fields must survive a detected Supabase node.
+        doc = {"nodes": [{"id": "mydb", "name": "Prod DB", "kind": "database", "vendor": "Supabase",
+                          "endpoint": "hand.authored.co", "notes": "keep me"}], "flows": []}
+        detected = [{"id": "db", "name": "Database", "kind": "database", "vendor": "Supabase"},
+                    {"id": "stripe", "name": "Stripe", "kind": "vendor", "vendor": "Stripe"}]
+        merged, added = cb._merge_infra_nodes(doc, detected)
+        # Supabase already present (by vendor+kind) → not duplicated; Stripe is new → added.
+        self.assertEqual(added, ["Stripe"])
+        self.assertEqual(len(merged["nodes"]), 2)
+        kept = next(n for n in merged["nodes"] if n["id"] == "mydb")
+        self.assertEqual(kept["endpoint"], "hand.authored.co")
+        self.assertEqual(kept["notes"], "keep me")
+
+    def test_trace_is_noop_without_infra_file(self):
+        (self.root / "package.json").write_text('{"dependencies":{"stripe":"^1"}}')
+        self.assertEqual(cb._architecture_trace(self.ctx, reason="test"), [])
+        self.assertFalse((self.ctx / cb.INFRA_LOCAL_NAME).is_file())
+
+    def test_trace_adds_new_piece_and_is_idempotent(self):
+        self._seed_infra()
+        (self.root / "requirements.txt").write_text("anthropic==1.2.3\n")
+        added = cb._architecture_trace(self.ctx, reason="test", allow_push=False)
+        self.assertIn("Anthropic API", added)
+        doc = json.loads((self.ctx / cb.INFRA_LOCAL_NAME).read_text())
+        self.assertIn("Anthropic", {n["vendor"] for n in doc["nodes"]})
+        # A second trace with no new signal changes nothing.
+        self.assertEqual(cb._architecture_trace(self.ctx, reason="test", allow_push=False), [])
+
+    def test_cadence_fires_every_three_turns(self):
+        self._seed_infra()
+        (self.root / "package.json").write_text('{"dependencies":{"stripe":"^1"}}')
+        n1 = cb._maybe_arch_trace_on_turn(self.ctx)
+        n2 = cb._maybe_arch_trace_on_turn(self.ctx)
+        self.assertEqual((n1, n2), ("", ""))            # turns 1 & 2: counter only, no trace
+        n3 = cb._maybe_arch_trace_on_turn(self.ctx)
+        self.assertIn("architecture trace", n3)          # turn 3: cadence fires, Stripe found
+        self.assertEqual(int(cb._load_arch_trace_state(self.ctx)["turns_since_trace"]), 0)
+
+    def test_manifest_edit_triggers_immediate_trace(self):
+        self._seed_infra()
+        (self.root / "package.json").write_text('{"dependencies":{"twilio":"^4"}}')
+        note = cb._maybe_arch_trace_on_edit(self.ctx, "package.json")
+        self.assertIn("Twilio", note)
+        # Bypasses the cadence: the note is stashed and surfaced on the very next turn.
+        self.assertIn("Twilio", cb._maybe_arch_trace_on_turn(self.ctx))
+
+    def test_non_manifest_edit_does_nothing(self):
+        self._seed_infra()
+        self.assertEqual(cb._maybe_arch_trace_on_edit(self.ctx, "web/components/Foo.tsx"), "")
+
+    def test_trace_state_is_local_only(self):
+        self.assertIn(cb.ARCH_TRACE_STATE_NAME, cs.SYNC_SKIP_NAMES)
+
+
+class TestLocalToolchain(CelebornTestCase):
+    """CELE-t236 — the local install toolchain: manifest detection (names + version specs only), the
+    `local` block seeded by init and REFRESHED (not additively merged) by trace, and its ride through
+    the credential-stripped architecture push row."""
+
+    def test_detects_runtimes_and_frameworks_with_versions(self):
+        (self.root / "package.json").write_text(json.dumps({
+            "engines": {"node": ">=20"},
+            "dependencies": {"next": "^15.1.0", "react": "19.0.0"},
+            "devDependencies": {"typescript": "~5.6.2"}}))
+        (self.root / "pyproject.toml").write_text('[project]\nname = "x"\nrequires-python = ">=3.11"\n')
+        deps = {d["name"]: d for d in cb._detect_local_deps(self.root)}
+        self.assertEqual(deps["Node.js"], {"name": "Node.js", "kind": "runtime", "version": ">=20",
+                                           "source": "package.json"})
+        self.assertEqual(deps["Python"]["version"], ">=3.11")
+        self.assertEqual(deps["Next.js"]["version"], "15.1.0")     # npm caret sigil stripped
+        self.assertEqual(deps["TypeScript"]["version"], "5.6.2")   # tilde too
+        self.assertEqual(deps["Next.js"]["kind"], "framework")
+
+    def test_detection_reaches_one_dir_level_and_orders_by_kind(self):
+        (self.root / "web").mkdir()
+        (self.root / "web" / "package.json").write_text('{"dependencies":{"next":"15.0.0"}}')
+        (self.root / "uv.lock").write_text("")
+        (self.root / "requirements.txt").write_text("anthropic\n")
+        deps = cb._detect_local_deps(self.root)
+        names = [d["name"] for d in deps]
+        self.assertEqual(names, ["Node.js", "Python", "Next.js", "uv"])  # runtime → framework → tool
+        self.assertEqual({d["name"]: d["source"] for d in deps}["Next.js"], "web/package.json")
+
+    def test_go_directive_and_lockfile_managers(self):
+        (self.root / "go.mod").write_text("module example.com/m\n\ngo 1.22.1\n")
+        (self.root / "pnpm-lock.yaml").write_text("lockfileVersion: 9\n")
+        deps = {d["name"]: d for d in cb._detect_local_deps(self.root)}
+        self.assertEqual(deps["Go"]["version"], "1.22.1")
+        self.assertEqual(deps["pnpm"]["kind"], "tool")
+
+    def test_init_seeds_the_local_block(self):
+        (self.root / "package.json").write_text('{"dependencies":{"next":"^15.0.0"}}')
+        self.cli("architecture", "init")
+        doc = json.loads((self.ctx / cb.INFRA_LOCAL_NAME).read_text())
+        self.assertIn("Next.js", {d["name"] for d in doc["local"]})
+
+    def test_trace_refreshes_local_without_touching_nodes(self):
+        # Seed a doc with no local block (pre-t236 capture) and a hand-authored node.
+        doc = {"schema": cb.INFRA_SCHEMA, "nodes": [{"id": "cli", "name": "Celeborn CLI",
+               "kind": "client", "vendor": "local"}], "flows": []}
+        (self.ctx / cb.INFRA_LOCAL_NAME).write_text(json.dumps(doc))
+        (self.root / "go.mod").write_text("module m\n\ngo 1.23\n")
+        # No new vendor nodes → trace returns [] but still writes the refreshed local block.
+        self.assertEqual(cb._architecture_trace(self.ctx, reason="test", allow_push=False), [])
+        after = json.loads((self.ctx / cb.INFRA_LOCAL_NAME).read_text())
+        self.assertEqual([d["name"] for d in after["local"]], ["Go"])
+        self.assertEqual(len(after["nodes"]), 1)
+        # Idempotent: an unchanged toolchain does not rewrite the file.
+        stamp = after["updated"]
+        self.assertEqual(cb._architecture_trace(self.ctx, reason="test", allow_push=False), [])
+        self.assertEqual(json.loads((self.ctx / cb.INFRA_LOCAL_NAME).read_text())["updated"], stamp)
+
+    def test_local_block_rides_the_push_row(self):
+        doc = {"schema": cb.INFRA_SCHEMA, "nodes": [{"id": "cli", "name": "CLI", "kind": "client"}],
+               "flows": [], "local": [{"name": "Python", "kind": "runtime", "version": ">=3.11",
+                                       "source": "pyproject.toml"}],
+               "credentials": {"x": "sk-secret"}}
+        (self.ctx / cb.INFRA_LOCAL_NAME).write_text(json.dumps(doc))
+        row = cs.build_architecture_row(self.ctx, "p", [])
+        self.assertEqual(row["doc"]["local"][0]["name"], "Python")
+        self.assertNotIn("credentials", row["doc"])
+
+    def test_manual_trace_reports_a_toolchain_refresh(self):
+        # A pre-t236 doc gains its local block on the next manual trace — and the CLI says so
+        # honestly instead of "the stack is up to date".
+        doc = {"schema": cb.INFRA_SCHEMA, "nodes": [{"id": "cli", "name": "CLI", "kind": "client",
+               "vendor": "local"}], "flows": []}
+        (self.ctx / cb.INFRA_LOCAL_NAME).write_text(json.dumps(doc))
+        (self.root / "go.mod").write_text("module m\n\ngo 1.23\n")
+        r = self.cli("architecture", "trace")
+        self.assertIn("refreshed the local toolchain", r.out)
+        r2 = self.cli("architecture", "trace")
+        self.assertIn("up to date", r2.out)
+
+    def test_show_prints_the_toolchain(self):
+        (self.root / "pyproject.toml").write_text('[project]\nrequires-python = ">=3.12"\n')
+        self.cli("architecture", "init")
+        r = self.cli("architecture", "show")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("local toolchain", r.out)
+        self.assertIn("Python >=3.12", r.out)
+
+
+class TestStackIsServerSideOnly(CelebornTestCase):
+    """CELE-t301 — Stack (the architecture diagram + the CELE-t236 local toolchain) is a SERVER-SIDE
+    Pro feature: its rendering ENGINE lives only in web/ and its DATA only in the RLS-gated
+    project_architecture table. The FREE local board (board/) may ONLY link out to the hosted page —
+    it must never gain the renderer. This guard trips if anyone ports the Stack engine into the local
+    board (a live risk: the house style ports board/ → web/ verbatim, so it could be done in reverse).
+    Detection stays in the CLI by design (operator decision 2026-07-07); this test does NOT police it."""
+
+    # The symbols that ARE the Stack rendering engine — none may appear anywhere in the local board.
+    ENGINE_SYMBOLS = ("layoutArchitecture", "parseArchitectureDoc", "ArchitectureView")
+
+    def setUp(self):
+        super().setUp()
+        if not (REPO_ROOT / "board").is_dir() or not (REPO_ROOT / "web").is_dir():
+            self.skipTest("source-invariant test — needs the repo layout (board/ + web/)")
+
+    def _board_sources(self):
+        import os
+        out = []
+        for dirpath, dirnames, filenames in os.walk(REPO_ROOT / "board"):
+            dirnames[:] = [d for d in dirnames if d not in ("node_modules", ".next", ".git")]
+            for fn in filenames:
+                if fn.endswith((".ts", ".tsx")):
+                    out.append(Path(dirpath) / fn)
+        return out
+
+    def test_local_board_has_no_stack_rendering_engine(self):
+        offenders = []
+        for p in self._board_sources():
+            text = p.read_text(errors="ignore")
+            for sym in self.ENGINE_SYMBOLS:
+                if sym in text:
+                    offenders.append(f"{p.relative_to(REPO_ROOT)}: {sym}")
+        self.assertEqual(offenders, [], "the local board must not carry the Stack rendering engine "
+                         "(server-side Pro feature) — port it into web/, never board/: " + "; ".join(offenders))
+
+    def test_local_board_has_no_stack_route_or_pro_table_read(self):
+        import re
+        # No local /stack route directory under the board app...
+        stack_dirs = [str(p.relative_to(REPO_ROOT)) for p in (REPO_ROOT / "board").rglob("stack")
+                      if p.is_dir() and "node_modules" not in p.parts]
+        self.assertEqual(stack_dirs, [], f"local board must not host a /stack route: {stack_dirs}")
+        # ...and no query against the Pro table (a comment mentioning the name is fine; a READ is not).
+        read_pat = re.compile(r"""\.from\(\s*['"]project_architecture['"]""")
+        offenders = [str(p.relative_to(REPO_ROOT)) for p in self._board_sources()
+                     if read_pat.search(p.read_text(errors="ignore"))]
+        self.assertEqual(offenders, [], f"local board must not read project_architecture: {offenders}")
+
+    def test_stack_tab_links_out_to_the_hosted_pro_page(self):
+        hdr = (REPO_ROOT / "board" / "app" / "BoardHeader.tsx").read_text()
+        # The Stack tab navigates OUT: an absolute hosted URL opened in a new tab, plus a (Pro) upgrade link.
+        self.assertRegex(hdr, r"function hostedStackHref[\s\S]{0,200}?HOSTED_BASE")   # absolute cloud origin
+        self.assertRegex(hdr, r'href=\{hostedStackHref[\s\S]{0,160}?target="_blank"')  # opens the hosted page
+        self.assertIn("(Pro)", hdr)
+
+    def test_rendering_engine_lives_in_web(self):
+        # Positive control — the engine really does exist server-side, so the guards above mean
+        # "only in web/", not "nowhere".
+        lib = REPO_ROOT / "web" / "lib" / "architecture.ts"
+        view = REPO_ROOT / "web" / "components" / "ArchitectureView.tsx"
+        self.assertTrue(lib.is_file() and view.is_file())
+        self.assertIn("layoutArchitecture", lib.read_text())
+        self.assertIn("ArchitectureView", view.read_text())
+
+
+# --------------------------------------------------------------------------- product federation (CELE-t190)
+
+class TestProductFederation(CelebornTestCase):
+    """Layer A of CELE-t188: the product registry (committed product.md + gitignored product-local.json),
+    the `celeborn product` command, and the orient banner. The load-bearing invariants are the
+    authored-vs-machine split (paths never enter product.md) and graceful unbound-facet degradation."""
+
+    def test_parse_product_facets_name_and_provenance(self):
+        d = cb.parse_product(
+            "# Product — Foo\n\n"
+            "<!-- a managed comment that mentions Facets and Provenance but must NOT parse as data -->\n"
+            "Facets (key · role · publish · repo):\n"
+            "- client   role=client:public   repo=github.com/x/y\n"
+            "- server   role=server:private  publish=never\n\n"
+            "Provenance (OSS — Layer C):\n"
+            "- vendor/z/ oss:dependency upstream=github.com/a/b\n")
+        self.assertEqual(d["name"], "Foo")
+        self.assertEqual(len(d["facets"]), 2)
+        self.assertEqual(d["facets"][0], {"key": "client", "role": "client:public", "repo": "github.com/x/y"})
+        self.assertEqual(d["facets"][1]["publish"], "never")
+        self.assertEqual(d["provenance"], ["- vendor/z/ oss:dependency upstream=github.com/a/b"])
+
+    def test_init_creates_product_md(self):
+        r = self.cli("product", "init", "--name", "Widget")
+        self.assertIsNone(r.exit_code, r.all)
+        p = self.ctx / cb.PRODUCT_MD_NAME
+        self.assertTrue(p.is_file())
+        self.assertIn("# Product — Widget", p.read_text())
+
+    def test_init_refuses_overwrite_without_force(self):
+        self.cli("product", "init")
+        r = self.cli("product", "init")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIsNone(self.cli("product", "init", "--force").exit_code)
+
+    def test_add_is_an_upsert(self):
+        self.cli("product", "init")
+        self.cli("product", "add", "client", "--role", "client:public", "--repo", "github.com/x/y")
+        self.assertEqual(len(cb.load_product(self.ctx)["facets"]), 1)
+        # re-adding the same key EDITS it (no duplicate), and the new field lands.
+        self.cli("product", "add", "client", "--role", "client:public", "--publish", "pypi")
+        facets = cb.load_product(self.ctx)["facets"]
+        self.assertEqual(len(facets), 1)
+        self.assertEqual(facets[0]["publish"], "pypi")
+
+    def test_add_rejects_unknown_role(self):
+        self.cli("product", "init")
+        r = self.cli("product", "add", "client", "--role", "not-a-role")
+        self.assertEqual(r.exit_code, 2)  # argparse choices rejection
+
+    def test_bind_writes_gitignored_local_json(self):
+        self.cli("product", "init")
+        self.cli("product", "add", "client", "--role", "client:public")
+        r = self.cli("product", "bind", "client", str(self.root))
+        self.assertIsNone(r.exit_code, r.all)
+        local = json.loads((self.ctx / cb.PRODUCT_LOCAL_NAME).read_text())
+        self.assertEqual(local["schema"], cb.PRODUCT_LOCAL_SCHEMA)
+        self.assertEqual(local["bindings"]["client"], str(self.root.resolve()))
+        # The binding path must NEVER leak into the committed product.md.
+        self.assertNotIn(str(self.root), (self.ctx / cb.PRODUCT_MD_NAME).read_text())
+
+    def test_product_local_json_is_gitignored(self):
+        # CELE-t228: .context/ is blanket-private (`/.context/`), which covers product-local.json.
+        gi = (self.root / ".gitignore").read_text()
+        self.assertIn("/.context/", gi)
+
+    def test_banner_silent_without_product_md(self):
+        self.assertEqual(cb._product_banner(self.ctx), "")
+
+    def test_banner_silent_with_no_facets(self):
+        self.cli("product", "init")  # product.md exists but has zero facets
+        self.assertEqual(cb._product_banner(self.ctx), "")
+
+    def test_banner_marks_bound_and_unbound(self):
+        self.cli("product", "init")
+        self.cli("product", "add", "client", "--role", "client:public")
+        # Declared but not bound on this machine → em-dash marker.
+        self.assertIn("client (client:public —)", cb._product_banner(self.ctx))
+        # Bound to a real directory → check marker.
+        self.cli("product", "bind", "client", str(self.root))
+        self.assertIn("client (client:public ✓)", cb._product_banner(self.ctx))
+
+    def test_bind_to_missing_path_stays_unbound(self):
+        self.cli("product", "init")
+        self.cli("product", "add", "client", "--role", "client:public")
+        self.cli("product", "bind", "client", str(self.root / "does-not-exist"))
+        # Binding is recorded, but a non-existent path degrades to unbound in the banner.
+        self.assertIn("client (client:public —)", cb._product_banner(self.ctx))
+
+    def test_list_graceful_without_registry(self):
+        r = self.cli("product")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("product init", r.out)
+
+    def test_add_preserves_provenance_lines(self):
+        self.cli("product", "init")
+        self.cli("product", "add", "client", "--role", "client:public")
+        # Simulate a Layer-C provenance write, then confirm a Layer-A facet edit round-trips it.
+        p = self.ctx / cb.PRODUCT_MD_NAME
+        p.write_text(p.read_text().replace(
+            "- (none yet)", "- vendor/z/ oss:dependency upstream=github.com/a/b"))
+        self.cli("product", "add", "server", "--role", "server:private")
+        prod = cb.load_product(self.ctx)
+        self.assertEqual(len(prod["facets"]), 2)
+        self.assertTrue(any("vendor/z" in line for line in prod["provenance"]))
+
+
+class TestMultiRepoOps(CelebornTestCase):
+    """Layer B of CELE-t188 (CELE-t191): facet-routed git/PR ops + the publish guard. The registry (Layer A)
+    names the repo-facets and their roles; `celeborn commit/push/pr --facet` route git to the bound checkout
+    with auto touch/trailer attribution, and the publish guard hard-DENYs a release targeting a facet whose
+    role forbids publishing. The load-bearing invariants: routing lands in the RIGHT repo, attribution is
+    automatic, and no server:private/oss:* facet can be published (with a marked accepted-risk escape hatch)."""
+
+    def _git(self, repo, *argv):
+        import subprocess
+        return subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True, check=True)
+
+    def _mkrepo(self, name):
+        import subprocess
+        repo = self.root / name
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init")
+        return repo
+
+    def setUp(self):
+        super().setUp()
+        self.server = self._mkrepo("server")   # bound to server:private
+        self.client = self._mkrepo("client")   # bound to client:public
+        self.cli("product", "init", "--name", "Celeborn")
+        self.cli("product", "add", "server", "--role", "server:private", "--publish", "never")
+        self.cli("product", "add", "client", "--role", "client:public",
+                 "--repo", "github.com/cloud-dancer-labs/celeborn")
+        self.cli("product", "bind", "server", str(self.server))
+        self.cli("product", "bind", "client", str(self.client))
+
+    def _decide(self, command, project_dir=None, tool_name="Bash"):
+        return cb._publish_guard_decision(
+            {"tool_name": tool_name, "tool_input": {"command": command}},
+            str(project_dir or self.root))
+
+    # -- pure policy helpers -------------------------------------------------
+    def test_is_publish_action(self):
+        for cmd in ("twine upload dist/*", "python3 -m twine upload x", "npm publish",
+                    "pnpm publish", "poetry publish", "gh release create v1",
+                    "git push origin --tags", "git push --follow-tags"):
+            self.assertTrue(cb._is_publish_action(cmd), cmd)
+        for cmd in ("git push origin main", "git commit -m x", "ls dist/", "echo publish"):
+            self.assertFalse(cb._is_publish_action(cmd), cmd)
+
+    def test_role_forbids_publish(self):
+        self.assertTrue(cb._role_forbids_publish("server:private"))
+        self.assertTrue(cb._role_forbids_publish("oss:upstream"))
+        self.assertTrue(cb._role_forbids_publish("oss:fork"))
+        self.assertFalse(cb._role_forbids_publish("client:public"))
+
+    def test_facet_role_for_path_longest_match(self):
+        # A path inside a bound checkout resolves to that facet's role.
+        key, role = cb._facet_role_for_path(self.ctx, str(self.server / "sub" / "x.py"))
+        self.assertEqual((key, role), ("server", "server:private"))
+        # A path outside every checkout resolves to nothing.
+        self.assertEqual(cb._facet_role_for_path(self.ctx, "/nowhere/at/all"), (None, None))
+
+    def test_celeborn_trailers(self):
+        ident = {"handle": "abc123", "family": "Claude", "model": "Opus 4.8"}
+        self.assertEqual(cb._celeborn_trailers(ident, "CELE-t9"),
+                         ["Celeborn-Task: t9", "Celeborn-Agent: abc123", "Celeborn-Model: Claude · Opus 4.8"])
+        # bare id is kept bare; unknown handle and empty model are omitted.
+        self.assertEqual(cb._celeborn_trailers({"handle": "unknown"}, ""), [])
+
+    # -- publish guard (PreToolUse decision) ---------------------------------
+    def _deny(self, out):
+        return bool(out) and json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    def test_guard_denies_publish_targeting_private_facet_by_path(self):
+        out = self._decide(f"cd {self.server} && twine upload dist/*")
+        self.assertTrue(self._deny(out))
+        self.assertIn("server:private", out)
+
+    def test_guard_allows_publish_targeting_public_facet(self):
+        # client:public may publish → the guard has no opinion (empty).
+        self.assertEqual(self._decide(f"cd {self.client} && twine upload dist/*"), "")
+
+    def test_guard_fallback_resolves_by_project_dir(self):
+        # No path in the command → resolve by the project it runs in (the server checkout) → deny.
+        out = self._decide("npm publish", project_dir=self.server)
+        self.assertTrue(self._deny(out))
+
+    def test_guard_oss_role_wording(self):
+        oss = self._mkrepo("vendored")
+        self.cli("product", "add", "foo", "--role", "oss:upstream", "--upstream", "github.com/acme/foo")
+        self.cli("product", "bind", "foo", str(oss))
+        out = self._decide(f"twine upload {oss}/dist/*")
+        self.assertTrue(self._deny(out))
+        self.assertIn("fork", out)  # oss wording: contribute via fork → PR
+
+    def test_guard_bypass_marker_auto_allows(self):
+        out = self._decide(f"twine upload {self.server}/dist/* # celeborn:allow-publish: emergency hotfix")
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_guard_ignores_non_publish_and_non_bash(self):
+        self.assertEqual(self._decide(f"git -C {self.server} push origin main"), "")     # branch push is fine
+        self.assertEqual(self._decide("twine upload x", tool_name="Edit"), "")            # not Bash
+
+    def test_guard_silent_without_product_md(self):
+        # A sibling project with no registry never pays the guard, even for a publish command.
+        solo = self.root / "solo"
+        solo.mkdir()
+        # CELE-t228 renamed the old scaffold-only `init` → `scaffold` (`--no-scan` lives there now;
+        # the new `init` is the full wire+sign-in command).
+        cb.main(["--path", str(solo), "scaffold", "--no-scan", "--no-cmm"])
+        self.assertEqual(self._decide("twine upload dist/*", project_dir=solo), "")
+
+    def test_guard_wired_into_dispatch_after_redirect(self):
+        # End-to-end through dispatch_hook: a publish targeting the private facet is denied on the same rail.
+        out = cb.dispatch_hook(
+            "pre-tool-use",
+            {"tool_name": "Bash", "tool_input": {"command": f"twine upload {self.server}/dist/*"},
+             "session_id": "S1"},
+            str(self.root))
+        self.assertTrue(self._deny(out))
+
+    # -- commit routing + attribution ----------------------------------------
+    def test_commit_routes_into_facet_with_trailers(self):
+        self.cli("identify", "--as", "tester", "--family", "Claude", "--model", "Opus 4.8")
+        (self.client / "feature.py").write_text("x\n")
+        r = self.cli("commit", "--facet", "client", "-m", "add feature", "--task", "t1", "--by", "tester", "feature.py")
+        self.assertIsNone(r.exit_code, r.all)
+        body = self._git(self.client, "log", "-1", "--format=%B").stdout
+        self.assertIn("add feature", body)
+        self.assertIn("Celeborn-Task: t1", body)      # bare id in the trailer (machine-parsed convention)
+        self.assertIn("Celeborn-Agent: tester", body)
+        self.assertIn("Celeborn-Model: Claude · Opus 4.8", body)
+        # the file is committed in the CLIENT repo, not the hub.
+        self.assertIn("feature.py", self._git(self.client, "show", "--name-only", "--format=").stdout)
+
+    def test_commit_registers_cross_repo_touch(self):
+        (self.client / "a.py").write_text("x\n")
+        self.cli("commit", "--facet", "client", "-m", "a", "--task", "t1", "a.py")
+        touches = cb._load_touches(self.ctx).get("files") or {}
+        self.assertIn("client:a.py", touches)         # namespaced by facet so other agents see the repo
+        self.assertEqual(touches["client:a.py"][0]["task"], "t1")
+
+    def test_commit_auto_fills_task_from_session_card(self):
+        # With a live doing card owned by this session, the Celeborn-Task trailer is auto-filled.
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sessABCDEF"}):
+            self.cli("tasks", "add", "work")
+            self.cli("claim", "t1")
+            (self.server / "s.py").write_text("x\n")
+            self.cli("commit", "--facet", "server", "-m", "srv", "s.py")
+        body = self._git(self.server, "log", "-1", "--format=%B").stdout
+        self.assertIn("Celeborn-Task: t1", body)
+
+    # -- facet resolution errors ---------------------------------------------
+    def test_commit_dies_on_unknown_facet(self):
+        r = self.cli("commit", "--facet", "nope", "-m", "x")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("not a facet", r.all)
+
+    def test_commit_dies_on_unbound_facet(self):
+        self.cli("product", "add", "ghost", "--role", "client:public")   # declared, never bound
+        r = self.cli("commit", "--facet", "ghost", "-m", "x")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("not bound", r.all)
+
+    # -- push routing + in-command release guard -----------------------------
+    def test_push_tags_into_private_facet_refused(self):
+        # A tag/release push into server:private is refused in-command (the PreToolUse guard can't see the
+        # git that runs inside celeborn, so cmd_push enforces the same policy itself).
+        r = self.cli("push", "--facet", "server", "--tags")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("refused", r.all)
+
+    def test_push_branch_into_private_facet_allowed_by_policy(self):
+        # A plain branch push is NOT a publish — the policy lets it through; git then fails (no remote),
+        # which is a transport error, not a policy refusal.
+        r = self.cli("push", "--facet", "server", "origin", "master")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("git push failed", r.all)       # reached git, not the policy guard
+        self.assertNotIn("refused", r.all)
+
+    # -- pr DRAFT (never sends) ----------------------------------------------
+    def test_pr_drafts_and_never_sends(self):
+        (self.client / "z.py").write_text("z\n")
+        self.cli("commit", "--facet", "client", "-m", "add z", "--task", "t1", "z.py")
+        self._git(self.client, "checkout", "-q", "-b", "feature-z")   # branch ahead of master
+        (self.client / "z2.py").write_text("z2\n")
+        self.cli("commit", "--facet", "client", "-m", "add z2", "--task", "t1", "z2.py")
+        r = self.cli("pr", "--facet", "client", "--base", "master")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("gh pr create", r.out)                       # a ready-to-run command is printed…
+        self.assertIn("--head feature-z", r.out)
+        self.assertIn("drafted, not sent", r.all)                  # …but Celeborn does NOT run it
+        self.assertIn("-R github.com/cloud-dancer-labs/celeborn", r.out)
+
+    def test_pr_oss_facet_shows_fork_flow(self):
+        oss = self._mkrepo("upstream")
+        self.cli("product", "add", "bar", "--role", "oss:fork",
+                 "--repo", "github.com/us/bar", "--upstream", "github.com/orig/bar")
+        self.cli("product", "bind", "bar", str(oss))
+        self._git(oss, "checkout", "-q", "-b", "fix")
+        (oss / "patch.py").write_text("p\n")
+        self.cli("commit", "--facet", "bar", "-m", "fix upstream bug", "--task", "t1", "patch.py")
+        r = self.cli("pr", "--facet", "bar", "--base", "master")
+        self.assertIn("gh repo fork", r.out)                       # fork→PR framing for stewarded OSS
+        self.assertIn("github.com/orig/bar", r.out)                # upstream shown
+
+
+class TestPMAutoProvision(CelebornTestCase):
+    """CELE-t211 — PM auto-provision: under the OpenCode harness a card-less coder that begins
+    substantive work is put ON the board (claim its assigned card, else create an `auto` card)
+    instead of being denied — the coder never hits the gate, and the §1.3 agent_sessions link is
+    written at bind time. Claude-harness behavior (deny/steer) is pinned unchanged, and subagent
+    (child) sessions keep the deny (contract t203 §1.2)."""
+
+    SID = "ocsessAAAABBBB"          # sid6 == "ocsess"
+
+    def _decide(self, tool_name="Edit", sid=SID, harness="opencode", child=False, **tool_input):
+        payload = {"tool_name": tool_name, "tool_input": tool_input, "session_id": sid}
+        if child:
+            payload["child_session"] = True
+        return cb.dispatch_hook("pre-tool-use", payload, str(self.root), harness=harness)
+
+    def _envelope(self, out) -> dict:
+        self.assertTrue(out, "expected a PreToolUse decision envelope, got silence")
+        return json.loads(out)["hookSpecificOutput"]
+
+    def test_cardless_edit_autoprovisions_and_allows(self):
+        self.cli("tasks", "add", "Someone else's card")        # open, unowned → gated under Claude
+        env = self._envelope(self._decide(file_path="x.py"))
+        self.assertEqual(env["permissionDecision"], "allow")
+        self.assertIn("auto-provisioned", env["permissionDecisionReason"])
+        card = next(t for t in cb._load_tasks(self.ctx) if "auto" in (t.get("tags") or []))
+        self.assertEqual(card["state"], "doing")
+        self.assertEqual(card["owner"], "ocsess")
+        self.assertEqual(card["autonomy"], ["research", "edits", "tests"])  # never commit
+        self.assertEqual(card["stop"], cb.DEFAULT_STOP)
+        self.assertTrue(cb._session_has_task(self.ctx, self.SID))          # §1.3 link at bind time
+        # The gate is lifted for the rest of the session: the next gated call passes in silence.
+        self.assertEqual(self._decide(file_path="y.py"), "")
+
+    def test_title_comes_from_last_recorded_prompt(self):
+        # _record_turn_prompt flattens newlines to spaces, so the recorded prompt is one line.
+        cb._record_turn_prompt(self.ctx, self.SID, "Fix the flaky SSE reconnect loop\nwith detail")
+        self._decide(file_path="x.py")
+        card = next(t for t in cb._load_tasks(self.ctx) if "auto" in (t.get("tags") or []))
+        self.assertEqual(card["title"], "Fix the flaky SSE reconnect loop with detail")
+
+    def test_title_falls_back_to_the_tool_call(self):
+        self._decide(tool_name="Edit", file_path="src/deep/reducer.ts")
+        card = next(t for t in cb._load_tasks(self.ctx) if "auto" in (t.get("tags") or []))
+        self.assertIn("reducer.ts", card["title"])
+
+    def test_assigned_todo_card_is_claimed_not_duplicated(self):
+        self.cli("tasks", "add", "Staged for this coder", "--owner", "ocsess")   # todo, pre-assigned
+        before = len(cb._load_tasks(self.ctx))
+        env = self._envelope(self._decide(file_path="x.py"))
+        self.assertEqual(env["permissionDecision"], "allow")
+        self.assertIn("auto-claimed", env["permissionDecisionReason"])
+        tasks = cb._load_tasks(self.ctx)
+        self.assertEqual(len(tasks), before)                                     # no duplicate card
+        card = next(t for t in tasks if t["title"] == "Staged for this coder")
+        self.assertEqual(card["state"], "doing")
+        self.assertEqual(card["autonomy"], ["research", "edits", "tests"])       # ungroomed → defaults
+        self.assertTrue(cb._session_has_task(self.ctx, self.SID))
+
+    def test_narrow_groomed_assigned_card_still_bounds_the_call(self):
+        # A pre-assigned card groomed to research-only must not widen just because the gate claimed
+        # it: the card is claimed (board truthful) but the triggering Edit is still autonomy-denied.
+        self.cli("tasks", "add", "Research only", "--owner", "ocsess", "--autonomy", "research")
+        env = self._envelope(self._decide(file_path="x.py"))
+        self.assertEqual(env["permissionDecision"], "deny")
+        self.assertIn("autonomy", env["permissionDecisionReason"])
+        card = next(t for t in cb._load_tasks(self.ctx) if t["title"] == "Research only")
+        self.assertEqual(card["state"], "doing")                                 # provisioned anyway
+        self.assertEqual(card["autonomy"], ["research"])                         # grooming untouched
+
+    def test_empty_board_autoprovisions_under_opencode(self):
+        # Other harnesses stay exempt on an empty board ('add one'); with no human in the loop,
+        # silence would just mean off-board work — so opencode creates the card.
+        env = self._envelope(self._decide(file_path="x.py"))
+        self.assertEqual(env["permissionDecision"], "allow")
+        self.assertEqual(len([t for t in cb._load_tasks(self.ctx) if t["state"] == "doing"]), 1)
+
+    def test_child_session_keeps_the_deny(self):
+        self.cli("tasks", "add", "Open card")
+        env = self._envelope(self._decide(child=True, file_path="x.py"))
+        self.assertEqual(env["permissionDecision"], "deny")
+        self.assertIn("a card is MANDATORY", env["permissionDecisionReason"])
+        self.assertFalse(cb._session_has_task(self.ctx, self.SID))              # no card minted
+
+    def test_claude_harness_behavior_unchanged(self):
+        self.cli("tasks", "add", "Open card")
+        env = self._envelope(self._decide(harness="", file_path="x.py"))
+        self.assertEqual(env["permissionDecision"], "deny")
+        self.assertEqual(cb._load_tasks(self.ctx)[0]["state"], "todo")          # nothing provisioned
+
+    def test_no_session_id_falls_back_to_deny(self):
+        self.cli("tasks", "add", "Open card")
+        env = self._envelope(self._decide(sid="", file_path="x.py"))
+        self.assertEqual(env["permissionDecision"], "deny")
+
+    def test_translation_lifts_the_child_flag(self):
+        ev, p = cb._opencode_to_claude_shape(
+            "tool.execute.before", {"sessionID": "s1", "tool": "edit", "args": {}, "child": True})
+        self.assertEqual(ev, "pre-tool-use")
+        self.assertTrue(p.get("child_session"))
+        _, p2 = cb._opencode_to_claude_shape(
+            "tool.execute.before", {"sessionID": "s1", "tool": "edit", "args": {}})
+        self.assertNotIn("child_session", p2)
+
+
+class TestNextUpSelector(CelebornTestCase):
+    """CELE-t219 — deterministic NEXT-UP / ready-set emitter. READY = state todo AND every
+    `blocked_by` id Done (on the board or in done-archive.md). The PM invokes `celeborn next` and
+    echoes stdout verbatim, so stdout must be data-only: card id + title, never notes or
+    agent-protocol boilerplate; anomaly flags ride stderr."""
+
+    def _pin_slug(self):
+        # Deterministic display ids (CELE-tN) — the derived slug of a temp dir isn't stable.
+        rc = json.loads(self.read(".celebornrc"))
+        rc["project_slug"] = "cele"
+        self.write(".celebornrc", json.dumps(rc))
+
+    def test_next_skips_blocked_and_picks_ready(self):
+        # The blocked card sits ON TOP of the todo column (newest-first) — next must skip it.
+        self.cli("tasks", "add", "base card")                              # t1
+        self.cli("tasks", "add", "dependent card", "--blocked-by", "t1")   # t2, lands on top
+        r = self.cli("next")
+        self.assertIsNone(r.exit_code)
+        self.assertIn("NEXT-UP: [", r.out)
+        self.assertIn("t1] base card", r.out)
+        self.assertNotIn("dependent card", r.out)
+
+    def test_blocker_done_unblocks_dependent(self):
+        self.cli("tasks", "add", "base card")
+        self.cli("tasks", "add", "dependent card", "--blocked-by", "t1")
+        self.cli("tasks", "move", "t1", "done")
+        r = self.cli("next")
+        self.assertIn("t2] dependent card", r.out)
+
+    def test_doing_blocker_still_blocks(self):
+        # A blocker in DOING is not Done — its dependent must never surface as next.
+        self.cli("tasks", "add", "base card")
+        self.cli("tasks", "add", "dependent card", "--blocked-by", "t1")
+        self.cli("tasks", "move", "t1", "doing")
+        r = self.cli("next")
+        self.assertIn("NEXT-UP: none", r.out)
+        self.assertNotIn("dependent card", r.out)
+
+    def test_all_lists_ready_set_in_board_order(self):
+        self.cli("tasks", "add", "first card")                        # t1
+        self.cli("tasks", "add", "second card")                       # t2 → column order [t2, t1]
+        self.cli("tasks", "add", "gated card", "--blocked-by", "t1")  # t3 on top, blocked
+        r = self.cli("tasks", "next", "--all")
+        self.assertIn("READY (2):", r.out)
+        self.assertLess(r.out.index("second card"), r.out.index("first card"))  # board order kept
+        self.assertNotIn("gated card", r.out)
+
+    def test_none_when_nothing_todo(self):
+        self.cli("tasks", "add", "solo card")
+        self.cli("claim", "t1", "--by", "tester")  # todo → doing
+        self.assertIn("NEXT-UP: none", self.cli("next").out)
+        self.assertIn("READY: none", self.cli("tasks", "next", "--all").out)
+
+    def test_archived_done_blocker_counts_as_done(self):
+        # The blocker aged off the Done column into done-archive.md — its dependent is READY.
+        self.write("done-archive.md",
+                   cb.DONE_ARCHIVE_HEADER + "\n## [t1] old shipped card\n- state: done\n")
+        self.write("tasks.md",
+                   cb.TASKS_HEADER + "\n## [t2] dependent card\n- state: todo\n- blocked-by: t1\n")
+        r = self.cli("next")
+        self.assertIn("t2] dependent card", r.out)
+        self.assertEqual("", r.err)  # a resolvable blocker is no anomaly
+
+    def test_unknown_blocker_treated_done_but_flagged_on_stderr(self):
+        self._pin_slug()
+        self.write("tasks.md",
+                   cb.TASKS_HEADER + "\n## [t2] dependent card\n- state: todo\n- blocked-by: t9\n")
+        r = self.cli("next")
+        self.assertIn("[CELE-t2] dependent card", r.out)  # not wedged by a vanished blocker
+        self.assertIn("t9", r.err)                        # …but the anomaly is flagged
+        self.assertNotIn("t9", r.out)                     # stdout stays a clean data channel
+
+    def test_tag_and_phase_filters(self):
+        self.cli("tasks", "add", "plat card", "--tags", "plat,board", "--phase", "p4")
+        self.cli("tasks", "add", "web card", "--tags", "web")
+        r = self.cli("next", "--tag", "plat")
+        self.assertIn("plat card", r.out)
+        self.assertNotIn("web card", r.out)
+        self.assertIn("plat card", self.cli("next", "--tag", "plat,board").out)  # ALL tags must match
+        self.assertIn("NEXT-UP: none", self.cli("next", "--tag", "plat,missing").out)
+        self.assertIn("plat card", self.cli("next", "--phase", "p4").out)
+        self.assertIn("NEXT-UP: none", self.cli("next", "--phase", "p9").out)
+
+    def test_output_never_carries_protocol_boilerplate(self):
+        # The whole reason this command exists: the 2026-07-04 PM test saw a small model fixate on
+        # the protocol block in raw board text and answer "none" past a plainly ready card.
+        self.cli("tasks", "add", "clean card")
+        for argv in (("next",), ("tasks", "next"), ("tasks", "next", "--all"), ("next", "--json")):
+            r = self.cli(*argv)
+            self.assertNotIn(cb.AGENT_PROTOCOL_MARKER, r.all, msg=str(argv))
+            self.assertNotIn("AGENT PROTOCOL", r.all, msg=str(argv))
+
+    def test_pasted_protocol_block_stripped_from_title(self):
+        self.write("tasks.md",
+                   cb.TASKS_HEADER + f"\n## [t1] real title {cb.AGENT_PROTOCOL_MARKER} pasted junk\n"
+                                     "- state: todo\n")
+        r = self.cli("next")
+        self.assertIn("real title", r.out)
+        self.assertNotIn("pasted junk", r.out)
+        self.assertNotIn(cb.AGENT_PROTOCOL_MARKER, r.out)
+
+    def test_json_shape(self):
+        self._pin_slug()
+        self.cli("tasks", "add", "base card")                         # t1
+        self.cli("tasks", "add", "gated card", "--blocked-by", "t1")  # t2
+        doc = json.loads(self.cli("next", "--json").out)
+        self.assertEqual(doc["next"]["id"], "t1")
+        self.assertEqual(doc["next"]["display_id"], "CELE-t1")
+        self.assertEqual(doc["next"]["title"], "base card")
+        self.assertEqual([t["id"] for t in doc["ready"]], ["t1"])
+        self.assertEqual(doc["ready"][0]["blocked_by"], [])
+        # Empty board → next is null, ready is [] (the PM can branch on it without parsing prose).
+        self.write("tasks.md", cb.TASKS_HEADER)
+        doc = json.loads(self.cli("next", "--json").out)
+        self.assertIsNone(doc["next"])
+        self.assertEqual(doc["ready"], [])
+
+    def test_top_level_alias_matches_tasks_next(self):
+        self.cli("tasks", "add", "base card")
+        self.assertEqual(self.cli("next").out, self.cli("tasks", "next").out)
+
+
+class TestSpineDiscipline(CelebornTestCase):
+    """CELE-t282 — spine discipline enforced at ship time (cele-t144-spine-and-stage.md §4). The
+    spine head — the first READY todo card, exactly t219's NEXT-UP — must be startable verbatim by
+    a fresh agent: blockers done, a real Stop condition, a brief in the note, no open question.
+    `celeborn ship` warns (--strict refuses) when it isn't; doctor flags it; the tasks.json
+    projection carries a per-card {pos, ready, why} stamp so the rail/PM never re-derive it."""
+
+    BRIEF = ("What: wire the widget to the frobnicator. Why now: wave 2 depends on it. "
+             "Pointers: scripts/celeborn.py, .context/notes.md.")
+
+    def _add_startable(self, title="startable card", **kw):
+        argv = ["tasks", "add", title, "--stop", "widget wired, frobnicator tests green",
+                "--note", self.BRIEF]
+        for k, v in kw.items():
+            argv += [f"--{k.replace('_', '-')}", v]
+        return self.cli(*argv)
+
+    def test_spine_audit_clauses(self):
+        bare = {"id": "t9", "stop": cb.DEFAULT_STOP, "notes": ""}
+        why = cb._spine_audit(bare)
+        self.assertTrue(any("auto-filled default" in w for w in why))
+        self.assertTrue(any("brief too thin" in w for w in why))
+        good = {"id": "t9", "stop": "a real stop", "notes": self.BRIEF}
+        self.assertEqual(cb._spine_audit(good), [])
+        # An open question addressed to the card (a live alert) blocks startability.
+        why = cb._spine_audit(good, alerts={"t9": {"kind": "permission"}})
+        self.assertTrue(any("open question" in w for w in why))
+        # Protocol boilerplate pasted into the note is not a brief — it's stripped before measuring.
+        pasted = {"id": "t9", "stop": "a real stop",
+                  "notes": cb.AGENT_PROTOCOL_MARKER + " pasted junk " * 40}
+        self.assertTrue(any("brief too thin" in w for w in cb._spine_audit(pasted)))
+
+    def test_ship_warns_on_unstartable_head_but_ships(self):
+        self.cli("tasks", "add", "thin next card")      # t1 — default stop, no brief
+        self.cli("tasks", "add", "card being shipped")  # t2, lands on top
+        r = self.cli("ship", "t2")
+        self.assertIsNone(r.exit_code)                  # warn-only: the ship still lands
+        self.assertIn("Shipped", r.out)
+        self.assertIn("auto-filled default", r.out)
+        self.assertIn("brief too thin", r.out)
+        self.assertIn("NOT startable", r.out)           # …and the follow-on line carries the caveat
+
+    def test_ship_strict_refuses_and_leaves_board_untouched(self):
+        self.cli("tasks", "add", "thin next card")      # t1
+        self.cli("tasks", "add", "card being shipped")  # t2
+        r = self.cli("ship", "t2", "--strict")
+        self.assertIsNotNone(r.exit_code)
+        self.assertIn("not startable verbatim", r.all)
+        self.assertNotIn("Shipped", r.out)
+        t2 = cb._find_task(cb._load_tasks(self.ctx), "t2")
+        self.assertEqual(t2["state"], "todo")           # refused BEFORE any side effect
+
+    def test_ship_strict_passes_and_names_ready_follow_on(self):
+        self._add_startable("next card")                # t1
+        self.cli("tasks", "add", "card being shipped")  # t2
+        r = self.cli("ship", "t2", "--strict")
+        self.assertIsNone(r.exit_code)
+        self.assertIn("spine head is now [", r.out)
+        self.assertIn("t1] next card", r.out)
+        self.assertIn("(READY)", r.out)
+
+    def test_shipping_unblocks_dependent_for_preflight(self):
+        # The card being shipped is the dependent's only blocker — the pre-flight must count the
+        # shipping card as Done (simulated post-ship board), so the dependent IS the new head.
+        self.cli("tasks", "add", "card being shipped")  # t1
+        self._add_startable("dependent card", blocked_by="t1")  # t2
+        r = self.cli("ship", "t1")
+        self.assertIn("t2] dependent card", r.out)
+        self.assertIn("(READY)", r.out)
+
+    def test_ship_empty_spine_is_clean(self):
+        self.cli("tasks", "add", "solo card")  # t1 — the only card on the board
+        r = self.cli("ship", "t1", "--strict")
+        self.assertIsNone(r.exit_code)
+        self.assertIn("spine is empty", r.out)
+
+    def test_ship_flags_headless_spine(self):
+        self.cli("tasks", "add", "peer doing card")     # t1
+        self.cli("claim", "t1", "--by", "peer")
+        self._add_startable("gated card", blocked_by="t1")  # t2 — blocked by in-flight t1
+        self.cli("tasks", "add", "card being shipped")  # t3
+        r = self.cli("ship", "t3")
+        self.assertIn("no READY head", r.out)
+        self.assertIn("Shipped", r.out)                 # warn-only without --strict
+        r2 = self.cli("ship", "t3", "--strict")         # already done; re-ship of t3 keeps head None
+        self.assertIsNotNone(r2.exit_code)
+
+    def test_doctor_flags_unstartable_head(self):
+        self.cli("tasks", "add", "thin card")
+        r = self.cli("doctor")
+        self.assertIn("not startable verbatim", r.out)
+
+    def test_doctor_ok_when_head_ready(self):
+        self._add_startable()
+        r = self.cli("doctor")
+        self.assertIn("READY — startable verbatim", r.out)
+
+    def test_tasks_json_carries_spine_stamp(self):
+        self._add_startable("ready head")                             # t1 (bottom of todo)
+        self.cli("tasks", "add", "thin card")                         # t2
+        self.cli("tasks", "add", "gated card", "--blocked-by", "t2")  # t3 (top)
+        doc = json.loads(self.cli("tasks", "json").out)
+        by_id = {t["id"]: t for t in doc["tasks"]}
+        # Board order top→bottom is t3, t2, t1 — positions are the spine's total order.
+        self.assertEqual(by_id["t3"]["spine"]["pos"], 1)
+        self.assertEqual(by_id["t2"]["spine"]["pos"], 2)
+        self.assertEqual(by_id["t1"]["spine"]["pos"], 3)
+        self.assertFalse(by_id["t3"]["spine"]["ready"])
+        self.assertTrue(any("waiting on t2" in w for w in by_id["t3"]["spine"]["why"]))
+        self.assertFalse(by_id["t2"]["spine"]["ready"])   # default stop + no brief
+        self.assertTrue(by_id["t1"]["spine"]["ready"])
+        self.assertEqual(by_id["t1"]["spine"]["why"], [])
+        # Non-todo cards carry no stamp — the spine is the todo column only.
+        self.cli("claim", "t2", "--by", "tester")
+        doc = json.loads(self.cli("tasks", "json").out)
+        self.assertIsNone({t["id"]: t for t in doc["tasks"]}["t2"]["spine"])
+
+
+class TestPmLoop(CelebornTestCase):
+    """CELE-t283 — the Qwen-4b PM march loop (`celeborn pm`, design §4+§6): stamp READY, dispatch
+    the spine head to a free coder slot, raise/lower the ✋ on an unstartable head, restamp after a
+    ship. The PM verifies and ferries, never invents — every decision is a code predicate; the
+    model only phrases lines, and a reply that fails validation falls back to code-formatted text
+    (so `--no-model` / Ollama-down runs are behaviourally identical)."""
+
+    BRIEF = ("What: wire the widget to the frobnicator. Why now: the spine depends on it. "
+             "Pointers: scripts/celeborn.py, .context/notes.md.")
+
+    def _add_startable(self, title="startable card", **kw):
+        argv = ["tasks", "add", title, "--stop", "widget wired, tests green", "--note", self.BRIEF]
+        for k, v in kw.items():
+            argv += [f"--{k.replace('_', '-')}", v]
+        return self.cli(*argv)
+
+    def _alerts(self) -> dict:
+        return cb._load_alerts(self.ctx).get("alerts") or {}
+
+    def test_stamp_then_steady(self):
+        self._add_startable("ready card")                       # t1 — startable, no blockers
+        r = self.cli("pm", "--no-model")
+        self.assertIsNone(r.exit_code)
+        self.assertIn("stamped READY", r.out)
+        self.assertIn("t1", r.out)
+        # The steady-state wait (READY, but no live coder slot) is announced on the same pass…
+        self.assertIn("no free coder slot", r.out)
+        self.assertTrue((self.ctx / cb.PM_STATE_NAME).is_file())
+        # …and later passes are silent: same status, nothing to announce.
+        r2 = self.cli("pm", "--no-model")
+        self.assertIn("spine steady", r2.all)
+        self.assertNotIn("stamped READY", r2.out)
+
+    def test_hand_raised_on_unstartable_head_and_lowered_when_fixed(self):
+        self.cli("tasks", "add", "thin card")                   # t1 — default stop, no brief
+        r = self.cli("pm", "--no-model")
+        self.assertIn("✋", r.out)
+        rec = self._alerts().get("t1")
+        self.assertIsNotNone(rec, "PM must raise a spine-kind alert on the unstartable head")
+        self.assertEqual(rec["kind"], "spine")
+        self.assertEqual(rec["session"], cb.PM_ALERT_SESSION)
+        self.assertIn("t1", rec["message"])
+        self.assertIn("auto-filled default", rec["message"])
+        # The hand is board-visible on the rail (spine.why) but must NOT feed the predicate back:
+        # the audit's own violations stay the only real clauses (a stale hand can't wedge --strict).
+        doc = json.loads(self.cli("tasks", "json").out)
+        spine = {t["id"]: t["spine"] for t in doc["tasks"] if t["id"] == "t1"}["t1"]
+        self.assertTrue(any(w.startswith("✋") for w in spine["why"]))
+        self.assertEqual(cb._spine_audit(cb._find_task(cb._load_tasks(self.ctx), "t1"),
+                                         alerts=self._alerts()),
+                         ["Stop condition is still the auto-filled default",
+                          "brief too thin (0/60 chars in the note)"])
+        # A raised hand is idempotent: same head, same why → no re-raise churn on the next pass.
+        r2 = self.cli("pm", "--no-model")
+        self.assertNotIn("✋", r2.out)
+        # Sharpen the card (what the ✋ asked for) → the PM lowers its own hand.
+        self.cli("tasks", "edit", "t1", "--stop", "widget wired", "--note", self.BRIEF)
+        r3 = self.cli("pm", "--no-model")
+        self.assertIn("lowered the hand", r3.out)
+        self.assertNotIn("t1", self._alerts())
+
+    def test_dispatch_stages_head_on_pinned_slot(self):
+        self._add_startable("ready card")                       # t1
+        r = self.cli("pm", "--no-model", "--slots", "coder1", "--dry-run")
+        self.assertIn("would dispatch", r.out)
+        self.assertEqual(cb._find_task(cb._load_tasks(self.ctx), "t1")["owner"], "",
+                         "--dry-run must not stage the card")
+        r = self.cli("pm", "--no-model", "--slots", "coder1")
+        self.assertIn("dispatched", r.out)
+        t1 = cb._find_task(cb._load_tasks(self.ctx), "t1")
+        self.assertEqual(t1["state"], "todo")                   # DOING is earned at pickup (t213)
+        self.assertEqual(t1["owner"], "coder1")
+        blocks = cb._outbox_blocks(cb._outbox_file(self.ctx, "coder1").read_text())
+        self.assertEqual(len(blocks), 1)                        # the brief is queued exactly once
+        # Staged is a terminal PM state until pickup: announced once, then silent — never re-queued.
+        r2 = self.cli("pm", "--no-model", "--slots", "coder1")
+        self.assertIn("awaiting pickup", r2.out)
+        r3 = self.cli("pm", "--no-model", "--slots", "coder1")
+        self.assertIn("spine steady", r3.all)
+        self.assertEqual(len(cb._outbox_blocks(cb._outbox_file(self.ctx, "coder1").read_text())), 1)
+
+    def test_unstartable_head_is_never_dispatched(self):
+        self.cli("tasks", "add", "thin card")                   # t1 — fails the audit
+        r = self.cli("pm", "--no-model", "--slots", "coder1")
+        self.assertNotIn("dispatched", r.out)
+        self.assertIn("✋", r.out)
+        self.assertFalse(cb._outbox_file(self.ctx, "coder1").is_file())
+
+    def test_restamp_after_ship(self):
+        self._add_startable("second card")                      # t1 (bottom of todo)
+        self._add_startable("head card")                        # t2 (top — the spine head)
+        self.cli("pm", "--no-model")                            # records the pre-ship board
+        self.cli("ship", "t2")                                  # the coder ships the head
+        r = self.cli("pm", "--no-model")
+        self.assertIn("shipped [", r.out)
+        self.assertIn("t2", r.out)
+        self.assertIn("spine head is now [", r.out)
+        self.assertIn("t1] second card", r.out)
+        self.assertIn("(READY)", r.out)
+
+    def test_free_slots_pick_live_unspoken_sessions(self):
+        self._add_startable("staged card")                      # t1
+        self.cli("tasks", "edit", "t1", "--owner", "staged1")   # already spoken for
+        self.cli("outbox", "push", "--text", "pending brief", "--for", "queued1")
+        rows = [
+            {"agent": "fresh1", "task_id": None, "tokens": 8_000},
+            {"agent": "busy1", "task_id": "t9", "tokens": 5_000},    # on a card
+            {"agent": "staged1", "task_id": None, "tokens": 4_000},  # owns a staged todo
+            {"agent": "queued1", "task_id": None, "tokens": 3_000},  # brief pending pickup
+            {"agent": "full1", "task_id": None, "tokens": 180_000},  # window about to /clear
+            {"agent": "fresh2", "task_id": None, "tokens": 20_000},
+        ]
+        with mock.patch.object(cb, "_active_agents", return_value=rows):
+            slots = cb._pm_free_slots(self.ctx, cb._load_tasks(self.ctx))
+        self.assertEqual(slots, ["fresh1", "fresh2"])           # emptiest first; the rest excluded
+
+    def test_model_line_validated_with_fallback(self):
+        cfg = {"pm_model": "qwen3:4b-instruct", "pm_ollama_url": "http://localhost:11434/v1"}
+        facts = {"event": "restamp", "shipped": ["CELE-t2"], "head": "CELE-t1", "stamp": "READY"}
+
+        def _reply(content):
+            body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+            resp = mock.MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = mock.MagicMock(return_value=False)
+            return resp
+
+        with mock.patch("urllib.request.urlopen", return_value=_reply(
+                "shipped CELE-t2 — spine head is now CELE-t1 (READY)")):
+            self.assertEqual(cb._pm_model_line(cfg, facts, "fb"),
+                             "shipped CELE-t2 — spine head is now CELE-t1 (READY)")
+        # A reply that drops a card id is an invention by definition → fallback.
+        with mock.patch("urllib.request.urlopen", return_value=_reply("all good, moving on")):
+            self.assertEqual(cb._pm_model_line(cfg, facts, "fb"), "fb")
+        # Multi-line: only the first non-empty line counts (and must still carry the ids).
+        with mock.patch("urllib.request.urlopen", return_value=_reply(
+                "\nCELE-t2 shipped; CELE-t1 is the new head\nextra prose")):
+            self.assertEqual(cb._pm_model_line(cfg, facts, "fb"),
+                             "CELE-t2 shipped; CELE-t1 is the new head")
+        # Ollama down → the loop marches on the code-formatted fallback.
+        with mock.patch("urllib.request.urlopen", side_effect=OSError("connection refused")):
+            self.assertEqual(cb._pm_model_line(cfg, facts, "fb"), "fb")
+
+
+import celeborn_secrets as sec  # noqa: E402
+
+
+def _fake_infisical(tmpdir: Path, *, logged_in: bool = True) -> Path:
+    """A fake `infisical` binary that records every invocation to argv.log and answers the verbs
+    celeborn_secrets drives, so CLI-seam tests stay offline and assert exact wiring."""
+    log = tmpdir / "argv.log"
+    script = tmpdir / "infisical"
+    script.write_text(f"""#!/usr/bin/env python3
+import json, sys
+argv = sys.argv[1:]
+with open({str(log)!r}, "a") as f:
+    f.write(json.dumps(argv) + "\\n")
+if argv[:3] == ["user", "get", "token"]:
+    {"print('Token: eyJhbGciOi.fake-session-token.sig')" if logged_in else "sys.exit(1)"}
+elif argv[:2] == ["secrets", "set"]:
+    print("secret set")
+elif argv[:2] == ["secrets", "get"]:
+    print("s3cr3t-value")
+elif argv[:1] == ["export"]:
+    print("ALPHA=1\\nBETA=2")
+elif argv[:1] == ["run"]:
+    sys.exit(7)   # distinctive pass-through exit code
+elif argv[:1] == ["init"]:
+    pass
+sys.exit(0)
+""")
+    script.chmod(0o755)
+    return script
+
+
+class TestSecretsCLI(CelebornTestCase):
+    """CELE-t224: the `celeborn secrets` family over a fake pinned binary — Pro gate, wiring, and
+    the never-write-a-value-to-disk contract."""
+
+    def setUp(self):
+        super().setUp()
+        self.bindir = self.root / "_bin"
+        self.bindir.mkdir()
+        self.fake = _fake_infisical(self.bindir)
+        rc = json.loads((self.ctx / ".celebornrc").read_text())
+        rc["secrets"] = {"binary": str(self.fake)}
+        (self.ctx / ".celebornrc").write_text(json.dumps(rc, indent=2) + "\n")
+        # Default to entitled: each test that exercises the gate overrides this patch.
+        self._tier = mock.patch.object(sec, "_entitled_tier", return_value="pro")
+        self._tier.start()
+        self.addCleanup(self._tier.stop)
+
+    def _argv_log(self) -> list:
+        log = self.bindir / "argv.log"
+        if not log.is_file():
+            return []
+        return [json.loads(l) for l in log.read_text().splitlines()]
+
+    def _link_project(self):
+        (self.root / ".infisical.json").write_text(
+            json.dumps({"workspaceId": "ws-123", "defaultEnvironment": "dev"}) + "\n")
+
+    # ---- the Pro gate (operator decision 2: the WHOLE family)
+
+    def test_free_tier_is_refused_with_upgrade_nudge(self):
+        with mock.patch.object(sec, "_entitled_tier", return_value="free"):
+            r = self.cli("secrets", "list")
+        self.assertEqual(r.exit_code, 2)
+        self.assertIn("celeborn upgrade", r.all)
+
+    def test_pro_tier_is_cached_so_next_call_skips_the_live_check(self):
+        self._link_project()
+        self.cli("secrets", "list")
+        with mock.patch.object(sec, "_entitled_tier", side_effect=AssertionError("live check re-ran")):
+            r = self.cli("secrets", "list")
+        self.assertIsNone(r.exit_code, r.all)   # rode the 24h cache — no network, no die
+
+    def test_stale_tier_cache_reverifies(self):
+        self._link_project()
+        self.cli("secrets", "list")             # writes the cache
+        cache = json.loads(sec._tier_cache_path().read_text())
+        cache["checked_at"] = time.time() - sec.TIER_CACHE_TTL - 1
+        sec._tier_cache_path().write_text(json.dumps(cache))
+        with mock.patch.object(sec, "_entitled_tier", return_value="free"):
+            r = self.cli("secrets", "list")
+        self.assertEqual(r.exit_code, 2)        # expired cache → live check → refused
+
+    # ---- wiring: each verb drives the binary with the right argv
+
+    def test_set_hidden_prompt_never_echoes_and_wires_env(self):
+        self._link_project()
+        with mock.patch("getpass.getpass", return_value="sk-live-VALUE"):
+            r = self.cli("secrets", "set", "ANTHROPIC_API_KEY")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertNotIn("sk-live-VALUE", r.all)                      # value never printed
+        self.assertIn(["secrets", "set", "ANTHROPIC_API_KEY=sk-live-VALUE", "--env", "dev"],
+                      self._argv_log())
+        # …and the value ended up NOWHERE in the repo or its .context/ (the whole point).
+        for p in self.root.rglob("*"):
+            if p.is_file() and p != self.bindir / "argv.log":
+                self.assertNotIn("sk-live-VALUE", p.read_text(errors="ignore"), p)
+
+    def test_set_stdin_for_automation(self):
+        self._link_project()
+        with mock.patch("sys.stdin", io.StringIO("piped-value\n")):
+            r = self.cli("secrets", "set", "STRIPE_KEY", "--stdin")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn(["secrets", "set", "STRIPE_KEY=piped-value", "--env", "dev"], self._argv_log())
+
+    def test_get_prints_plain_value(self):
+        self._link_project()
+        r = self.cli("secrets", "get", "ALPHA")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("s3cr3t-value", r.out)
+        self.assertIn(["secrets", "get", "ALPHA", "--plain", "--env", "dev"], self._argv_log())
+
+    def test_list_names_only_never_values(self):
+        self._link_project()
+        r = self.cli("secrets", "list")
+        self.assertIn("ALPHA", r.out)
+        self.assertIn("BETA", r.out)
+        self.assertNotIn("=1", r.out)            # values stripped
+
+    def test_run_passes_command_through_and_propagates_exit_code(self):
+        self._link_project()
+        r = self.cli("secrets", "run", "--", "deploy-thing", "--prod")
+        self.assertEqual(r.exit_code, 7)         # the fake's distinctive code came back
+        self.assertIn(["run", "--env", "dev", "--", "deploy-thing", "--prod"], self._argv_log())
+
+    def test_run_with_no_command_dies(self):
+        self._link_project()
+        r = self.cli("secrets", "run")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("nothing to run", r.all)
+
+    def test_unlinked_repo_points_at_setup(self):
+        r = self.cli("secrets", "list")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("celeborn secrets setup", r.all)
+
+    def test_status_reports_link_and_login(self):
+        self._link_project()
+        r = self.cli("secrets", "status", "--json")
+        doc = json.loads(r.out)
+        self.assertTrue(doc["project_linked"])
+        self.assertTrue(doc["logged_in"])
+        self.assertEqual(doc["workspace_id"], "ws-123")
+
+    # ---- setup: Model 3a hands-off provisioning over mocked REST
+
+    def test_setup_provisions_project_via_rest_and_writes_infisical_json(self):
+        calls = []
+        def fake_http(method, url, headers=None, body=None, timeout=30):
+            calls.append((method, url, body))
+            if url.endswith("/api/v2/organizations"):
+                return 200, {"organizations": [{"id": "org-1", "name": "personal"}]}
+            if url.endswith("/api/v2/organizations/org-1/workspaces"):
+                return 200, {"workspaces": []}
+            if url.endswith("/api/v2/workspaces"):
+                return 200, {"project": {"id": "ws-new", "name": body["projectName"]}}
+            raise AssertionError(f"unexpected REST call {url}")
+        with mock.patch.object(sec, "_http", side_effect=fake_http):
+            r = self.cli("secrets", "setup", "--project", "my-vault")
+        self.assertIsNone(r.exit_code, r.all)
+        proj = json.loads((self.root / ".infisical.json").read_text())
+        self.assertEqual(proj["workspaceId"], "ws-new")
+        self.assertEqual(proj["defaultEnvironment"], "dev")
+        self.assertEqual([b["projectName"] for m, u, b in calls if u.endswith("/api/v2/workspaces")],
+                         ["my-vault"])
+        rc = json.loads((self.ctx / ".celebornrc").read_text())
+        self.assertEqual(rc["secrets"]["provider"], "infisical")
+
+    def test_setup_reuses_existing_same_named_project(self):
+        def fake_http(method, url, headers=None, body=None, timeout=30):
+            if url.endswith("/api/v2/organizations"):
+                return 200, {"organizations": [{"id": "org-1"}]}
+            if url.endswith("/api/v2/organizations/org-1/workspaces"):
+                return 200, {"workspaces": [{"id": "ws-old", "name": "My-Vault"}]}
+            raise AssertionError("should not have tried to create a duplicate")
+        with mock.patch.object(sec, "_http", side_effect=fake_http):
+            r = self.cli("secrets", "setup", "--project", "my-vault")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertEqual(json.loads((self.root / ".infisical.json").read_text())["workspaceId"],
+                         "ws-old")
+
+    def test_setup_is_idempotent_when_already_linked(self):
+        self._link_project()
+        with mock.patch.object(sec, "_http",
+                               side_effect=AssertionError("REST touched on an already-linked repo")):
+            r = self.cli("secrets", "setup")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("already linked", r.all)
+
+    def test_setup_degrades_to_interactive_init_when_rest_fails(self):
+        with mock.patch.object(sec, "_http", return_value=(0, None)):
+            r = self.cli("secrets", "setup", "--project", "x")
+        # The fake's `init` is a no-op that writes no .infisical.json → setup must die with a retry
+        # hint, but only AFTER having tried the interactive fallback.
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn(["init"], self._argv_log())
+        self.assertIn("did not complete", r.all)
+
+
+class TestSecretsProvision(unittest.TestCase):
+    """CELE-t224: pinned-binary provisioning — the CMM fail-safe contract, plus the tarball twist."""
+
+    PIN = None  # built per-test from the tarball bytes
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self._tmp.name)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            data = b"#!/bin/sh\necho fake\n"
+            ti = tarfile.TarInfo("infisical")
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+        self.blob = buf.getvalue()
+        self.pin = {"version": "v9.9.9", "artifacts": {sec.platform_key(): {
+            "url": "https://example.invalid/infisical.tar.gz",
+            "sha256": hashlib.sha256(self.blob).hexdigest()}}}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_provision_extracts_verifies_and_caches(self):
+        res = sec.provision(self.pin, downloader=lambda url: self.blob, cache_dir=self.cache)
+        self.assertEqual(res["status"], "provisioned", res)
+        p = Path(res["path"])
+        self.assertTrue(p.is_file())
+        self.assertTrue(os.access(p, os.X_OK))
+        # Re-run is a cache hit (idempotent), and the resolver agrees.
+        again = sec.provision(self.pin, downloader=lambda url: (_ for _ in ()).throw(AssertionError()),
+                              cache_dir=self.cache)
+        self.assertEqual(again["status"], "cached")
+        self.assertEqual(sec.resolve_cached_binary(self.pin, self.cache), str(p))
+
+    def test_checksum_mismatch_installs_nothing(self):
+        self.pin["artifacts"][sec.platform_key()]["sha256"] = "0" * 64
+        res = sec.provision(self.pin, downloader=lambda url: self.blob, cache_dir=self.cache)
+        self.assertEqual(res["status"], "error")
+        self.assertIn("checksum mismatch", res["reason"])
+        self.assertFalse(sec.cached_binary_path("v9.9.9", self.cache).exists())
+
+    def test_archive_without_binary_member_refused(self):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            ti = tarfile.TarInfo("README.md")
+            ti.size = 2
+            tf.addfile(ti, io.BytesIO(b"hi"))
+        blob = buf.getvalue()
+        self.pin["artifacts"][sec.platform_key()]["sha256"] = hashlib.sha256(blob).hexdigest()
+        res = sec.provision(self.pin, downloader=lambda url: blob, cache_dir=self.cache)
+        self.assertEqual(res["status"], "error")
+        self.assertIn("no `infisical` binary", res["reason"])
+
+    def test_tampered_cache_treated_as_absent(self):
+        res = sec.provision(self.pin, downloader=lambda url: self.blob, cache_dir=self.cache)
+        Path(res["path"]).write_bytes(b"evil")
+        self.assertIsNone(sec.resolve_cached_binary(self.pin, self.cache))
+
+    def test_unknown_platform_skips(self):
+        res = sec.provision({"version": "v1", "artifacts": {}}, downloader=lambda u: b"",
+                            cache_dir=self.cache)
+        self.assertEqual(res["status"], "skipped")
+
+    def test_shipped_pin_is_wellformed(self):
+        pin = sec.load_pin()
+        self.assertEqual(pin.get("schema"), "celeborn-infisical-pin/1")
+        for key in ("darwin-arm64", "darwin-x86_64", "linux-x86_64", "linux-arm64"):
+            art = pin["artifacts"][key]
+            self.assertRegex(art["sha256"], r"^[0-9a-f]{64}$")
+            self.assertTrue(art["url"].startswith(
+                "https://github.com/Infisical/infisical/releases/download/"))
+
+
+class TestSecretsDiscipline(CelebornTestCase):
+    """CELE-t224 §5 — the real point of the card: live secret VALUES on disk get flagged and
+    steered into the vault, in doctor and in the advise signal."""
+
+    SK = "sk-" + "a" * 24   # matches the shipped sk- secret pattern
+
+    def test_env_scan_flags_live_values_not_names(self):
+        (self.root / ".env").write_text(f"ANTHROPIC_API_KEY={self.SK}\nHARMLESS=hello\n")
+        hits = cb._env_file_secret_hits(self.root, cb.load_config(self.ctx)["secret_patterns"])
+        self.assertEqual(hits, [(".env", "ANTHROPIC_API_KEY")])
+
+    def test_env_scan_skips_examples_comments_and_quotes(self):
+        (self.root / ".env.example").write_text(f"KEY={self.SK}\n")
+        (self.root / ".env").write_text(f'# KEY={self.SK}\nQUOTED="{self.SK}"\n')
+        hits = cb._env_file_secret_hits(self.root, cb.load_config(self.ctx)["secret_patterns"])
+        self.assertEqual(hits, [(".env", "QUOTED")])   # example file + comment skipped; quotes stripped
+
+    def test_doctor_warns_and_points_at_the_vault(self):
+        (self.root / ".env").write_text(f"STRIPE_KEY={self.SK}\n")
+        r = self.cli("doctor")
+        self.assertIn("LIVE SECRET VALUE in .env", r.all)
+        self.assertIn("celeborn secrets setup", r.all)     # unconfigured repo → setup nudge
+
+    def test_doctor_nudge_shifts_once_vault_is_configured(self):
+        (self.root / ".env").write_text(f"STRIPE_KEY={self.SK}\n")
+        (self.root / ".infisical.json").write_text('{"workspaceId": "ws"}\n')
+        r = self.cli("doctor")
+        self.assertIn("celeborn secrets set <NAME>", r.all)
+
+    def test_doctor_clean_when_no_env_files(self):
+        r = self.cli("doctor")
+        self.assertIn("no live secret values in repo .env files", r.all)
+
+    def test_advise_signal_fires_and_maps_to_the_intent(self):
+        (self.root / ".env").write_text(f"K={self.SK}\n")
+        sigs = cb._secrets_on_disk_signal(self.ctx)
+        self.assertEqual(len(sigs), 1)
+        self.assertEqual(sigs[0]["signal"], "secrets-on-disk")
+        self.assertEqual(cb._signal_to_intent(sigs[0]), "vault-disk-secrets")
+
+    def test_advise_signal_silent_on_clean_repo(self):
+        self.assertEqual(cb._secrets_on_disk_signal(self.ctx), [])
+
+    def test_secrets_doctor_subcommand_exits_nonzero_on_hits(self):
+        (self.root / ".env").write_text(f"K={self.SK}\n")
+        with mock.patch.object(sec, "_entitled_tier", return_value="pro"):
+            r = self.cli("secrets", "doctor")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("looks like a live secret", r.all)
+
+
+class TestCheckpointForClear(CelebornTestCase):
+    """CELE-t208 — `celeborn checkpoint --for-clear`: the pre-clear routine that snapshots + verify-gates
+    so a /clear loses nothing. Mechanical steps (handoff + panic-save) always run; the verdict/exit code
+    gates on the authored Hot tier being fresh."""
+
+    CLEAN_STATE = ("# Project state — headline\n\n## Now\n"
+                   "- **Focus:** Wiring widget cache invalidation on save.\n"
+                   "- **Next action:** Add the cacheTag call, then test the flow.\n"
+                   "- **Branch:** main · **Status:** in-progress\n")
+
+    def _author_clean(self):
+        self.write("state.md", self.CLEAN_STATE)     # fresh mtime, no placeholders
+
+    def test_clean_tier_is_resumable_exit_zero(self):
+        self._author_clean()
+        r = self.cli("checkpoint", "--for-clear",
+                     "--focus", "Wiring widget cache invalidation", "--next", "Add cacheTag then test")
+        self.assertIsNone(r.exit_code, f"expected clean exit, got: {r.all}")
+        self.assertIn("resumable", r.all)
+        # handoff + snapshot were actually produced
+        self.assertTrue((self.ctx / "handoff.md").is_file())
+        self.assertTrue(list((self.ctx / cb.PANIC_DIR).glob("*/meta.json")))
+        # gate drives stop_allowed true when clean
+        self.assertTrue(json.loads(self.read("session.json"))["stop_allowed"])
+
+    def test_scaffold_placeholders_block_clear(self):
+        # A never-authored scaffold (default state.md + starter session focus) must NOT pass.
+        r = self.cli("checkpoint", "--for-clear")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("NOT yet losslessly resumable", r.all)
+        self.assertIn("scaffold", r.all.lower())
+        self.assertFalse(json.loads(self.read("session.json"))["stop_allowed"])
+
+    def test_empty_session_fields_block_clear(self):
+        self._author_clean()
+        self.write("session.json", json.dumps(
+            {"schema": "celeborn/1", "focus": "", "next_action": "", "stop_allowed": True}) + "\n")
+        r = self.cli("checkpoint", "--for-clear")     # no --focus/--next supplied → stays empty
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("focus is empty", r.all)
+        self.assertIn("next action is empty", r.all)
+
+    def test_stale_state_mtime_blocks_clear(self):
+        self._author_clean()
+        old = time.time() - 40 * 60                   # 40 min ago > default 20 min window
+        os.utime(self.ctx / "state.md", (old, old))
+        r = self.cli("checkpoint", "--for-clear", "--focus", "real work", "--next", "next step")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("last rewritten", r.all)
+
+    def test_stale_window_is_configurable(self):
+        self._author_clean()
+        old = time.time() - 40 * 60
+        os.utime(self.ctx / "state.md", (old, old))
+        rc = self.ctx / ".celebornrc"
+        cfg = json.loads(rc.read_text()); cfg["prep_stale_minutes"] = 120; rc.write_text(json.dumps(cfg))
+        r = self.cli("checkpoint", "--for-clear", "--focus", "real work", "--next", "next step")
+        self.assertIsNone(r.exit_code, f"120-min window should tolerate a 40-min-old headline: {r.all}")
+        self.assertIn("resumable", r.all)
+
+    def test_doing_card_generic_default_stop_blocks_clear(self):
+        self._author_clean()
+        sid = "aaaaaa11-0000-0000-0000-000000000000"
+        self.cli("tasks", "add", "demo card")          # no --stop → gets DEFAULT_STOP
+        tid = json.loads(self.cli("tasks", "json").out)["tasks"][0]["id"]
+        self.cli("claim", tid, "--session", sid)
+        r = self.cli("checkpoint", "--for-clear", "--session", sid,
+                     "--focus", "real work", "--next", "next step")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("generic default Stop", r.all)
+        # A real Stop condition clears the gate.
+        self.cli("tasks", "edit", tid, "--stop", "Feature wired and tested")
+        r2 = self.cli("checkpoint", "--for-clear", "--session", sid,
+                      "--focus", "real work", "--next", "next step")
+        self.assertIsNone(r2.exit_code, f"real Stop should pass: {r2.all}")
+
+    def test_snapshot_taken_even_when_gate_fails(self):
+        # The safety net must exist regardless of the verdict — a failing gate still leaves a restore point.
+        r = self.cli("checkpoint", "--for-clear")
+        self.assertEqual(r.exit_code, 1)
+        self.assertTrue(list((self.ctx / cb.PANIC_DIR).glob("*/meta.json")),
+                        "panic-save snapshot must be written even on a failed gate")
+
+
+class TestPmWake(CelebornTestCase):
+    """CELE-t216 — the event side of the PM. Producers (a git post-commit hook, the board's kanban
+    mutations, an OpenCode user turn, a github/jira pull delta) enqueue a wake into `.pm-wake.json`;
+    `celeborn pm` drains the queue and reports what woke it, and CELE-t217's daemon will watch it."""
+
+    def _wakes(self) -> list[dict]:
+        return cb._pm_wake_peek(self.ctx)
+
+    def test_enqueue_and_list(self):
+        r = self.cli("pm", "wake", "--source", "git-commit", "--detail", "abc123")
+        self.assertIsNone(r.exit_code, r.all)
+        self.cli("pm", "wake", "--source", "kanban", "--detail", "move")
+        self.assertEqual([e["source"] for e in self._wakes()], ["git-commit", "kanban"])
+        listed = self.cli("pm", "wake", "--list")
+        self.assertIn("git-commit", listed.out)
+        self.assertIn("abc123", listed.out)
+        self.assertIn("kanban", listed.out)
+
+    def test_list_empty(self):
+        self.assertIn("no pending PM wake events", self.cli("pm", "wake", "--list").all)
+
+    def test_wake_needs_source(self):
+        r = self.cli("pm", "wake")            # neither --source nor --list
+        self.assertIsNotNone(r.exit_code)
+        self.assertIn("needs --source", r.all)
+
+    def test_backlog_is_capped(self):
+        for i in range(cb.PM_WAKE_MAX + 25):
+            cb._pm_wake_enqueue(self.ctx, "git-commit", str(i))
+        self.assertEqual(len(self._wakes()), cb.PM_WAKE_MAX)
+        self.assertEqual(self._wakes()[-1]["detail"], str(cb.PM_WAKE_MAX + 24))  # newest kept
+
+    def test_pass_drains_and_reports_woke_by(self):
+        cb._pm_wake_enqueue(self.ctx, "git-commit", "abc")
+        cb._pm_wake_enqueue(self.ctx, "kanban", "move")
+        r = self.cli("pm", "--no-model")
+        self.assertIsNone(r.exit_code, r.all)
+        self.assertIn("woken by 2 event(s)", r.out)
+        self.assertIn("git-commit", r.out)
+        self.assertIn("kanban", r.out)
+        self.assertEqual(self._wakes(), [], "a pass must drain the wake queue")
+
+    def test_dry_run_does_not_drain(self):
+        cb._pm_wake_enqueue(self.ctx, "git-commit", "abc")
+        r = self.cli("pm", "--no-model", "--dry-run")
+        self.assertNotIn("woken by", r.out)
+        self.assertEqual([e["source"] for e in self._wakes()], ["git-commit"])
+
+    def test_opencode_user_turn_enqueues_wake(self):
+        cb.dispatch_hook("user-prompt-submit", {"session_id": "S1", "prompt": "hi"},
+                         str(self.root), harness="opencode")
+        self.assertEqual([e["source"] for e in self._wakes()], ["opencode"])
+
+    def test_non_opencode_user_turn_does_not_wake(self):
+        cb.dispatch_hook("user-prompt-submit", {"session_id": "S1", "prompt": "hi"}, str(self.root))
+        self.assertEqual(self._wakes(), [], "only human↔OpenCode turns wake the PM (t216 scope)")
+
+    def test_git_hook_installer_idempotent_and_preserves_foreign(self):
+        import subprocess
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(repo, ignore_errors=True))
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        self.assertEqual(cb._install_git_hooks(repo), "installed")
+        hook = repo / ".git" / "hooks" / "post-commit"
+        self.assertIn("celeborn pm wake --source git-commit", hook.read_text())
+        self.assertTrue(os.stat(hook).st_mode & 0o100, "hook must be executable")
+        self.assertEqual(cb._install_git_hooks(repo), "present")     # idempotent re-run
+        hook.write_text("#!/bin/sh\necho existing\n")                 # a pre-existing foreign hook
+        self.assertEqual(cb._install_git_hooks(repo), "installed")
+        body = hook.read_text()
+        self.assertIn("echo existing", body)                         # preserved
+        self.assertIn(cb.GIT_HOOK_START, body)                       # our block appended
+        self.assertIsNone(cb._install_git_hooks(Path(tempfile.mkdtemp())))  # non-git → no-op
+
+    def test_post_commit_hook_fires_a_wake_end_to_end(self):
+        """The installed hook, run as git would run it, lands a git-commit wake in this project."""
+        import subprocess
+        cli = str(Path(cb.__file__))
+        hook = self.root / ".git" / "hooks" / "post-commit"  # written as if git-initialized here
+        subprocess.run(["git", "-C", str(self.root), "init", "-q"], check=True)
+        self.assertEqual(cb._install_git_hooks(self.root), "installed")
+        # Run the hook body against THIS project, but route `celeborn` through the source module so the
+        # test doesn't depend on an installed console-script being on PATH.
+        env = dict(os.environ, PATH=os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""))
+        wrapper = self.root / "celeborn"
+        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{cli}" --path "{self.root}" "$@"\n')
+        os.chmod(wrapper, 0o755)
+        env["PATH"] = str(self.root) + os.pathsep + env["PATH"]
+        subprocess.run(["sh", str(hook)], cwd=str(self.root), env=env, check=True,
+                       capture_output=True)
+        self.assertEqual([e["source"] for e in self._wakes()], ["git-commit"])
+
+
+# --------------------------------------------------------------------------- spine branding (CELE-t380)
+
+class TestSpineEmojiHelpers(unittest.TestCase):
+    """Pure helpers: leading-emoji detection, collision, summary — no project context needed."""
+
+    def test_leading_emoji(self):
+        self.assertEqual(cb._leading_emoji("⚙️ Install engine"), "⚙️")
+        self.assertEqual(cb._leading_emoji("🏹 Some spine"), "🏹")
+        self.assertEqual(cb._leading_emoji("  ✅ trimmed"), "✅")
+        self.assertEqual(cb._leading_emoji("plain title"), "")
+        self.assertEqual(cb._leading_emoji(""), "")
+
+    def _cards(self):
+        return [
+            {"id": "t1", "state": "todo", "spine": "install", "emoji": "⚙️"},
+            {"id": "t2", "state": "doing", "spine": "install", "emoji": "⚙️"},
+            {"id": "t3", "state": "todo", "spine": "ship", "emoji": "🚀"},
+            {"id": "t4", "state": "todo", "spine": "", "emoji": ""},
+        ]
+
+    def test_brand_conflict_and_error(self):
+        cards = self._cards()
+        # same spine reusing its own emoji is fine; a different spine taking a used emoji conflicts
+        self.assertEqual(cb._spine_brand_conflict(cards, "⚙️", "install"), "")
+        self.assertEqual(cb._spine_brand_conflict(cards, "⚙️", "new"), "install")
+        self.assertEqual(cb._brand_error(cards, "install", "⚙️"), "")
+        self.assertIn("already the brand", cb._brand_error(cards, "new", "🚀"))
+        self.assertIn("single glyph", cb._brand_error(cards, "s", "a b"))
+        self.assertIn("needs a --spine", cb._brand_error(cards, "", "🎯"))
+        self.assertEqual(cb._brand_error(cards, "fresh", "🎯"), "")
+
+    def test_summary_and_emoji_for_slug(self):
+        cards = self._cards()
+        rows = cb._spines_summary(cards)
+        self.assertEqual([r["slug"] for r in rows], ["install", "ship"])
+        install = rows[0]
+        self.assertEqual(install["emoji"], "⚙️")
+        self.assertEqual(install["total"], 2)
+        self.assertEqual(install["counts"], {"todo": 1, "doing": 1, "done": 0})
+        self.assertEqual(cb._emoji_for_slug(cards, "install"), "⚙️")
+        self.assertEqual(cb._emoji_for_slug(cards, "nope"), "")
+
+
+class TestSpineEmojiRoundTrip(unittest.TestCase):
+    """tasks.md parse/render carries spine/emoji, and unbranded cards stay byte-identical."""
+
+    def test_round_trip_and_legacy_byte_safety(self):
+        md = cb.TASKS_HEADER + (
+            "\n## [t1] ⚙️ Install engine\n"
+            "- state: todo\n- owner:\n- tags:\n- blocked-by:\n- phase:\n"
+            "- spine: install\n- emoji: ⚙️\n- stop: x\n"
+            "- created: 2026-01-01T00:00:00\n- updated: 2026-01-01T00:00:00\n"
+            "\n## [t2] plain legacy card\n"
+            "- state: todo\n- owner:\n- tags:\n- blocked-by:\n- phase:\n- stop: y\n"
+            "- created: 2026-01-01T00:00:00\n- updated: 2026-01-01T00:00:00\n"
+        )
+        tasks = cb._parse_tasks(md)
+        self.assertEqual(tasks[0]["spine"], "install")
+        self.assertEqual(tasks[0]["emoji"], "⚙️")
+        self.assertEqual(tasks[1]["spine"], "")
+        self.assertEqual(tasks[1]["emoji"], "")
+        out = cb._render_tasks(tasks)
+        # branded card carries the lines; legacy card gains neither (no drift)
+        self.assertIn("- spine: install", out)
+        self.assertIn("- emoji: ⚙️", out)
+        legacy_block = out.split("## [t2]")[1]
+        self.assertNotIn("spine:", legacy_block)
+        self.assertNotIn("emoji:", legacy_block)
+        # stable across a second parse
+        self.assertEqual(cb._parse_tasks(out)[0]["emoji"], "⚙️")
+
+
+class TestSpineEmojiCLI(CelebornTestCase):
+    """End-to-end: add/edit/spine commands enforce per-project emoji uniqueness and render the glyph."""
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+
+    def test_add_brand_inherit_collision(self):
+        self.assertEqual(self.cli("tasks", "add", "A", "--spine", "install", "--emoji", "⚙️").exit_code, None)
+        # a second card in the same spine with no --emoji inherits the spine brand
+        self.cli("tasks", "add", "B", "--spine", "install")
+        # a different spine cannot reuse a taken emoji
+        r = self.cli("tasks", "add", "C", "--spine", "other", "--emoji", "⚙️")
+        self.assertEqual(r.exit_code, 1)
+        self.assertIn("already the brand", r.all)
+        # a free emoji is accepted
+        self.assertNotEqual(self.cli("tasks", "add", "D", "--spine", "ship", "--emoji", "🚀").exit_code, 1)
+        doc = json.loads(self.cli("tasks", "json").out)
+        by_title = {t["title"]: t for t in doc["tasks"]}
+        self.assertEqual(by_title["B"]["emoji"], "⚙️")          # inherited
+        self.assertEqual(by_title["B"]["spine_id"], "install")   # slug rides spine_id, not spine
+        self.assertNotIsInstance(by_title["A"].get("spine"), str)  # spine key stays the t282 stamp
+
+    def test_spine_ls_set_and_backfill(self):
+        self.cli("tasks", "add", "A", "--spine", "install", "--emoji", "⚙️")
+        self.cli("tasks", "add", "B", "--spine", "ship", "--emoji", "🚀")
+        ls = self.cli("spine", "ls")
+        self.assertIn("install", ls.out)
+        self.assertIn("ship", ls.out)
+        # rebrand ship, then a collision on rebrand is rejected
+        self.assertNotEqual(self.cli("spine", "set", "ship", "--emoji", "📦").exit_code, 1)
+        self.assertEqual(self.cli("spine", "set", "ship", "--emoji", "⚙️").exit_code, 1)
+        # backfill adopts a leading title glyph into the emoji field
+        self.cli("tasks", "add", "🔑 Keys work")
+        bf = self.cli("spine", "backfill")
+        self.assertIn("🔑", bf.out)
+        doc = json.loads(self.cli("tasks", "json").out)
+        keys = next(t for t in doc["tasks"] if "Keys work" in t["title"])
+        self.assertEqual(keys["emoji"], "🔑")
+        self.assertEqual(keys["title"], "Keys work")  # glyph moved out of the title (no double-render)
+
+    def test_edit_emoji_collision(self):
+        self.cli("tasks", "add", "A", "--spine", "install", "--emoji", "⚙️")
+        r = self.cli("tasks", "add", "B")  # unbranded
+        tid = r.out.split("[")[1].split("]")[0].split("-")[-1]
+        clash = self.cli("tasks", "edit", tid, "--spine", "dup", "--emoji", "⚙️")
+        self.assertEqual(clash.exit_code, 1)
+        self.assertIn("already the brand", clash.all)
+        self.assertNotEqual(self.cli("tasks", "edit", tid, "--spine", "misc", "--emoji", "🧪").exit_code, 1)
 
 
 if __name__ == "__main__":

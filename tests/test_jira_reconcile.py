@@ -78,6 +78,38 @@ class JiraReconcileTestCase(unittest.TestCase):
         self.assertEqual(len(report["celeborn_unlinked"]), 1)
         self.assertEqual(report["celeborn_unlinked"][0]["id"], "t2")
 
+    def test_pull_delta_wakes_pm(self):
+        # CEL-1 is linked to t1; return it with a changed summary → a real pull delta (CELE-t216).
+        changed = [{"key": "CEL-1", "fields": {
+            "summary": "Linked card RENAMED",
+            "status": {"statusCategory": {"key": "indeterminate"}},
+            "issuetype": {"name": "Task"}, "parent": None}}]
+
+        class A:
+            path = str(self.root)
+            dry_run = False
+
+        with mock.patch.object(cj, "_search_issues", return_value=changed):
+            cj._cmd_pull(A())
+        t1 = next(t for t in cb._load_tasks(self.ctx) if t["id"] == "t1")
+        self.assertEqual(t1["title"], "Linked card RENAMED")
+        self.assertEqual([e["source"] for e in cb._pm_wake_peek(self.ctx)], ["jira"])
+
+    def test_pull_no_delta_does_not_wake_pm(self):
+        # Only the already-synced CEL-1 (matching title + state) → no create, no update, no wake.
+        same = [{"key": "CEL-1", "fields": {
+            "summary": "Linked card",
+            "status": {"statusCategory": {"key": "indeterminate"}},
+            "issuetype": {"name": "Task"}, "parent": None}}]
+
+        class A:
+            path = str(self.root)
+            dry_run = False
+
+        with mock.patch.object(cj, "_search_issues", return_value=same):
+            cj._cmd_pull(A())
+        self.assertEqual(cb._pm_wake_peek(self.ctx), [])
+
     def test_perform_connect_includes_reconcile_before_first_apply(self):
         (self.ctx / cb.RC_NAME).write_text("{}\n")
         with mock.patch.object(cj, "jira_request") as req:

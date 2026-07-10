@@ -521,6 +521,11 @@ def _cmd_pull(args):
     if created or updated:
         cb._save_tasks(ctx, tasks)
         cb.ok(f"Wrote {len(created)} new + {len(updated)} updated card(s) to tasks.md")
+        # CELE-t216: a real pull delta means Jira moved cards under us — wake the PM to re-march.
+        try:
+            cb._pm_wake_enqueue(ctx, "jira", f"{len(created)} new + {len(updated)} updated")
+        except Exception:  # noqa: BLE001
+            pass
     return 0
 
 

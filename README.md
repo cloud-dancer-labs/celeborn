@@ -10,7 +10,7 @@ place across days or weeks — instead of degrading as the context window fills 
 > ### Is this the Celeborn you're looking for?
 > **Yes — if you want memory for an AI coding agent.** *Celeborn Code* is this project: a context
 > substrate for AI coding agents (Claude Code, Codex, Grok). Install it with **`uv tool install celeborn`**
-> or **`pip install celeborn`**; home is **[celeborn.thot.ai](https://celeborn.thot.ai)** and
+> or **`pip install celeborn`**; home is **[celeborncode.ai](https://celeborncode.ai)** and
 > **[github.com/cloud-dancer-labs/celeborn](https://github.com/cloud-dancer-labs/celeborn)**.
 >
 > It is **not** these same-named projects:
@@ -161,7 +161,8 @@ auto-load), a browser sign-in (`login --github`), and then opens your kanban boa
 `--no-login` (purely local-first, skip the account), `--project` (wire just this repo, not `~/.claude`),
 `--name "<name>"` / `--no-open` (board), `--no-skills` / `--no-permission-baseline` (wiring). **Grok
 users:** for Grok's full hooks (not just project rules) also run `bash grok/scripts/install.sh` (see
-[Grok Build](#grok-build)). Run `celeborn init --help` for the full list.
+[Grok Build](#grok-build)). Run `celeborn init --help` for the full list. *(Only need the per-project
+files, agent already wired? `celeborn scaffold` does just the scaffold step.)*
 
 Everything below is the **detailed / manual breakdown** of what `init` runs — read it when you want to
 run the pieces by hand, wire CI, or tune the defaults.
@@ -245,21 +246,24 @@ same verbs by hand.
 
 ```bash
 cd your-project
-celeborn init        # creates .context/ + annotates CLAUDE.md  (--private in a public repo)
+celeborn scaffold    # creates .context/ (always private) + annotates CLAUDE.md
 celeborn status      # what an agent loads on Orient
 ```
 
-When you run `celeborn init` at a terminal it **asks for a project name** (defaulting to the folder
-name) and then **opens the project's localhost kanban board** — that board is Celeborn's UI, where you
-see the control surfaces (tasks, run/fleet, settings), and the SessionStart hook keeps it live from
-then on. Pass `--name "<name>"` to skip the prompt, `--no-browser` to start the board without popping a
-tab, or `--no-open` to skip the board entirely. Non-interactive installs (CI, scripts, headless agents)
-skip the prompt and the browser automatically — the board still comes up on the next session's Orient.
+`celeborn init` already runs this scaffold step; `celeborn scaffold` is the same step on its own, for
+when your agent is already wired and you just want a new project's files. When you run it at a terminal
+it **asks for a project name** (defaulting to the folder name) and then **opens the project's localhost
+kanban board** — that board is Celeborn's UI, where you see the control surfaces (tasks, run/fleet,
+settings), and the SessionStart hook keeps it live from then on. Pass `--name "<name>"` to skip the
+prompt, `--no-browser` to start the board without popping a tab, or `--no-open` to skip the board
+entirely. Non-interactive installs (CI, scripts, headless agents) skip the prompt and the browser
+automatically — the board still comes up on the next session's Orient.
 
-From here Celeborn records every turn and rehydrates on each new session. `init` also **engages
-Codebase Memory (CMM)** for the project if the CMM binary is installed (step 4) — pre-clearing its
-read-only tools so structural questions never stop to ask permission. Opt out per project with
-`celeborn init --no-cmm` (or globally with `CELEBORN_NO_CMM=1`); reverse anytime with `celeborn cmm off`.
+Your `.context/` is **always private** — gitignored, never committed (see the note below). From here
+Celeborn records every turn and rehydrates on each new session. Scaffolding also **engages Codebase
+Memory (CMM)** for the project if the CMM binary is installed (step 4) — pre-clearing its read-only
+tools so structural questions never stop to ask permission. Opt out per project with
+`celeborn scaffold --no-cmm` (or globally with `CELEBORN_NO_CMM=1`); reverse anytime with `celeborn cmm off`.
 
 **4 — Strongly recommended: install Codebase Memory (CMM).** This is the single biggest accelerator
 Celeborn can give a vibe coder, and it's worth understanding why:
@@ -305,14 +309,15 @@ and reminds you to install CMM for the structural half.
 > <cmd>` without installing anything — handy for a quick look. For real use, do the one-time [Install](#install)
 > above so the hooks work, then it's just `celeborn <cmd>`.
 
-> **Public repo? Keep your memory private.** `.context/` travels in git by default, which is great
-> for a *private* repo. In a **public** repo that would publish your working journal — so use
-> `celeborn init --private` to gitignore `.context/` and carry it across machines with `celeborn sync`
-> instead. `init` auto-detects a public repo (via the `gh` CLI) and defaults to private there.
+> **Your memory is always private — never in git.** `.context/` holds your prompts, notes, and working
+> memory, so Celeborn **always gitignores it** — there is no option to commit it. (Committing it to a repo
+> that is, or ever becomes, public would leak all of that permanently into git history.) It lives on your
+> machine and travels **between your devices via your free account** — `celeborn init --github` (or
+> `celeborn login --github` later), then `celeborn sync` — **not** git. See the [FAQ](#faq) for the why.
 
 ```bash
 # from your project root
-python3 /path/to/celeborn/scripts/celeborn.py init     # scaffold .context/ (--private to keep it out of git)
+python3 /path/to/celeborn/scripts/celeborn.py scaffold  # scaffold .context/ (always gitignored/private)
 python3 /path/to/celeborn/scripts/celeborn.py status   # what an agent loads on Orient
 python3 /path/to/celeborn/scripts/celeborn.py index    # build the search index
 python3 /path/to/celeborn/scripts/celeborn.py search "that decision about auth"
@@ -373,7 +378,7 @@ publishes, the latter is contributed back via fork → PR. See
 
 ### Sync across devices (optional)
 
-Once `.context/` is private (gitignored), git no longer carries it between machines — so Celeborn can.
+Because `.context/` is always private (gitignored), git never carries it between machines — so Celeborn can.
 **Local use is free; hosted sync is a paid subscription** (cross-device + real-time), because that's the
 part that costs real money to run:
 
@@ -383,9 +388,33 @@ part that costs real money to run:
   adds nothing to the offline core but pre-wires the one-step upgrade to hosted sync.
 - **Pro — $8/seat/mo:** `celeborn login` → `celeborn sync`. Hosted, cross-device, real-time,
   zero-setup; unlimited projects. Secrets are redacted out before upload; your local SQLite index is
-  never synced.
+  never synced. Pro also includes the [encrypted secrets manager](#encrypted-secrets-manager-pro)
+  (`celeborn secrets`).
 - **Team — $12/seat/mo:** everything in Pro, plus shared projects, org admin, shared context, and shared
   agent telepathy (the multi-agent bus). **Enterprise:** SSO + custom terms — [get in touch](#support).
+
+### Encrypted secrets manager (Pro)
+
+New to secrets? The rule is: **API keys never belong in your repo, your `.env`, or a chat prompt.**
+Celeborn Pro gives them one safe home — an encrypted vault ([Infisical](https://infisical.com), your
+own free account) — and reads them back *locally, at run time* when a command needs them:
+
+```bash
+celeborn secrets setup                      # once: browser login + Celeborn creates your vault project
+celeborn secrets set ANTHROPIC_API_KEY      # hidden prompt — the value never touches your repo's disk
+celeborn secrets run -- vercel deploy       # runs with vault secrets injected as env vars
+```
+
+`setup` is fully hands-off: it provisions a pinned, checksum-verified `infisical` CLI, opens the
+browser login (signup happens right there), creates the vault project over Infisical's API with your
+own session, and writes the committable `.infisical.json` (project id only — no sensitive data). You
+never see a dashboard. `secrets list` shows names, never values; `secrets status` shows the wiring;
+self-hosters can point `--host` at their own Infisical.
+
+Celeborn also **enforces the discipline**: `celeborn doctor` (and the advisor nudges every agent
+harness gets) flag any live-looking secret *value* sitting in a repo `.env*` file and walk you
+through moving it into the vault. Non-secret config stays in `.celebornrc`; the login token lives in
+your OS keyring, managed by the Infisical CLI itself — Celeborn never stores a vault secret anywhere.
 
 ### The economy estimate
 
@@ -468,17 +497,33 @@ the `celeborn hook user-prompt-submit` hook (`UserPromptSubmit`) reads the live 
 transcript each turn and speaks at most once per band; on other agents the skill invites the same
 `celeborn remind` call by hand.
 
-Two knobs, passed as flags wherever `remind` is invoked:
+Three knobs, resolved wherever `remind` is invoked:
 
-- **`--soft-limit <n>`** — the ceiling. At or above it the nudge drops the poetry and turns urgent
-  (*"you're at ~165,000 tokens, past your 150,000-token limit"*). Omit it for gentle milestone verses only.
+- **`--soft-limit <n>` / `--hard-limit <n>`** — the context-pressure thresholds. Newly crossing one
+  turns the nudge into an explicit warning: ⚠ at soft (*wrap the current step, checkpoint, then
+  clear*), ⛔ at hard (*stop and checkpoint NOW*). Defaults come from `.celebornrc` —
+  `context_soft_tokens` (100k) and `context_hard_tokens` (125k), the same lines the board's
+  "clear now"/"clear urgent" bands draw — so configure them once per project; the flags override
+  per call, and ≤ 0 disables a threshold. The DOING cards on the board carry matching ⚠/⛔ chips.
 - **`--every <n>`** — the band (default 100k; the hook uses 50k). The nudge fires once per band
   crossed, then stays silent until the next — so it never nags.
 
-The `UserPromptSubmit` hook uses a 50k band and a 150k soft limit by default (baked into
-`celeborn hook user-prompt-submit`). To use your own thresholds, call `remind` directly with the flags:
-`celeborn remind --tokens <n> --soft-limit 120000 --every 50000`. Full design:
+The `UserPromptSubmit` hook reads the thresholds from `.celebornrc` automatically — on Claude Code
+from the live transcript, on OpenCode from the window the session reported via `celeborn record
+tokens` (the warning rides the per-turn envelope into the TUI). Full design:
 [`references/reminders.md`](references/reminders.md).
+
+**Seamless clear-and-continue (OpenCode, opt-in).** On OpenCode, Celeborn can take the last step for
+you: when a session crosses the hard threshold it clears *itself* and resumes the same card, no human
+in the loop. Turn it on with `"opencode_autoclear": true` in `.celebornrc`. Then, at the next turn
+boundary (never mid-turn), the plugin runs `celeborn autoclear`, which verify-gates that a clear
+would lose nothing (the same freshness check as `celeborn checkpoint --for-clear`) and — if the Hot
+tier is fresh — regenerates the handoff, takes a restorable snapshot, and queues a resume brief to the
+session's outbox. The plugin then compacts the session (losslessly: the compaction summary *is* your
+Celeborn memory, verbatim) and re-prompts it to continue, draining that brief on the first turn back.
+If the Hot tier is stale, `autoclear` instead hands the coder the exact fix-list so it freshens and
+retries — so a clear never strands you in a stub. `autoclear_cooldown_minutes` (default 10) keeps it
+from thrashing. Claude Code keeps the calm human-run `/clear` nudge above.
 
 ### Troubleshooting
 
@@ -555,6 +600,38 @@ this README any other way than by saying thank you.
 
 ---
 
+## FAQ
+
+**What's the one command to get started?**
+`celeborn init`, run in your project. It wires your coding agent, scaffolds this project, signs you in
+(optional), and opens your kanban board — all in one pass, and it's safe to re-run. That's it. (If your
+agent is already wired and you only want a new project's files, `celeborn scaffold` does just that step.)
+
+**Is my code or memory ever uploaded or made public?**
+No. Everything runs locally by default. Your `.context/` (prompts, notes, working memory) is **always
+gitignored — never committed, and there is no option to commit it.** Cross-device sync is opt-in, goes
+only to *your* private account, and redacts secrets before upload.
+
+**Why can't I commit `.context/` to git, even if I want to?**
+Because it's the single easiest way to leak your working memory forever. `.context/` contains your
+prompts, notes, and decisions. If it's committed to a repo that is public — or private today but made
+public later, or forked, or its history published — all of that becomes permanently world-visible in git
+history, and history is very hard to scrub. Rather than leave that footgun armed, Celeborn keeps
+`.context/` private by design and moves it between your machines a safer way (below). There is no
+`--public` flag.
+
+**Then how does my memory follow me to another machine?**
+Through your free account, not git. Run `celeborn init --github` (or `celeborn login --github` later),
+then `celeborn sync`. Local use is free and fully offline; hosted cross-device/real-time sync is the paid
+tier — see [Sync across devices](#sync-across-devices-optional).
+
+**Where do I actually *use* Celeborn once it's installed?**
+Your **kanban board** (`celeborn board` opens it) is Celeborn's UI — tasks, run/fleet, and settings live
+there, and your coding agent orients from `.context/` automatically at the start of every session. You
+mostly just talk to your agent; Celeborn remembers.
+
+---
+
 ## Support
 
 Celeborn is **source-available under the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE)** (© Cloud Dancer; distributed by Thot Technologies LLC).
@@ -571,7 +648,7 @@ It earns its keep in tokens and time. If you want to know how much, run `celebor
 - **Pro — $8/seat/mo** — hosted sync: cross-device, real-time, zero-setup, unlimited projects.
 - **Team — $12/seat/mo** — Pro plus shared projects, org admin, shared context, and shared agent
   telepathy (the multi-agent bus).
-- **Enterprise** — SSO/SAML, custom terms, volume pricing. **Email sales@thot.ai.**
+- **Enterprise** — SSO/SAML, custom terms, volume pricing. **Ask in the support chat at [celeborncode.ai/faq](https://celeborncode.ai/faq).**
 
 Create a free account with `celeborn register` (email + password + MFA) or `celeborn login --github`,
 then `celeborn upgrade` when you want hosted sync. ⭐ Starring the repo and telling another developer is

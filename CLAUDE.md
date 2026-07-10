@@ -7,11 +7,14 @@ files do nothing on their own. Start at **[README.md → Install](README.md#inst
 
 ## Contact & identity — hard rule
 
-Celeborn's **only** public / sales / enterprise / contact email is **`sales@thot.ai`**. Never put a
-personal or work email address — the maintainer's or anyone else's — anywhere associated with Celeborn:
-marketing copy, source, docs, commit metadata, or the `.context/` tiers. Associating a personal/work
-identity with this project creates real legal risk. If you find one, replace it with `sales@thot.ai`
-(or redact it in historical/context records) and flag it.
+Celeborn's public contact is the **support chat** (celeborncode.ai/faq and the board's Support
+pill) — **chat only, no email**. Where an email address is genuinely essential (machine-readable
+contact fields like llms.txt, package-registry metadata, chat-is-down fallbacks), the **only**
+permitted address is **`hello@thot.ai`**. Never use `sales@thot.ai` in anything new, and never put a
+personal or work email address — the maintainer's or anyone else's — anywhere associated with
+Celeborn: marketing copy, source, docs, commit metadata, or the `.context/` tiers. Associating a
+personal/work identity with this project creates real legal risk. If you find one, replace it with
+`hello@thot.ai` (or redact it in historical/context records) and flag it.
 
 ## Task references — always use the full ID (CELE-tN)
 

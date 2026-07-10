@@ -711,7 +711,7 @@ def _delete_project(cfg: dict, jwt: str, project_id: str) -> None:
 
 
 def cmd_project(args):
-    """Manage hosted projects on celeborn.thot.ai: `list` them, or `rm <name|id>` to remove one. Removal
+    """Manage hosted projects on celeborncode.ai: `list` them, or `rm <name|id>` to remove one. Removal
     cascades to the project's context files, tasks, GitHub links, and Jira connection. Operates purely
     against the hosted API (no local .context/ required), so a project whose repo was deleted can still
     be removed."""
@@ -794,7 +794,7 @@ def _pull(ctx: Path, cfg: dict, jwt: str, project_id: str) -> int:
 
 
 def _push_tasks(ctx: Path, cfg: dict, jwt: str, project_id: str, patterns: list[str]) -> int:
-    """Push the local task board to the hosted `tasks` table (0006) so it renders on celeborn.thot.ai
+    """Push the local task board to the hosted `tasks` table (0006) so it renders on celeborncode.ai
     (t61 Phase 1). Upserts a row per local task, then PRUNES rows whose task no longer exists locally
     so the hosted board mirrors `.context/tasks.md` (the local truth). No tasks.md → no-op (never
     wipes the table). RLS gates this Pro, exactly like the file push."""
@@ -861,7 +861,7 @@ def build_architecture_row(ctx: Path, project_id: str, patterns: list[str]) -> d
 
 def _push_architecture(ctx: Path, cfg: dict, jwt: str, project_id: str, patterns: list[str]) -> int:
     """Push the per-project architecture diagram to the hosted `project_architecture` table (0013) so it
-    renders on celeborn.thot.ai (CELE-t187). One row per project (upsert on project_id). No
+    renders on celeborncode.ai (CELE-t187). One row per project (upsert on project_id). No
     infra-local.json → no-op. RLS gates this Pro, exactly like the file/task pushes."""
     row = build_architecture_row(ctx, project_id, patterns)
     if not row:
@@ -955,7 +955,7 @@ def _session_quiet(cfg: dict) -> str | None:
 
 def schedule_hosted_push(ctx: Path, task_ids: list[str]) -> None:
     """Best-effort: after a local task mutation (claim/move/ship/edit), push the changed cards to the
-    hosted `tasks` table so celeborn.thot.ai reflects them in ~realtime (the Supabase Realtime channel
+    hosted `tasks` table so celeborncode.ai reflects them in ~realtime (the Supabase Realtime channel
     delivers the row change to every open board). Spawns a DETACHED `celeborn hosted-push` so the CLI
     never blocks or hangs on the network. Cheap local gates first — spawns nothing when hosted sync
     isn't configured or there's no stored session, so free / offline users pay ~nothing."""
@@ -1123,7 +1123,7 @@ _TASK_PULL_SELECT = "task_id,title,state,owner,tags,blocked_by,phase,stop,progre
 
 def _pull_tasks(ctx: Path, cfg: dict, jwt: str, project_id: str) -> tuple[int, list[dict]]:
     """Pull the hosted `tasks` rows and reconcile them back into `.context/tasks.md` — the inverse of
-    `_push_tasks` (t61 Phase 2 write-back). A drag/edit/create made on celeborn.thot.ai lands in the
+    `_push_tasks` (t61 Phase 2 write-back). A drag/edit/create made on celeborncode.ai lands in the
     LOCAL source of truth via the existing `_load_tasks`/`_save_tasks` round-trip (LWW on `updated`,
     keyed on task_id; see `reconcile_tasks`).
 
@@ -1328,7 +1328,7 @@ def _warn_identity_split(provider: str) -> None:
     though your projects synced fine. Print the exact, copy-pasteable fix. No-op for a GitHub session."""
     if provider == "github":
         return
-    cb.warn("you're signed in with email + password — but celeborn.thot.ai signs in with GitHub.")
+    cb.warn("you're signed in with email + password — but celeborncode.ai signs in with GitHub.")
     print("  These can be two separate accounts, so your web board may look EMPTY even though sync worked.")
     print("  To use the same identity the website does:")
     print("      celeborn login --github")
@@ -1336,8 +1336,52 @@ def _warn_identity_split(provider: str) -> None:
     print("      celeborn account migrate")
 
 
+def _whoami_json(args) -> dict:
+    """The board-facing identity read (CELE-t355): a THIN, best-effort snapshot for the Account section.
+    Renders from local credentials so it works offline; when online it upgrades to the authoritative
+    GoTrue `/user` payload to name the true sign-in provider (the input to the CELE-t107 identity-split
+    notice). Never dies — a logged-out or offline board still gets a well-formed object it can render."""
+    creds = load_creds()
+    logged_in = bool(creds.get("access_token") or creds.get("refresh_token"))
+    out = {
+        "logged_in": logged_in,
+        "online": False,
+        "email": creds.get("email"),
+        "user_id": creds.get("user_id"),
+        "username": creds.get("username") or creds.get("login"),
+        "provider": None,
+        # differs=True → email identity vs the GitHub identity the website uses (t107). null = unknown offline.
+        "identity_split": {"differs": None, "fix": "celeborn login --github"},
+    }
+    if not logged_in:
+        return out
+    try:
+        cfg = _resolve_cfg(args)
+        tok = _ensure_session(cfg)
+        s, u = _auth("GET", cfg, "user", bearer=tok)
+        if s == 200 and u:
+            md = u.get("user_metadata") or {}
+            provider = _provider_of(u)
+            out.update({
+                "online": True,
+                "email": u.get("email") or out["email"],
+                "user_id": u.get("id") or out["user_id"],
+                "username": md.get("username") or out["username"],
+                "provider": provider,
+            })
+            out["identity_split"]["differs"] = (provider != "github")
+    except SystemExit:
+        pass  # _ensure_session may die() when the session is unrecoverable — degrade to the local view
+    except Exception:
+        pass  # any network / parse failure → keep the offline local snapshot
+    return out
+
+
 def cmd_whoami(args):
     """Show the signed-in account: email, username, sign-in provider, MFA status, and tier."""
+    if getattr(args, "json", False):
+        print(json.dumps(_whoami_json(args), indent=2))
+        return
     cfg = _resolve_cfg(args)
     creds = load_creds()
     if not creds.get("access_token") and not creds.get("refresh_token"):
@@ -1399,7 +1443,7 @@ def cmd_account_migrate(args):
     moved = d.get("moved", 0)
     if moved:
         cb.ok(f"moved {moved} project(s) into {ku.get('email')} [{keeper_provider}].")
-        print("  Refresh celeborn.thot.ai — your board now shows them.")
+        print("  Refresh celeborncode.ai — your board now shows them.")
     else:
         cb.ok("no projects were owned by the old account — nothing to move.")
         print("  (If your board is still empty, the projects may be under a third identity — run "

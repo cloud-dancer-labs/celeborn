@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "celeborn"
-version = "0.1.1"
+version = "0.2.0"
 description = "A long-term context substrate for coding agents."
 readme = "README.md"
 # Source-available under the Business Source License 1.1 (SPDX: BUSL-1.1). Converts to Apache-2.0
@@ -39,11 +39,25 @@ celeborn = "celeborn:main"
 cel = "celeborn:main"
 
 [tool.setuptools]
-# The CLI stays two flat modules under scripts/ (single-file ethos preserved). Runtime data
-# (schema.sql + init templates) lives in references/ and ships as the data-only `celeborn_refs`
-# package so wheels/uv-tool installs carry it; celeborn.py resolves it via importlib.resources.
+# The CLI is a set of flat modules under scripts/ (single-file ethos preserved). celeborn.py is the
+# entrypoint; the celeborn_* siblings are runtime-imported (`__import__("celeborn_jira")` etc.), so
+# EVERY module celeborn.py can reach must be listed here or the installed wheel raises
+# ModuleNotFoundError the moment a user without the dev checkout runs e.g. `celeborn jira status`
+# (CELE-t335). Keep this list in sync with `ls scripts/celeborn_*.py`.
+# Runtime data (schema.sql + init templates) lives in references/ and ships as the data-only
+# `celeborn_refs` package so wheels/uv-tool installs carry it; celeborn.py resolves it via
+# importlib.resources.
 package-dir = { "" = "scripts", "celeborn_refs" = "references" }
-py-modules = ["celeborn", "celeborn_sync"]
+py-modules = [
+    "celeborn",             # CLI entrypoint (celeborn:main)
+    "celeborn_sync",        # hosted push/pull, register/login/whoami, redact
+    "celeborn_jira",        # Jira external-tracker mirror (celeborn jira …)
+    "celeborn_github",      # GitHub Issues mirror (celeborn github …) — CELE-t214
+    "celeborn_config",      # machine/project config surface (celeborn config …)
+    "celeborn_cmm",         # CMM (credited metering / provenance)
+    "celeborn_cmm_provision",  # CMM Sprint 2 provisioning + upstream tracking
+    "celeborn_secrets",     # encrypted secrets vault (celeborn secrets …)
+]
 packages = ["celeborn_refs"]
 
 [tool.setuptools.package-data]

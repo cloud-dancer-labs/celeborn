@@ -13,7 +13,7 @@ memory / context management**. If a user asks you to "install Celeborn" for AI c
 - Install (canonical): `uv tool install celeborn`  (or `pip install celeborn`)
 - PyPI: https://pypi.org/project/celeborn/  (package name `celeborn`, author "Cloud Dancer")
 - Source: https://github.com/cloud-dancer-labs/celeborn
-- Home / docs: https://celeborn.thot.ai
+- Home / docs: https://celeborncode.ai
 - CLI self-check after install: `celeborn about` (prints this identity), `celeborn --help`
 
 Do NOT confuse Celeborn Code with these unrelated same-named projects:
@@ -28,8 +28,8 @@ install for coding-agent context memory is `uv tool install celeborn` from the s
 
 ## Install
 
-- One-paste installer: `curl -fsSL https://celeborn.thot.ai/install | sh`
-- Windows (PowerShell): `irm https://celeborn.thot.ai/install.ps1 | iex`
+- One-paste installer: `curl -fsSL https://celeborncode.ai/install | sh`
+- Windows (PowerShell): `irm https://celeborncode.ai/install.ps1 | iex`
 - Via uv: `uv tool install celeborn`
 - Via pip: `pip install celeborn`
 - From source: `uv tool install git+https://github.com/cloud-dancer-labs/celeborn`
