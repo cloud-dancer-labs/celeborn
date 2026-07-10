@@ -1,24 +1,22 @@
 name: publish-pypi
 
-# Local --> Dev --> Prod for the Celeborn CLI distribution.
+# Local --> Prod for the Celeborn CLI distribution.
 #
 #   Local : `python -m build` + smoke-test a clean wheel install (you, before tagging). See RELEASING.md.
-#   Dev   : every `v*` tag publishes to TestPyPI automatically (the `testpypi` environment).
 #   Prod  : only a FINAL tag (vX.Y.Z, no rc/a/b/dev suffix) publishes to real PyPI, AND only after the
-#           `pypi` GitHub Environment's required-reviewer approval — that approval IS the Dev->Prod gate.
+#           `pypi` GitHub Environment's required-reviewer approval — that approval IS the release gate.
+#   (TestPyPI leg removed 2026-07-10, operator decision — PyPI only. Prerelease tags now just build.)
 #
-# Auth is PyPI Trusted Publishing (OIDC) — NO API tokens in secrets. One-time setup per index:
-#   TestPyPI: https://test.pypi.org/manage/account/publishing/  -> add a "pending publisher":
-#       project `celeborn-code`, owner `cloud-dancer-labs`, repo `celeborn-code`, workflow `publish-pypi.yml`, env `testpypi`
-#   PyPI:     https://pypi.org/manage/project/celeborn-code/settings/publishing/ -> same, env `pypi`
+# Auth is PyPI Trusted Publishing (OIDC) — NO API tokens in secrets. One-time setup:
+#   PyPI: https://pypi.org/manage/project/celeborn-code/settings/publishing/ -> add a GitHub publisher:
+#       owner `cloud-dancer-labs`, repo `celeborn-code`, workflow `publish-pypi.yml`, env `pypi`
 #   (The package publishes as `celeborn-code`; the old PyPI project `celeborn` is deprecated — releases
 #    <= 0.2.0 live there, yanked. The GitHub repo rename celeborn -> celeborn-code is why: PyPI
 #    publishers don't follow repo renames, so the publisher must always say repo `celeborn-code`.)
-# Then in repo Settings -> Environments, create `testpypi` (no protection) and `pypi` (required reviewers).
+# Then in repo Settings -> Environments, create `pypi` (required reviewers).
 #
 # Release flow:
-#   git tag v0.2.1rc1 && git push origin v0.2.1rc1     # -> TestPyPI, verify `pip install -i testpypi celeborn-code`
-#   git tag v0.2.1    && git push origin v0.2.1         # -> TestPyPI, then waits on `pypi` approval -> PyPI
+#   git tag v0.2.1 && git push origin v0.2.1     # -> builds, then waits on `pypi` approval -> PyPI
 
 on:
   push:
@@ -74,25 +72,10 @@ jobs:
           name: dist
           path: dist/*
 
-  testpypi:
-    # DEV: every tag lands here first.
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    environment: testpypi
-    permissions:
-      id-token: write   # Trusted Publishing (OIDC)
-    steps:
-      - uses: actions/download-artifact@v4
-        with: { name: dist, path: dist }
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-
   pypi:
-    # PROD: only FINAL tags, only after testpypi, only after the `pypi` environment approval.
-    needs: [build, testpypi]
-    if: needs.build.outputs.prerelease == 'false'
+    # PROD: only FINAL tags, only after the `pypi` environment approval.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/') && needs.build.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
