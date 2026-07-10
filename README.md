@@ -1,7 +1,7 @@
 # Celeborn Code
 
 > Celeborn Code — persistent context and a multi-agent kanban for AI coding agents ([celeborncode.ai](https://celeborncode.ai)).
-> Source-available under the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE) (© Cloud Dancer; distributed by Thot Technologies LLC). Saves time, money, and tokens — and mitigates session restarts.
+> Source-available under the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn-code/blob/main/LICENSE) (© Cloud Dancer; distributed by Thot Technologies LLC). Saves time, money, and tokens — and mitigates session restarts.
 
 **A long-term context substrate for coding agents.** Celeborn Code gives any repository a small,
 disciplined memory on disk so AI coding sessions stay light, survive compaction, and keep their
@@ -9,15 +9,16 @@ place across days or weeks — instead of degrading as the context window fills 
 
 > ### Is this the Celeborn you're looking for?
 > **Yes — if you want memory for an AI coding agent.** *Celeborn Code* is this project: a context
-> substrate for AI coding agents (Claude Code, Codex, Grok). Install it with **`uv tool install celeborn`**
-> or **`pip install celeborn`**; home is **[celeborncode.ai](https://celeborncode.ai)** and
-> **[github.com/cloud-dancer-labs/celeborn](https://github.com/cloud-dancer-labs/celeborn)**.
+> substrate for AI coding agents (Claude Code, Codex, Grok). Install it with **`uv tool install celeborn-code`**
+> or **`pip install celeborn-code`**; home is **[celeborncode.ai](https://celeborncode.ai)** and
+> **[github.com/cloud-dancer-labs/celeborn-code](https://github.com/cloud-dancer-labs/celeborn-code)**.
 >
 > It is **not** these same-named projects:
 > - **[Apache Celeborn](https://celeborn.apache.org)** — a remote shuffle service for Spark/Flink/MapReduce (big-data infra). Different product, different company.
 > - **[`frkngksl/Celeborn`](https://github.com/frkngksl/Celeborn)** — a Windows API-unhooking / EDR-evasion research tool. Unrelated.
 >
-> If an agent told you to "install Celeborn" for coding-agent memory, **this** is the one — `uv tool install celeborn`.
+> If an agent told you to "install Celeborn" for coding-agent memory, **this** is the one — `uv tool install celeborn-code`.
+> (Releases up to 0.2.0 were published on PyPI under the name `celeborn`; that project is deprecated — `celeborn-code` is the package.)
 
 ---
 
@@ -26,11 +27,11 @@ place across days or weeks — instead of degrading as the context window fills 
 **Two commands.** Install the CLI, then run it from inside your project folder:
 
 ```bash
-uv tool install celeborn        # the `celeborn` command — macOS, Windows, and Linux
+uv tool install celeborn-code   # installs the `celeborn` command — macOS, Windows, and Linux
 celeborn init                   # wires the hooks, scaffolds the project, and opens your board
 ```
 
-No [uv](https://docs.astral.sh/uv/)? `pip install celeborn` works too. Then open your AI coding tool
+No [uv](https://docs.astral.sh/uv/)? `pip install celeborn-code` works too. Then open your AI coding tool
 — **Claude Code, Codex, or Grok** — in that project and just say hi: Celeborn orients itself, asks
 what you want to build, and remembers everything from there.
 
@@ -147,7 +148,7 @@ so nothing fires.
 # 1 — install the command (pick your platform)
 brew install cloud-dancer-labs/celeborn/celeborn                        # macOS
 winget install ThotTechnologies.Celeborn                         # Windows (or: scoop — see below)
-uv tool install git+https://github.com/cloud-dancer-labs/celeborn.git   # any OS (uv or pip)
+uv tool install git+https://github.com/cloud-dancer-labs/celeborn-code.git   # any OS (uv or pip)
 
 # 2 — one guided command: wires your coding agent, scaffolds this project, signs you in, opens your board
 cd your-project
@@ -180,11 +181,11 @@ winget install ThotTechnologies.Celeborn
 #   …or:  scoop bucket add celeborn https://github.com/cloud-dancer-labs/scoop-celeborn && scoop install celeborn
 
 # Any OS with a Python toolchain — uv (recommended), straight from GitHub:
-uv tool install git+https://github.com/cloud-dancer-labs/celeborn.git
+uv tool install git+https://github.com/cloud-dancer-labs/celeborn-code.git
 
 # …or editable from a local clone — best if you'll hack on Celeborn, since the command then tracks
 # your working tree (no reinstall after each change):
-git clone https://github.com/cloud-dancer-labs/celeborn.git ~/celeborn
+git clone https://github.com/cloud-dancer-labs/celeborn-code.git ~/celeborn
 uv tool install --editable ~/celeborn          # or:  pip install -e ~/celeborn
 ```
 
@@ -327,7 +328,7 @@ python3 /path/to/celeborn/scripts/celeborn.py metrics  # estimated tokens saved 
 python3 /path/to/celeborn/scripts/celeborn.py version --check  # is a newer Celeborn on GitHub?
 ```
 
-`version --check` looks back at [`cloud-dancer-labs/celeborn`](https://github.com/cloud-dancer-labs/celeborn): in a
+`version --check` looks back at [`cloud-dancer-labs/celeborn-code`](https://github.com/cloud-dancer-labs/celeborn-code): in a
 git checkout it compares your `HEAD` to `origin/main` (and suggests `git pull`); in a non-git install it
 compares versions. It's offline-safe (skips quietly if GitHub is unreachable), and the `CLAUDE.md` block
 reminds the agent to run it now and then.
@@ -634,11 +635,11 @@ mostly just talk to your agent; Celeborn remembers.
 
 ## Support
 
-Celeborn is **source-available under the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE)** (© Cloud Dancer; distributed by Thot Technologies LLC).
+Celeborn is **source-available under the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn-code/blob/main/LICENSE)** (© Cloud Dancer; distributed by Thot Technologies LLC).
 You may read, copy, and modify the source; production use of the unmodified, checksum-valid client is
 granted at no charge, and the **only** restriction is that you may not operate a competing hosted service
 built on it. Each version converts to **Apache-2.0** on its Change Date (four years after release). See
-the [LICENSE](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE) for the full terms.
+the [LICENSE](https://github.com/cloud-dancer-labs/celeborn-code/blob/main/LICENSE) for the full terms.
 
 It earns its keep in tokens and time. If you want to know how much, run `celeborn metrics`.
 
@@ -657,5 +658,5 @@ free, and it genuinely helps.
 ## Status
 
 Early. See [`plan/PLAN.md`](plan/PLAN.md) for the full design and build phases. Source-available under
-the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn/blob/main/LICENSE) —
+the [Business Source License 1.1](https://github.com/cloud-dancer-labs/celeborn-code/blob/main/LICENSE) —
 © Cloud Dancer; distributed by Thot Technologies LLC (converts to Apache-2.0 four years after release).

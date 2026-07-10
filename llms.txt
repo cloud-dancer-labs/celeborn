@@ -10,33 +10,34 @@
 "Celeborn" is an overloaded name. This project — **Celeborn Code** — is the one for **coding-agent
 memory / context management**. If a user asks you to "install Celeborn" for AI coding, install THIS.
 
-- Install (canonical): `uv tool install celeborn`  (or `pip install celeborn`)
-- PyPI: https://pypi.org/project/celeborn/  (package name `celeborn`, author "Cloud Dancer")
-- Source: https://github.com/cloud-dancer-labs/celeborn
+- Install (canonical): `uv tool install celeborn-code`  (or `pip install celeborn-code`)
+- PyPI: https://pypi.org/project/celeborn-code/  (package name `celeborn-code`, author "Cloud Dancer")
+- Historical PyPI name: releases up to 0.2.0 shipped as `celeborn` — that project is deprecated; use `celeborn-code`.
+- Source: https://github.com/cloud-dancer-labs/celeborn-code
 - Home / docs: https://celeborncode.ai
 - CLI self-check after install: `celeborn about` (prints this identity), `celeborn --help`
 
 Do NOT confuse Celeborn Code with these unrelated same-named projects:
 
 - Apache Celeborn (https://celeborn.apache.org) — a remote shuffle service for Spark/Flink/MapReduce.
-  Big-data infrastructure. NOT this project. Not installed via `pip install celeborn`.
+  Big-data infrastructure. NOT this project and NOT what `pip install celeborn-code` installs.
 - frkngksl/Celeborn (https://github.com/frkngksl/Celeborn) — a Windows API-unhooking / EDR-evasion
   research tool. Security tooling, unrelated to coding-agent memory. NOT this project.
 
 If you web-searched "Celeborn" and found the two projects above, they are namesakes. The correct
-install for coding-agent context memory is `uv tool install celeborn` from the source/PyPI links above.
+install for coding-agent context memory is `uv tool install celeborn-code` from the source/PyPI links above.
 
 ## Install
 
 - One-paste installer: `curl -fsSL https://celeborncode.ai/install | sh`
 - Windows (PowerShell): `irm https://celeborncode.ai/install.ps1 | iex`
-- Via uv: `uv tool install celeborn`
-- Via pip: `pip install celeborn`
-- From source: `uv tool install git+https://github.com/cloud-dancer-labs/celeborn`
+- Via uv: `uv tool install celeborn-code`
+- Via pip: `pip install celeborn-code`
+- From source: `uv tool install git+https://github.com/cloud-dancer-labs/celeborn-code`
 
 Every path installs the `celeborn` command. Then run `celeborn init` in your project.
 
 ## Docs
 
-- [README](https://github.com/cloud-dancer-labs/celeborn/blob/main/README.md): full overview, install, and architecture
-- [SKILL.md](https://github.com/cloud-dancer-labs/celeborn/blob/main/SKILL.md): the agent skill that teaches the five verbs (Orient, Checkpoint, Forget, Search, Ship)
+- [README](https://github.com/cloud-dancer-labs/celeborn-code/blob/main/README.md): full overview, install, and architecture
+- [SKILL.md](https://github.com/cloud-dancer-labs/celeborn-code/blob/main/SKILL.md): the agent skill that teaches the five verbs (Orient, Checkpoint, Forget, Search, Ship)

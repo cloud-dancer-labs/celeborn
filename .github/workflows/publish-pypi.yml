@@ -9,13 +9,16 @@ name: publish-pypi
 #
 # Auth is PyPI Trusted Publishing (OIDC) — NO API tokens in secrets. One-time setup per index:
 #   TestPyPI: https://test.pypi.org/manage/account/publishing/  -> add a "pending publisher":
-#       project `celeborn`, owner `cloud-dancer-labs`, repo `celeborn`, workflow `publish-pypi.yml`, env `testpypi`
-#   PyPI:     https://pypi.org/manage/account/publishing/        -> same, env `pypi`
+#       project `celeborn-code`, owner `cloud-dancer-labs`, repo `celeborn-code`, workflow `publish-pypi.yml`, env `testpypi`
+#   PyPI:     https://pypi.org/manage/project/celeborn-code/settings/publishing/ -> same, env `pypi`
+#   (The package publishes as `celeborn-code`; the old PyPI project `celeborn` is deprecated — releases
+#    <= 0.2.0 live there, yanked. The GitHub repo rename celeborn -> celeborn-code is why: PyPI
+#    publishers don't follow repo renames, so the publisher must always say repo `celeborn-code`.)
 # Then in repo Settings -> Environments, create `testpypi` (no protection) and `pypi` (required reviewers).
 #
 # Release flow:
-#   git tag v0.1.0rc1 && git push origin v0.1.0rc1     # -> TestPyPI, verify `pip install -i testpypi celeborn`
-#   git tag v0.1.0    && git push origin v0.1.0         # -> TestPyPI, then waits on `pypi` approval -> PyPI
+#   git tag v0.2.1rc1 && git push origin v0.2.1rc1     # -> TestPyPI, verify `pip install -i testpypi celeborn-code`
+#   git tag v0.2.1    && git push origin v0.2.1         # -> TestPyPI, then waits on `pypi` approval -> PyPI
 
 on:
   push:

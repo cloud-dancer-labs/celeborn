@@ -3,8 +3,8 @@ requires = ["setuptools>=77"]  # >=77 for PEP 639 SPDX license expression (licen
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "celeborn"
-version = "0.2.0"
+name = "celeborn-code"
+version = "0.2.1"
 description = "A long-term context substrate for coding agents."
 readme = "README.md"
 # Source-available under the Business Source License 1.1 (SPDX: BUSL-1.1). Converts to Apache-2.0
@@ -30,9 +30,9 @@ classifiers = [
 dependencies = []  # stdlib only (argparse, sqlite3, json, pathlib) — "boring technology"
 
 [project.urls]
-Homepage = "https://github.com/cloud-dancer-labs/celeborn"
-Repository = "https://github.com/cloud-dancer-labs/celeborn"
-Issues = "https://github.com/cloud-dancer-labs/celeborn/issues"
+Homepage = "https://celeborncode.ai"
+Repository = "https://github.com/cloud-dancer-labs/celeborn-code"
+Issues = "https://github.com/cloud-dancer-labs/celeborn-code/issues"
 
 [project.scripts]
 celeborn = "celeborn:main"
