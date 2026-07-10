@@ -42,7 +42,7 @@ Elves historically pushed often so a compaction or crash couldn't lose state. In
   cadence, not on every state change.
 - **Portability for free.** Because the memory is markdown + a regenerable SQLite index, an Elves run
   is transportable (clone → `celeborn index` → resume) — and ready for the Phase 8 sync layer so a
-  run on one machine can be watched/steered from another (see `../references/sync-design.md`).
+  run on one machine can be watched/steered from another.
 
 ## Operating contract for the agent
 

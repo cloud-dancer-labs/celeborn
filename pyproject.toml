@@ -19,7 +19,7 @@ classifiers = [
     # NOTE: No "License ::" trove classifier here — PEP 639 forbids pairing a License-Expression
     # (the `license = "BUSL-1.1"` above) with a License classifier. PyPI renders BUSL-1.1 from the
     # SPDX expression. ("Private :: Do Not Upload" is also intentionally absent — it makes PyPI
-    # REJECT the upload.) See references/pypi-publishing.md.
+    # REJECT the upload.)
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Environment :: Console",
@@ -61,4 +61,26 @@ py-modules = [
 packages = ["celeborn_refs"]
 
 [tool.setuptools.package-data]
-celeborn_refs = ["*.sql", "*.md", "*.json", "templates/*", "templates/**/*"]
+# Explicit keep-list, not a wildcard: references/ also holds contributor-facing design docs, and a
+# wildcard shipped every stray plan in the wheel. Only runtime data (schema, pins, init templates)
+# and the docs the CLI points users at belong here — a new reference doc does NOT ship unless
+# deliberately added.
+celeborn_refs = [
+    "VERSION",              # baked by the release build when present
+    "integrity.json",       # baked by the release build when present
+    "schema.sql",
+    "cmm-pin.json",
+    "infisical-pin.json",
+    "weave-pin.json",
+    "memory-protocol.md",   # PANIC_READ_MORE — printed in the panic-save line
+    "metrics.md",
+    "multi-agent-editing.md",  # printed by `celeborn touch` + written into rules files at init
+    "rehydration.md",
+    "reminders.md",
+    "supabase-auth-setup.md",  # printed in sync error messages
+    "supabase-setup.md",       # printed in sync error messages
+    "tiers.md",
+    "weave-contract.md",    # prose contract behind weave-pin.json
+    "templates/*",
+    "templates/**/*",
+]
