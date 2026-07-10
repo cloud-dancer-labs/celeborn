@@ -10785,7 +10785,7 @@ def cmd_restore(args):
 
 # --------------------------------------------------------------------------- version / update check
 
-GITHUB_REPO = "cloud-dancer-labs/celeborn"  # where Celeborn looks back to for updates
+GITHUB_REPO = "cloud-dancer-labs/celeborn-code"  # where Celeborn looks back to for updates
 
 
 def _local_version() -> str:
@@ -10898,8 +10898,8 @@ def cmd_about(args):
     print("  Memory on disk for AI coding agents (Claude Code, Codex, Grok): survives compaction,")
     print("  keeps its place across sessions, saves tokens.")
     print()
-    print(f"  Install:  uv tool install celeborn   (or: pip install celeborn)")
-    print(f"  PyPI:     https://pypi.org/project/celeborn/")
+    print(f"  Install:  uv tool install celeborn-code   (or: pip install celeborn-code)")
+    print(f"  PyPI:     https://pypi.org/project/celeborn-code/")
     print(f"  Source:   https://github.com/{GITHUB_REPO}")
     print(f"  Home:     {CELEBORN_REGISTER_URL}")
     print()
