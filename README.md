@@ -313,8 +313,8 @@ and reminds you to install CMM for the structural half.
 > **Your memory is always private — never in git.** `.context/` holds your prompts, notes, and working
 > memory, so Celeborn **always gitignores it** — there is no option to commit it. (Committing it to a repo
 > that is, or ever becomes, public would leak all of that permanently into git history.) It lives on your
-> machine and travels **between your devices via your free account** — `celeborn init --github` (or
-> `celeborn login --github` later), then `celeborn sync` — **not** git. See the [FAQ](#faq) for the why.
+> machine and travels **between your devices via your account** — `celeborn init` (or
+> `celeborn login` later), then `celeborn sync` — **not** git. See the [FAQ](#faq) for the why.
 
 ```bash
 # from your project root
@@ -380,19 +380,22 @@ publishes, the latter is contributed back via fork → PR. See
 ### Sync across devices (optional)
 
 Because `.context/` is always private (gitignored), git never carries it between machines — so Celeborn can.
-**Local use is free; hosted sync is a paid subscription** (cross-device + real-time), because that's the
-part that costs real money to run:
+**Celeborn is a paid subscription with a 7-day free trial** — every account starts as a full Pro
+trial (card upfront, $0 today, cancel anytime in one click), because that's what lets us keep
+building and supporting it:
 
-- **Free:** everything local — capture, the tiered store, search, and the Hot-tier Orient load. No
-  account, no network, fully offline. Plus free git-daemon sync and bring-your-own-Supabase. An
-  **optional free account** (`celeborn register` — email + password + MFA, or `celeborn login --github`)
-  adds nothing to the offline core but pre-wires the one-step upgrade to hosted sync.
-- **Pro — $8/seat/mo:** `celeborn login` → `celeborn sync`. Hosted, cross-device, real-time,
-  zero-setup; unlimited projects. Secrets are redacted out before upload; your local SQLite index is
-  never synced. Pro also includes the [encrypted secrets manager](#encrypted-secrets-manager-pro)
-  (`celeborn secrets`).
+- **Pro — $8/seat/mo (starts with a 7-day free trial):** the full product. Everything local —
+  capture, the tiered store, search, the board, git-daemon sync, bring-your-own-Supabase — plus
+  hosted sync: `celeborn login` → `celeborn sync`, cross-device, real-time, zero-setup, unlimited
+  projects. Secrets are redacted out before upload; your local SQLite index is never synced. Pro
+  also includes the [encrypted secrets manager](#encrypted-secrets-manager-pro) (`celeborn
+  secrets`). Annual ($80/yr) is available from the billing portal after your trial converts.
 - **Team — $12/seat/mo:** everything in Pro, plus shared projects, org admin, shared context, and shared
-  agent telepathy (the multi-agent bus). **Enterprise:** SSO + custom terms — [get in touch](#support).
+  agent telepathy (the multi-agent bus). A straight upgrade from inside Pro — no separate trial.
+  **Enterprise:** SSO + custom terms — [get in touch](#support).
+
+Whatever you decide on day 8, your `.context/` memory stays on your disk as plain Markdown,
+readable by anything — your memory is yours, the machinery is ours.
 
 ### Encrypted secrets manager (Pro)
 
@@ -622,9 +625,9 @@ history, and history is very hard to scrub. Rather than leave that footgun armed
 `--public` flag.
 
 **Then how does my memory follow me to another machine?**
-Through your free account, not git. Run `celeborn init --github` (or `celeborn login --github` later),
-then `celeborn sync`. Local use is free and fully offline; hosted cross-device/real-time sync is the paid
-tier — see [Sync across devices](#sync-across-devices-optional).
+Through your account, not git. Run `celeborn init` (or `celeborn login` later — email + password),
+then `celeborn sync` — hosted, cross-device, real-time sync is part of your Pro plan. See
+[Sync across devices](#sync-across-devices-optional).
 
 **Where do I actually *use* Celeborn once it's installed?**
 Your **kanban board** (`celeborn board` opens it) is Celeborn's UI — tasks, run/fleet, and settings live
@@ -645,15 +648,19 @@ It earns its keep in tokens and time. If you want to know how much, run `celebor
 
 **Plans**
 
-- **Free** — the entire local CLI. No account, fully offline.
-- **Pro — $8/seat/mo** — hosted sync: cross-device, real-time, zero-setup, unlimited projects.
+- **Pro — $8/seat/mo** — the full product: the local engine, hosted sync (cross-device, real-time,
+  zero-setup, unlimited projects), and the hosted board. **Every new account starts with a 7-day
+  free trial** — card upfront, $0 today, cancel anytime in one click; the day-8 charge has a
+  published no-questions 7-day refund window. Annual ($80/yr) is available from the billing portal
+  after the trial converts.
 - **Team — $12/seat/mo** — Pro plus shared projects, org admin, shared context, and shared agent
-  telepathy (the multi-agent bus).
+  telepathy (the multi-agent bus). A straight upgrade from inside Pro — no separate trial.
 - **Enterprise** — SSO/SAML, custom terms, volume pricing. **Ask in the support chat at [celeborncode.ai/faq](https://celeborncode.ai/faq).**
 
-Create a free account with `celeborn register` (email + password + MFA) or `celeborn login --github`,
-then `celeborn upgrade` when you want hosted sync. ⭐ Starring the repo and telling another developer is
-free, and it genuinely helps.
+There is no free tier — we charge because we intend to still exist next year. Whatever you decide,
+your `.context/` memory stays yours: plain files on your disk, readable by anything. Start the
+trial with `celeborn register` (email + password + MFA — you can link GitHub afterwards if you
+like). ⭐ Starring the repo and telling another developer is free, and it genuinely helps.
 
 ## Status
 
