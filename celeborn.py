@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 RELEASES = "https://github.com/cloud-dancer-labs/celeborn-releases/releases/download"
 
@@ -42,9 +42,9 @@ RELEASES = "https://github.com/cloud-dancer-labs/celeborn-releases/releases/down
 # Stamped per release — a platform absent here has no published binary for
 # this version (the installer refuses honestly rather than skip verification).
 CHECKSUMS = {
-    "linux-x86_64": "187a121cc458dc1f508f3644fcae0f49aaf0842f6a0fc4066844e7d38475aff0",
-    "macos-arm64": "185abf540e89267ce4152fd5bb37f142c57b0f11119f8329bdbe6560114e7140",
-    "windows-x86_64": "8b4ffa9a7e580b4aacbd4077988a1d7f2b50775d82de67954413f2f9d97de4b2",
+    "linux-x86_64": "9ea89029e5bb8bf50d5c31bb9643f8357051b0977484e81771e29d4357868226",
+    "macos-arm64": "a1bded7d5c050228664500f24637fb20a43be45cd966a42974994055ce83b516",
+    "windows-x86_64": "b2bf2b7758dcd84dac2a9f1349ca158077ad8866e5ce1c9d2f85e62a2b6dab30",
 }
 
 SUPPORT = "https://celeborncode.ai/faq"

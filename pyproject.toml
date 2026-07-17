@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "celeborn-code"
-version = "0.3.0"
+version = "0.3.1"
 description = "Persistent memory for AI coding agents — works with Claude Code, Cursor, Codex, ChatGPT, Grok Build, and other AI coding assistants. A long-term context substrate on disk plus a multi-agent kanban board: sessions survive compaction, restarts, and /clear, and stop re-explaining the project. Installs the `celeborn` command."
 readme = "README.md"
 # This package is the THIN INSTALLER (BUSL 1.1 — SPDX: BUSL-1.1; converts to Apache-2.0 four years
